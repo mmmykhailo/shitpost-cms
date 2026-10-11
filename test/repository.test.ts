@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { asChatId, asMessageId, asUserId } from "../src/types";
-import { snapshotFixture } from "./domain.test";
+import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ close(): void; path: string }> = [];
 

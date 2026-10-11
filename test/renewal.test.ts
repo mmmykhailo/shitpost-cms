@@ -9,7 +9,7 @@ import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
-import { snapshotFixture } from "./domain.test";
+import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 

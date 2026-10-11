@@ -7,7 +7,7 @@ import { createGeneratedMessageRepository, createPolicyRepository, createQueueRe
 import { createIngestionService } from "../src/services/ingestion";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId } from "../src/types";
-import { snapshotFixture } from "./domain.test";
+import { snapshotFixture } from "./fixtures";
 
 const open = () => {
   const directory = mkdtempSync(join(tmpdir(), "queuebot-ingestion-"));

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { appendInlineByline, separateByline, validateAlias } from "../src/domain/byline";
 import { classifyPublicationPlan } from "../src/domain/origin-policy";
 import { formatUtcSlot, nextOccurrence, occurrencesBetween, parseUtcSlot } from "../src/domain/schedule";
-import { asChatId, asUserId, type StoredMessageSnapshot } from "../src/types";
+import { asChatId, asUserId } from "../src/types";
 
 const userOrigin = { kind: "user" as const, userId: asUserId(7), displayName: "Ada Lovelace", username: "ada" };
 
@@ -52,17 +52,4 @@ describe("UTC slots", () => {
     expect(nextOccurrence(now, slots)).toBe(Date.parse("2026-10-04T23:59:00Z"));
     expect(occurrencesBetween(Date.parse("2026-10-03T00:00:00Z"), now, slots)).toHaveLength(5);
   });
-});
-
-export const snapshotFixture = (overrides: Partial<StoredMessageSnapshot> = {}): StoredMessageSnapshot => ({
-  schemaVersion: 1,
-  chatId: asChatId(-100),
-  messageId: 1 as StoredMessageSnapshot["messageId"],
-  ordinal: 0,
-  contentType: "text",
-  text: "hello",
-  origin: { kind: "absent" },
-  telegramDate: Date.parse("2026-10-04T10:00:00Z"),
-  hasReplyMarkup: false,
-  ...overrides,
 });
