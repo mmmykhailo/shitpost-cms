@@ -32,6 +32,38 @@ const RENEWAL_INTERVAL_MS = 15 * 60_000;
 const RENEWAL_START_AGE_MS = 36 * 60 * 60_000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
+const waitForShutdownStage = async (
+  name: string,
+  operation: () => Promise<unknown>,
+  timeoutMs: number,
+  logger: ReturnType<typeof createLogger>,
+): Promise<boolean> => {
+  if (timeoutMs <= 0) {
+    logger.error("shutdown_stage_timeout", { stage: name });
+    return false;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    Promise.resolve().then(operation).then(
+      () => ({ completed: true as const }),
+      (error: unknown) => ({ completed: true as const, error }),
+    ),
+    new Promise<{ completed: false; timedOut: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ completed: false, timedOut: true }), timeoutMs);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (!result.completed) {
+    logger.error("shutdown_stage_timeout", { stage: name });
+    return false;
+  }
+  if ("error" in result) {
+    logger.warn("shutdown_stage_failed", { stage: name, error: safeErrorDescription(result.error) });
+    return false;
+  }
+  return true;
+};
+
 const main = async (): Promise<void> => {
   const config = parseConfig();
   const logger = createLogger(config.logLevel);
@@ -101,21 +133,13 @@ const main = async (): Promise<void> => {
       } catch (error) {
         logger.error("runtime_status_write_failed", { state: "stopping", error: safeErrorDescription(error) });
       }
-      try {
-        await bot.stop();
-      } catch (error) {
-        logger.warn("bot_stop_failed", { error: safeErrorDescription(error) });
-      }
-      if (pollingPromise !== undefined) {
-        try {
-          await pollingPromise;
-        } catch (error) {
-          logger.warn("polling_drain_failed", { error: safeErrorDescription(error) });
-        }
-      }
+      const botStopped = await waitForShutdownStage("bot_stop", () => bot.stop(), Math.max(0, shutdownDeadline - Date.now()), logger);
+      const pollingStopped = pollingPromise === undefined
+        ? true
+        : await waitForShutdownStage("polling_drain", () => pollingPromise as Promise<unknown>, Math.max(0, shutdownDeadline - Date.now()), logger);
       const operationsDrained = await operationTracker.waitForEmpty(Math.max(0, shutdownDeadline - Date.now()));
       const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - Date.now()));
-      const clean = tasksDrained && operationsDrained;
+      const clean = botStopped && pollingStopped && tasksDrained && operationsDrained;
       let checkpointed = false;
       try {
         if (!clean) logger.error("shutdown_drain_timeout", { tasks: supervisor.names().join(","), operations: operationTracker.names().join(",") });
