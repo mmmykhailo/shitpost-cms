@@ -56,6 +56,8 @@ export const createPublicationService = (input: {
     finally { finish?.(); }
   };
 
+  const numericOutputCount = (ids: readonly unknown[]): number => ids.filter((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0).length;
+
   const logUncertainty = (claimed: Claimed, error: NormalizedTelegramError, context: { phase?: string; expectedOutputCount?: number; knownOutputCount?: number } = {}): void => {
     let evidence: ReturnType<QueueRepository["operationEvidence"]>;
     try { evidence = input.queue.operationEvidence(claimed.item.id); }
@@ -221,7 +223,7 @@ export const createPublicationService = (input: {
           input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", "Known partial destination output could not be confirmed deleted");
           input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
           input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          logUncertainty(claimed, cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
+          logUncertainty(claimed, cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
           return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
         }
         input.queue.transition(claimed.item.id, "publishing", "needs_review", input.clock.now(), "partial_result", "Telegram returned fewer destination messages than the source contract requires");
@@ -251,7 +253,7 @@ export const createPublicationService = (input: {
           input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", normalized.description);
           input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
           input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          logUncertainty(claimed, cleaned.ok ? normalized : cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
+          logUncertainty(claimed, cleaned.ok ? normalized : cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
           return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
         }
         // An edit failure after the known base messages were removed is safe to
@@ -262,7 +264,7 @@ export const createPublicationService = (input: {
           return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
         }
       }
-      return failClaim(claimed, normalized, { expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
+      return failClaim(claimed, normalized, { expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
     }
 
     try {
