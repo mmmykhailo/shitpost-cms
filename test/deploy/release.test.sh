@@ -28,6 +28,9 @@ exec "$REAL_BUN" "\$@"
 EOF
 cat > "$FAKE_BIN/flock" <<'EOF'
 #!/usr/bin/env bash
+if [ -f "${FAKE_ROOT:?}/lock-busy" ]; then
+  exit 1
+fi
 exit 0
 EOF
 cat > "$FAKE_BIN/sleep" <<'EOF'
@@ -186,6 +189,58 @@ test -d "$FAKE_ROOT/releases/$sha_c"
 test -d "$FAKE_ROOT/releases/$sha_d"
 test ! -e "$FAKE_ROOT/releases/$sha_a"
 
+# Re-activating the current release is a valid no-op deployment.
+run_release "$sha_d"
+test "$(current_sha)" = "$sha_d"
+
+if "$FAKE_ROOT/releases/$sha_d/deploy/release.sh" "not-a-sha" > "$FAKE_ROOT/malformed-sha.log" 2>&1; then
+  printf 'malformed SHA unexpectedly passed validation\n' >&2
+  exit 1
+fi
+grep -q 'release SHA must be 40 lowercase hexadecimal characters' "$FAKE_ROOT/malformed-sha.log"
+
+missing_sha=abababababababababababababababababababab
+create_release "$missing_sha" yes
+rm -f "$FAKE_ROOT/releases/$missing_sha/package.json"
+if run_release "$missing_sha" > "$FAKE_ROOT/missing-artifact.log" 2>&1; then
+  printf 'release with a missing artifact unexpectedly passed validation\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$sha_d"
+grep -q 'release is missing package.json' "$FAKE_ROOT/missing-artifact.log"
+
+forbidden_sha=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+create_release "$forbidden_sha" yes
+mkdir -p "$FAKE_ROOT/releases/$forbidden_sha/data"
+if run_release "$forbidden_sha" > "$FAKE_ROOT/forbidden-path.log" 2>&1; then
+  printf 'release with a forbidden data path unexpectedly passed validation\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$sha_d"
+grep -q 'forbidden .env or data path' "$FAKE_ROOT/forbidden-path.log"
+
+staged_sha=1234123412341234123412341234123412341234
+create_release "$staged_sha" yes
+rm -f "$FAKE_ROOT/bot.env.next"
+printf 'RELEASE_SHA=%s\n' "$staged_sha" > "$FAKE_ROOT/staged-env-source"
+ln -s "$FAKE_ROOT/staged-env-source" "$FAKE_ROOT/bot.env.next"
+if FAKE_ROOT="$FAKE_ROOT" RUNTIME_STATUS_PATH="$FAKE_ROOT/ready.json" "$FAKE_ROOT/releases/$staged_sha/deploy/release.sh" "$staged_sha" > "$FAKE_ROOT/staged-env.log" 2>&1; then
+  printf 'symlinked staged environment unexpectedly passed validation\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$sha_d"
+grep -q 'staged bot environment must not be a symlink' "$FAKE_ROOT/staged-env.log"
+rm -f "$FAKE_ROOT/bot.env.next" "$FAKE_ROOT/staged-env-source"
+
+touch "$FAKE_ROOT/lock-busy"
+if run_release "$sha_d" > "$FAKE_ROOT/lock-contention.log" 2>&1; then
+  printf 'locked deployment unexpectedly passed validation\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$sha_d"
+grep -q 'another deployment is already in progress' "$FAKE_ROOT/lock-contention.log"
+rm -f "$FAKE_ROOT/lock-busy"
+
 create_release "$sha_f" yes
 touch "$FAKE_ROOT/fail-next-restart"
 if run_release "$sha_f" > "$FAKE_ROOT/failed-activation.log" 2>&1; then
@@ -217,5 +272,15 @@ if "$FAKE_ROOT/releases/$symlink_sha/deploy/release.sh" "$symlink_sha" > "$FAKE_
   exit 1
 fi
 grep -q 'must not be a symlink' "$FAKE_ROOT/symlink-deploy.log"
+
+no_previous_sha=1212121212121212121212121212121212121212
+create_release "$no_previous_sha" no
+rm -f "$FAKE_ROOT/current" "$FAKE_ROOT/bot.env"
+if run_release "$no_previous_sha" > "$FAKE_ROOT/no-previous.log" 2>&1; then
+  printf 'release without a previous target unexpectedly became ready\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$no_previous_sha"
+grep -q 'no previous release exists; failed service left for diagnosis' "$FAKE_ROOT/no-previous.log"
 
 printf 'release activation, rollback, pruning, and path validation tests passed\n'
