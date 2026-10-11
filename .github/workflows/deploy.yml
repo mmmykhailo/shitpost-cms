@@ -1,0 +1,224 @@
+name: Deploy bot
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+      - "package.json"
+      - "bun.lock"
+      - "bunfig.toml"
+      - "tsconfig.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production-bot
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 30
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: "1.3.4"
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = "1.3.4"
+
+      - name: Install frozen dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Run application tests
+        run: bun test
+
+      - name: Run coverage and enforce deployment gate
+        env:
+          COVERAGE_THRESHOLD: "0.90"
+        run: |
+          set -euo pipefail
+          bun run test:coverage
+          bun run coverage:gate
+
+      - name: Run deployment script tests
+        run: bun run test:deploy
+
+      - name: Validate production configuration
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          QUEUE_CHANNEL_ID: ${{ secrets.QUEUE_CHANNEL_ID }}
+          TARGET_CHANNEL_ID: ${{ secrets.TARGET_CHANNEL_ID }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER }}
+          BOT_LOG_LEVEL: ${{ vars.BOT_LOG_LEVEL }}
+        run: |
+          set -euo pipefail
+          bun -e '
+            const env = process.env;
+            if (!/^[0-9a-f]{40}$/.test(env.GITHUB_SHA ?? "")) throw new Error("GITHUB_SHA is invalid");
+            const required = (name) => {
+              const value = env[name];
+              if (value === undefined || value === "") throw new Error(`${name} is missing`);
+              return value;
+            };
+            const singleLine = (name) => {
+              const value = required(name);
+              if (value.includes("\n") || value.includes("\r")) throw new Error(`${name} must not contain a newline`);
+              return value;
+            };
+            const botToken = singleLine("BOT_TOKEN");
+            if (!/^[0-9]+:[A-Za-z0-9_-]+$/.test(botToken)) throw new Error("BOT_TOKEN has an invalid format");
+            const safeInteger = (name, pattern, predicate) => {
+              const value = singleLine(name);
+              if (!pattern.test(value) || !Number.isSafeInteger(Number(value)) || !predicate(Number(value))) throw new Error(`${name} has an invalid value`);
+              return Number(value);
+            };
+            const adminId = safeInteger("ADMIN_USER_ID", /^[0-9]+$/, (value) => value > 0);
+            const queueId = safeInteger("QUEUE_CHANNEL_ID", /^-[0-9]+$/, () => true);
+            const targetId = safeInteger("TARGET_CHANNEL_ID", /^-[0-9]+$/, () => true);
+            if (queueId === targetId) throw new Error("QUEUE_CHANNEL_ID and TARGET_CHANNEL_ID must differ");
+            const host = singleLine("VPS_HOST");
+            if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251})$/.test(host) || host.includes("..")) throw new Error("VPS_HOST has an invalid hostname or IPv4 format");
+            const user = singleLine("VPS_USER");
+            if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(user)) throw new Error("VPS_USER has an invalid format");
+            required("VPS_SSH_KEY");
+            required("VPS_KNOWN_HOSTS");
+            if (env.BOT_LOG_LEVEL !== undefined && (env.BOT_LOG_LEVEL.includes("\n") || env.BOT_LOG_LEVEL.includes("\r"))) throw new Error("BOT_LOG_LEVEL must not contain a newline");
+            const logLevel = env.BOT_LOG_LEVEL?.trim() || "info";
+            if (!["debug", "info", "warn", "error"].includes(logLevel)) throw new Error("BOT_LOG_LEVEL must be debug, info, warn, or error");
+            void adminId;
+          '
+
+      - name: Configure pinned SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/deploy-ssh"
+          mkdir -p "$ssh_dir"
+          chmod 0700 "$ssh_dir"
+          printf '%s' "$VPS_SSH_KEY" > "$ssh_dir/id_deploy"
+          chmod 0600 "$ssh_dir/id_deploy"
+          ssh-keygen -y -P '' -f "$ssh_dir/id_deploy" > "$ssh_dir/id_deploy.pub"
+          chmod 0644 "$ssh_dir/id_deploy.pub"
+          printf 'CI deploy key fingerprint: '
+          ssh-keygen -lf "$ssh_dir/id_deploy.pub"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 0644 "$ssh_dir/known_hosts"
+          ssh-keygen -F "$VPS_HOST" -f "$ssh_dir/known_hosts" >/dev/null
+          {
+            printf '%s\n' 'Host vps'
+            printf '  HostName %s\n' "$VPS_HOST"
+            printf '  User %s\n' "$VPS_USER"
+            printf '  IdentityFile %s\n' "$ssh_dir/id_deploy"
+            printf '%s\n' '  IdentitiesOnly yes'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+            printf '%s\n' '  BatchMode yes'
+            printf '%s\n' '  PreferredAuthentications publickey'
+            printf '%s\n' '  ServerAliveInterval 30'
+            printf '%s\n' '  ServerAliveCountMax 3'
+          } > "$ssh_dir/config"
+          chmod 0600 "$ssh_dir/config"
+          ssh -F "$ssh_dir/config" vps true
+
+      - name: Render and upload bot environment
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          QUEUE_CHANNEL_ID: ${{ secrets.QUEUE_CHANNEL_ID }}
+          TARGET_CHANNEL_ID: ${{ secrets.TARGET_CHANNEL_ID }}
+          BOT_LOG_LEVEL: ${{ vars.BOT_LOG_LEVEL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/deploy-ssh"
+          env_file="$RUNNER_TEMP/bot.env"
+          trap 'rm -f "$env_file"' EXIT HUP INT TERM
+          {
+            printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+            printf 'ADMIN_USER_ID=%s\n' "$ADMIN_USER_ID"
+            printf 'QUEUE_CHANNEL_ID=%s\n' "$QUEUE_CHANNEL_ID"
+            printf 'TARGET_CHANNEL_ID=%s\n' "$TARGET_CHANNEL_ID"
+            printf '%s\n' 'DATABASE_PATH=/srv/shitpost-cms/data/bot.sqlite'
+            printf 'LOG_LEVEL=%s\n' "${BOT_LOG_LEVEL:-info}"
+            printf 'RELEASE_SHA=%s\n' "$GITHUB_SHA"
+            printf '%s\n' 'RUNTIME_STATUS_PATH=/run/shitpost-cms/ready.json'
+          } > "$env_file"
+          ssh -F "$ssh_dir/config" vps 'umask 077 && cat > /srv/shitpost-cms/bot.env.tmp && chmod 0600 /srv/shitpost-cms/bot.env.tmp && mv -f /srv/shitpost-cms/bot.env.tmp /srv/shitpost-cms/bot.env' < "$env_file"
+
+      - name: Upload immutable release inputs
+        env:
+          VPS_HOST: ${{ vars.VPS_HOST }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ssh_dir="$RUNNER_TEMP/deploy-ssh"
+          release_dir="/srv/shitpost-cms/releases/$GITHUB_SHA"
+          existing_manifest="$(ssh -F "$ssh_dir/config" vps "if [ -f '$release_dir/release-manifest.json' ]; then sed -nE 's/.*\\\"sha\\\"[[:space:]]*:[[:space:]]*\\\"([0-9a-f]{40})\\\".*/\\1/p' '$release_dir/release-manifest.json'; fi")"
+          ssh -F "$ssh_dir/config" vps "mkdir -p '$release_dir'"
+          file_list="$RUNNER_TEMP/deploy-file-list"
+          {
+            find src -type f -print
+            find deploy -type f -print
+            printf '%s\n' package.json bun.lock bunfig.toml tsconfig.json
+          } | sort > "$file_list"
+          files_checksum="$(while IFS= read -r file; do sha256sum "$file"; done < "$file_list" | sha256sum | cut -d' ' -f1)"
+          existing_checksum="$(ssh -F "$ssh_dir/config" vps "if [ -f '$release_dir/release-manifest.json' ]; then sed -nE 's/.*\\\"filesChecksum\\\"[[:space:]]*:[[:space:]]*\\\"([0-9a-f]{64})\\\".*/\\1/p' '$release_dir/release-manifest.json'; fi")"
+          if ssh -F "$ssh_dir/config" vps "test -e '$release_dir/release-manifest.json'"; then
+            [ "$existing_manifest" = "$GITHUB_SHA" ] || { printf 'existing release manifest is invalid or belongs to another SHA\n' >&2; exit 1; }
+            [ "$existing_checksum" = "$files_checksum" ] || { printf 'existing release checksum differs from the tested workspace\n' >&2; exit 1; }
+          fi
+          manifest_file="$RUNNER_TEMP/release-manifest.json"
+          printf '{"sha":"%s","deployedAt":"%s","bunVersion":"1.3.4","filesChecksum":"%s"}\n' "$GITHUB_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files_checksum" > "$manifest_file"
+          rsync -az --delete --chmod=D755,F644 \
+            --exclude='*' \
+            --include='/src/***' \
+            --include='/deploy/***' \
+            --include='/package.json' \
+            --include='/bun.lock' \
+            --include='/bunfig.toml' \
+            --include='/tsconfig.json' \
+            -e "ssh -F $ssh_dir/config" \
+            ./ "vps:$release_dir/"
+          rsync -az --chmod=F644 -e "ssh -F $ssh_dir/config" "$manifest_file" "vps:$release_dir/release-manifest.json"
+          ssh -F "$ssh_dir/config" vps "chmod 0755 '$release_dir'/deploy/*.sh"
+
+      - name: Activate tested release
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ssh -F "$RUNNER_TEMP/deploy-ssh/config" vps "bash '/srv/shitpost-cms/releases/$GITHUB_SHA/deploy/release.sh' '$GITHUB_SHA'"
+
+      - name: Verify active release
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ssh -F "$RUNNER_TEMP/deploy-ssh/config" vps "set -euo pipefail; systemctl is-active --quiet shitpost-cms.service; pid=\$(systemctl show -p MainPID --value shitpost-cms.service); case \"\$pid\" in ''|*[!0-9]*) exit 1;; esac; test \"\$pid\" -gt 0; test \"\$(readlink -f /srv/shitpost-cms/current)\" = '/srv/shitpost-cms/releases/$GITHUB_SHA'; RUNTIME_STATUS_PATH=/run/shitpost-cms/ready.json /usr/local/bin/bun /srv/shitpost-cms/current/deploy/check-ready.ts '$GITHUB_SHA' \"\$pid\""
