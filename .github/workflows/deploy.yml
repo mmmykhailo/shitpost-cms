@@ -172,7 +172,7 @@ jobs:
             printf 'RELEASE_SHA=%s\n' "$GITHUB_SHA"
             printf '%s\n' 'RUNTIME_STATUS_PATH=/run/shitpost-cms/ready.json'
           } > "$env_file"
-          ssh -F "$ssh_dir/config" vps 'umask 077 && cat > /srv/shitpost-cms/bot.env.tmp && chmod 0600 /srv/shitpost-cms/bot.env.tmp && mv -f /srv/shitpost-cms/bot.env.tmp /srv/shitpost-cms/bot.env' < "$env_file"
+          ssh -F "$ssh_dir/config" vps 'umask 077 && cat > /srv/shitpost-cms/bot.env.next.tmp && chmod 0600 /srv/shitpost-cms/bot.env.next.tmp && mv -f /srv/shitpost-cms/bot.env.next.tmp /srv/shitpost-cms/bot.env.next' < "$env_file"
 
       - name: Upload immutable release inputs
         env:

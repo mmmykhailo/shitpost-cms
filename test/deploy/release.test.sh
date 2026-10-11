@@ -14,6 +14,8 @@ cleanup() { rm -rf -- "$FAKE_ROOT"; }
 trap cleanup EXIT
 
 mkdir -p "$FAKE_BIN" "$FAKE_ROOT/releases"
+printf '%s\n' 'RELEASE_SHA=development' > "$FAKE_ROOT/bot.env"
+chmod 0600 "$FAKE_ROOT/bot.env"
 
 cat > "$FAKE_BIN/bun" <<EOF
 #!/usr/bin/env bash
@@ -82,6 +84,10 @@ state_file="$root/systemctl.state"
 pid_file="$root/systemctl.pid"
 case "${1:-}" in
   restart)
+    if [ -f "$root/fail-next-restart" ]; then
+      rm -f "$root/fail-next-restart"
+      exit 1
+    fi
     current="$(realpath "$root/current")"
     sha="${current##*/}"
     now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
@@ -147,6 +153,8 @@ create_release() {
 
 run_release() {
   local sha="$1"
+  printf 'RELEASE_SHA=%s\n' "$sha" > "$FAKE_ROOT/bot.env.next"
+  chmod 0600 "$FAKE_ROOT/bot.env.next"
   RUNTIME_STATUS_PATH="$FAKE_ROOT/ready.json" FAKE_ROOT="$FAKE_ROOT" "$FAKE_ROOT/releases/$sha/deploy/release.sh" "$sha"
 }
 
@@ -157,6 +165,7 @@ sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 sha_c=cccccccccccccccccccccccccccccccccccccccc
 sha_d=dddddddddddddddddddddddddddddddddddddddd
 sha_e=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+sha_f=abababababababababababababababababababab
 
 create_release "$sha_a" yes
 run_release "$sha_a"
@@ -176,6 +185,17 @@ test -d "$FAKE_ROOT/releases/$sha_b"
 test -d "$FAKE_ROOT/releases/$sha_c"
 test -d "$FAKE_ROOT/releases/$sha_d"
 test ! -e "$FAKE_ROOT/releases/$sha_a"
+
+create_release "$sha_f" yes
+touch "$FAKE_ROOT/fail-next-restart"
+if run_release "$sha_f" > "$FAKE_ROOT/failed-activation.log" 2>&1; then
+  printf 'activation failure unexpectedly succeeded\n' >&2
+  exit 1
+fi
+test "$(current_sha)" = "$sha_d"
+grep -q 'RELEASE_SHA=dddddddddddddddddddddddddddddddddddddddd' "$FAKE_ROOT/bot.env"
+grep -q "rollback became ready: $sha_d" "$FAKE_ROOT/failed-activation.log"
+test -d "$FAKE_ROOT/releases/$sha_f"
 
 mkdir -p "$FAKE_ROOT/releases/not-a-release"
 printf '%s\n' 'must survive pruning' > "$FAKE_ROOT/releases/not-a-release/keep.txt"

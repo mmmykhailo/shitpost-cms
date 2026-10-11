@@ -10,6 +10,10 @@ readonly ROOT_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)"
 readonly RELEASES_DIR="$ROOT_DIR/releases"
 readonly CURRENT_LINK="$ROOT_DIR/current"
 readonly SERVICE_NAME="shitpost-cms.service"
+readonly ENV_FILE="$ROOT_DIR/bot.env"
+readonly STAGED_ENV_FILE="$ROOT_DIR/bot.env.next"
+readonly ENV_BACKUP="$ROOT_DIR/.bot.env.before.$$"
+environment_changed=0
 
 fail() {
   printf 'release activation failed: %s\n' "$1" >&2
@@ -35,6 +39,10 @@ require_file deploy/check-ready.ts
 require_file deploy/prestart-backup.sh
 require_file release-manifest.json
 
+[ -f "$STAGED_ENV_FILE" ] || fail "staged bot environment is missing"
+[ ! -L "$STAGED_ENV_FILE" ] || fail "staged bot environment must not be a symlink"
+grep -Fqx "RELEASE_SHA=$SHA" "$STAGED_ENV_FILE" || fail "staged bot environment does not match requested release"
+
 manifest_sha="$(/usr/local/bin/bun -e 'const manifest = JSON.parse(await Bun.file(process.argv[1]).text()); if (typeof manifest.sha !== "string") process.exit(2); console.log(manifest.sha)' "$RELEASE_DIR/release-manifest.json")" \
   || fail "release manifest is not valid JSON"
 [ "$manifest_sha" = "$SHA" ] || fail "release manifest SHA does not match requested SHA"
@@ -59,13 +67,41 @@ fi
 
 (cd "$RELEASE_DIR" && /usr/local/bin/bun install --frozen-lockfile --production)
 
-activate() {
+prepare_environment() {
+  rm -f -- "$ENV_BACKUP" || return 1
+  if [ -e "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+    [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] || return 1
+    cp -p -- "$ENV_FILE" "$ENV_BACKUP" || return 1
+  fi
+  mv -f -- "$STAGED_ENV_FILE" "$ENV_FILE" || return 1
+  environment_changed=1
+  chmod 0600 "$ENV_FILE" || return 1
+}
+
+restore_environment() {
+  if [ -e "$ENV_BACKUP" ] || [ -L "$ENV_BACKUP" ]; then
+    mv -f -- "$ENV_BACKUP" "$ENV_FILE"
+  elif [ "$environment_changed" -eq 1 ]; then
+    rm -f -- "$ENV_FILE"
+  fi
+  environment_changed=0
+}
+
+discard_environment_backup() {
+  rm -f -- "$ENV_BACKUP"
+}
+
+restart_release() {
   local target="$1"
   local temporary_link="$ROOT_DIR/.current.tmp.$$"
   rm -f -- "$temporary_link"
   ln -s "$target" "$temporary_link"
   mv -Tf "$temporary_link" "$CURRENT_LINK"
   /usr/bin/sudo -n /usr/bin/systemctl restart "$SERVICE_NAME"
+}
+
+activate_new_release() {
+  prepare_environment && restart_release "$RELEASE_DIR"
 }
 
 show_failure() {
@@ -103,15 +139,20 @@ wait_for_ready() {
   return 1
 }
 
-activate "$RELEASE_DIR"
-if ! wait_for_ready "$SHA" "$RELEASE_DIR"; then
-  printf 'new release did not become ready: %s\n' "$SHA" >&2
+rollback_to_previous() {
+  local previous_name="${previous_target##*/}"
+  printf 'rolling back to %s\n' "$previous_name" >&2
+  restore_environment || return 1
+  restart_release "$previous_target" && wait_for_ready "$previous_name" "$previous_target"
+}
+
+if ! activate_new_release; then
+  printf 'new release activation failed: %s\n' "$SHA" >&2
   show_failure
   if [ -n "$previous_target" ]; then
-    previous_name="${previous_target##*/}"
-    printf 'rolling back to %s\n' "$previous_name" >&2
-    if activate "$previous_target" && wait_for_ready "$previous_name" "$previous_target"; then
-      printf 'rollback became ready: %s\n' "$previous_name" >&2
+    if rollback_to_previous; then
+      printf 'rollback became ready: %s\n' "${previous_target##*/}" >&2
+      discard_environment_backup
     else
       printf 'rollback failed; operator intervention is required\n' >&2
       show_failure
@@ -121,6 +162,25 @@ if ! wait_for_ready "$SHA" "$RELEASE_DIR"; then
   fi
   exit 1
 fi
+
+if ! wait_for_ready "$SHA" "$RELEASE_DIR"; then
+  printf 'new release did not become ready: %s\n' "$SHA" >&2
+  show_failure
+  if [ -n "$previous_target" ]; then
+    if rollback_to_previous; then
+      printf 'rollback became ready: %s\n' "${previous_target##*/}" >&2
+      discard_environment_backup
+    else
+      printf 'rollback failed; operator intervention is required\n' >&2
+      show_failure
+    fi
+  else
+    printf 'no previous release exists; failed service left for diagnosis\n' >&2
+  fi
+  exit 1
+fi
+
+discard_environment_backup
 
 current_target="$(readlink -f "$CURRENT_LINK")"
 [ "$current_target" = "$RELEASE_DIR" ] || fail "current symlink changed unexpectedly"
