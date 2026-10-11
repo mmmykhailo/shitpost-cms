@@ -11,6 +11,7 @@
     "start": "bun src/index.ts",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
+    "test:deploy": "bash test/deploy/release.test.sh",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run test"
   },
