@@ -13,7 +13,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean; ambiguousTransfer?: boolean } = {}) => {
+const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean; ambiguousTransfer?: boolean; transferFailure?: unknown } = {}) => {
   let nextMessageId = 1000;
   let deleteAttempts = 0;
   const calls: string[] = [];
@@ -21,8 +21,8 @@ const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: bo
     getBotIdentity: async () => ({ id: asUserId(1) }),
     getChat: async (id) => ({ id: Number(id) as never, type: "channel" }),
     getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
-    forwardMessages: async ({ messageIds }) => { calls.push("forward"); if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
-    copyMessages: async ({ messageIds }) => { calls.push("copy"); if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
+    forwardMessages: async ({ messageIds }) => { calls.push("forward"); if (options.transferFailure !== undefined) throw options.transferFailure; if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
+    copyMessages: async ({ messageIds }) => { calls.push("copy"); if (options.transferFailure !== undefined) throw options.transferFailure; if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
     forwardMessage: async () => { throw new Error("not used"); },
     editText: async () => { calls.push("editText"); if (options.ambiguousEdit) throw { kind: "ambiguous_send_result", description: "edit response lost" }; },
     editCaption: async () => { calls.push("editCaption"); },
@@ -60,6 +60,79 @@ afterEach(() => {
 });
 
 describe("publication service", () => {
+  test("returns empty or blocked without claiming an unsafe head", async () => {
+    const fake = fakeGateway();
+    const { queue, service } = open(fake.gateway);
+    expect(await service.publishNext()).toEqual({ kind: "empty" });
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(100) }), 1_000);
+    queue.transition(1, "queued", "blocked", 2_000, "manual", "review");
+    expect(await service.publishNext()).toMatchObject({ kind: "blocked", itemId: 1, status: "blocked", reason: "head_not_ready" });
+
+    const maintenanceFake = fakeGateway();
+    const maintenanceRun = open(maintenanceFake.gateway);
+    maintenanceRun.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(101), telegramDate: 0 }), 1_000);
+    maintenanceRun.queue.claimRenewal("renewing", 10_000, 20_000);
+    expect(await maintenanceRun.service.publishNext()).toMatchObject({ kind: "blocked", itemId: 1, reason: "maintenance_pending" });
+  });
+
+  test("classifies transfer rate limits and missing sources without deleting prematurely", async () => {
+    const limited = fakeGateway({ transferFailure: { kind: "rate_limited", description: "slow down", retryAfterSeconds: 2 } });
+    const limitedRun = open(limited.gateway);
+    limitedRun.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(102) }), 1_000);
+    expect((await limitedRun.service.publishNext()).kind).toBe("retry_scheduled");
+    expect(limitedRun.queue.findItemById(1)?.status).toBe("queued");
+    expect(limited.calls).toEqual(["copy"]);
+
+    const missing = fakeGateway({ transferFailure: { kind: "source_missing", description: "message not found" } });
+    const missingRun = open(missing.gateway);
+    missingRun.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(103) }), 1_000);
+    expect((await missingRun.service.publishNext()).kind).toBe("deleted_external");
+    expect(missingRun.queue.findItemById(1)?.status).toBe("deleted_external");
+    expect(missing.calls).toEqual(["copy"]);
+  });
+
+  test("blocks unsupported and mixed-caption plans before transfer", async () => {
+    const fake = fakeGateway();
+    const unsupported = open(fake.gateway);
+    unsupported.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(104), contentType: "service", origin: { kind: "user", userId: asUserId(4), displayName: "User" } }), 1_000);
+    expect(await unsupported.service.publishNext()).toMatchObject({ kind: "failed", status: "blocked" });
+    expect(fake.calls).toEqual([]);
+
+    const mixed = open(fake.gateway);
+    const origin = { kind: "user" as const, userId: asUserId(5), displayName: "User" };
+    mixed.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(105), mediaGroupId: "caption-album", contentType: "photo", caption: "first", origin }), 1_000);
+    mixed.queue.addAlbumMember(1, snapshotFixture({ messageId: asMessageId(106), mediaGroupId: "caption-album", ordinal: 1, contentType: "photo", caption: "second", origin }), 1_100);
+    mixed.queue.finalizeAlbums(20_000);
+    expect(await mixed.service.publishNext()).toMatchObject({ kind: "failed", status: "needs_review" });
+  });
+
+  test("edits caption bylines and completes a separate-byline publication", async () => {
+    const captionFake = fakeGateway();
+    const caption = open(captionFake.gateway);
+    const captionOrigin = { kind: "user" as const, userId: asUserId(6), displayName: "Caption Author" };
+    caption.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(107), contentType: "photo", caption: "photo", origin: captionOrigin }), 1_000);
+    caption.policy.observeAuthor(captionOrigin, 1);
+    caption.policy.setAlias(6, "Caption Alias", 1, 2);
+    expect((await caption.service.publishNext()).kind).toBe("published");
+    expect(captionFake.calls).toContain("editCaption");
+
+    const separateFake = fakeGateway();
+    const separate = open(separateFake.gateway);
+    const separateOrigin = { kind: "user" as const, userId: asUserId(7), displayName: "Sticker Author" };
+    separate.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(108), contentType: "sticker", origin: separateOrigin }), 1_000);
+    expect((await separate.service.publishNext()).kind).toBe("published");
+    expect(separateFake.calls).toContain("sendText");
+    expect(separate.queue.findItemById(1)?.status).toBe("done");
+  });
+
+  test("reports missing operations and source-cleanup retry states", async () => {
+    const fake = fakeGateway();
+    const { queue, service } = open(fake.gateway);
+    expect(await service.cleanupPending(99)).toEqual({ kind: "failed", itemId: 99, status: "published_cleanup_pending", error: "Missing publication operation" });
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(109) }), 1_000);
+    expect(await service.publishNext()).toMatchObject({ kind: "published" });
+  });
+
   test("copies an unlisted source and deletes it only after publication", async () => {
     const fake = fakeGateway();
     const { queue, service } = open(fake.gateway);
