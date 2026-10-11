@@ -238,8 +238,9 @@ export const createQueueRepository = (database: AppDatabase) => {
     if (!item || !isSourceBearing(item.status)) return item;
     const current = getMessages(item.id).find((message) => message.telegramMessageId === messageId);
     if (!current) return item;
-    database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(snapshot.telegramDate, snapshot.editDate ?? null, JSON.stringify(snapshot), item.id, item.sourceGeneration, messageId);
-    database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ?, origin_json = ? WHERE id = ?").run(snapshot.contentType, JSON.stringify(snapshot.origin), item.id);
+    const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
+    database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);
+    database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ? WHERE id = ?").run(persistedSnapshot.contentType, item.id);
     return findItemById(item.id);
   });
 

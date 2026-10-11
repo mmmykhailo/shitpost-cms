@@ -48,6 +48,15 @@ describe("queue repository", () => {
     expect(claimed?.item.status).toBe("publishing");
     expect(queue.getHead()?.status).toBe("publishing");
   });
+
+  test("edits never replace the semantic origin captured at ingestion", () => {
+    const { queue } = open();
+    const origin = { kind: "channel" as const, chatId: asChatId(-300), title: "Source" };
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(21), origin }), 1_000);
+    queue.updateSnapshot(-100, 21, snapshotFixture({ messageId: asMessageId(21), text: "edited", origin: { kind: "absent" } }));
+    expect(queue.findItemById(1)?.origin).toEqual(origin);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.origin).toEqual(origin);
+  });
 });
 
 describe("policy repository", () => {
