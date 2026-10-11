@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Message } from "@grammyjs/types";
+import { classifyTelegramError } from "../errors";
 import { snapshotFromMessage } from "../domain/message";
 import type { RecoveryRepository } from "../db/recovery-repository";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
@@ -130,7 +131,39 @@ export const createRecoveryService = (input: {
     finally { finish?.(); }
   };
 
-  return { recover };
+  const reconcileExpiredSessions = async (): Promise<{ completed: number; blocked: number }> => {
+    if (!input.recovery) return { completed: 0, blocked: 0 };
+    let completed = 0;
+    let blocked = 0;
+    for (const session of input.recovery.listRecoverable(input.clock.now())) {
+      try {
+        const previews = input.recovery.previews(session.id);
+        if (previews.some((preview) => preview.previewMessageId === undefined || preview.previewChatId === undefined)) {
+          input.recovery.markPreviewCleanupPending(session.id, input.clock.now(), "A recovery preview call may have succeeded without a recorded response ID");
+          input.logger.error("recovery_preview_output_unknown", { operationId: session.id, itemId: session.itemId });
+          blocked += 1;
+          continue;
+        }
+        const previewIds = previews.map((preview) => preview.previewMessageId!);
+        if (previewIds.length > 0) {
+          try {
+            await input.gateway.deleteMessages(input.adminChatId, previewIds);
+          } catch (error) {
+            if (classifyTelegramError(error).kind !== "source_missing") throw error;
+          }
+        }
+        input.recovery.complete(session.id, input.clock.now());
+        completed += 1;
+      } catch (error) {
+        input.recovery.markPreviewCleanupPending(session.id, input.clock.now(), error instanceof Error ? error.message : "recovery preview cleanup failed");
+        input.logger.error("recovery_preview_reconciliation_failed", { operationId: session.id, itemId: session.itemId, error: error instanceof Error ? error.message : "unknown" });
+        blocked += 1;
+      }
+    }
+    return { completed, blocked };
+  };
+
+  return { recover, reconcileExpiredSessions };
 };
 
 export const adminChatIdFromUserId = (userId: UserId): ChatId => asChatId(Number(userId));

@@ -123,6 +123,8 @@ const main = async (): Promise<void> => {
   const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock: systemClock, logger, operationTracker });
   const scheduler = createSchedulerService({ schedule, publisher, clock: systemClock, logger });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId, operationTracker });
+  const recoveredSessions = await recovery.reconcileExpiredSessions();
+  if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);
   const orphanCleanup = createOrphanCleanupService({ orphan: orphanRepository, gateway, clock: systemClock, logger });
   const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns });
   const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });

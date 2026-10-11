@@ -6,6 +6,7 @@ import { createDatabase } from "../src/db/database";
 import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createRecoveryRepository } from "../src/db/recovery-repository";
 import { createRecoveryService, parseRecoveryReference, queueInternalId } from "../src/services/recovery";
+import { snapshotFromMessage } from "../src/domain/message";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
@@ -42,9 +43,10 @@ const open = () => {
     editAdminMessage: async () => {},
     answerCallbackQuery: async () => {},
   };
-  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), recovery: createRecoveryRepository(database), gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), operationId: () => "recover-1" });
+  const recoveryRepository = createRecoveryRepository(database);
+  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), recovery: recoveryRepository, gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), operationId: () => "recover-1" });
   resources.push({ directory, close: database.close });
-  return { recovery, deleted, queue: createQueueRepository(database), database };
+  return { recovery, recoveryRepository, deleted, queue: createQueueRepository(database), database };
 };
 
 afterEach(() => {
@@ -73,5 +75,17 @@ describe("recovery", () => {
     expect(queue.findItemById(recovered.itemId)?.origin).toEqual({ kind: "absent" });
     expect(deleted).toEqual([asMessageId(700)]);
     expect((database.raw.query("SELECT phase FROM recovery_sessions WHERE id = 'recover-1'").get() as { phase: string }).phase).toBe("completed");
+  });
+
+  test("reconciles recorded previews after a restart", async () => {
+    const { recovery, recoveryRepository, deleted, database } = open();
+    recoveryRepository.createSession("stale-recovery", [asMessageId(88)], "old-boot", 0, 1);
+    recoveryRepository.addPreviewPending("stale-recovery", 88, 0, 0);
+    recoveryRepository.recordPreview("stale-recovery", 88, 99, 701, snapshotFromMessage(preview(701, undefined)), 0);
+    recoveryRepository.markPreviewCleanupPending("stale-recovery", 0, "process restarted before cleanup");
+
+    expect(await recovery.reconcileExpiredSessions()).toEqual({ completed: 1, blocked: 0 });
+    expect(deleted).toEqual([asMessageId(701)]);
+    expect((database.raw.query("SELECT phase FROM recovery_sessions WHERE id = 'stale-recovery'").get() as { phase: string }).phase).toBe("completed");
   });
 });
