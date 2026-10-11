@@ -694,6 +694,27 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
   };
 
+  const redactCompletedBefore = (before: number, now: number): { items: number; messages: number } => database.transaction(() => {
+    const rows = database.raw.query("SELECT id FROM queue_items WHERE status IN ('done','deleted','deleted_external') AND completed_at IS NOT NULL AND completed_at < ? AND NOT EXISTS (SELECT 1 FROM orphaned_sources os WHERE os.item_id = queue_items.id AND os.resolved_at IS NULL) AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state NOT IN ('done','failed'))").all(before) as Array<{ id: number }>;
+    let messages = 0;
+    for (const row of rows) {
+      const snapshots = database.raw.query("SELECT source_generation, telegram_message_id, snapshot_json FROM queue_messages WHERE item_id = ?").all(row.id) as Array<{ source_generation: number; telegram_message_id: number; snapshot_json: string }>;
+      for (const snapshot of snapshots) {
+        try {
+          const value = JSON.parse(snapshot.snapshot_json) as Record<string, unknown>;
+          for (const key of ["text", "entities", "caption", "captionEntities"]) delete value[key];
+          database.raw.query("UPDATE queue_messages SET snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(JSON.stringify(value), row.id, snapshot.source_generation, snapshot.telegram_message_id);
+          messages += 1;
+        } catch {
+          // Invalid terminal JSON is already non-actionable; leave it for the
+          // health/quarantine path rather than failing unrelated retention.
+        }
+      }
+    }
+    if (rows.length > 0) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('retention_redacted', 'retention', ?, ?)").run(JSON.stringify({ itemCount: rows.length, messageCount: messages, before }), now);
+    return { items: rows.length, messages };
+  });
+
   return {
     findItemById,
     findBySource,
@@ -749,6 +770,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     listRenewalAges,
     renewalCandidateOperation,
     setBootId,
+    redactCompletedBefore,
   };
 };
 

@@ -11,6 +11,7 @@ import type { TelegramGateway } from "../telegram";
 import type { PublicationService } from "../services/publisher";
 import type { SchedulerService } from "../services/scheduler";
 import type { RecoveryService } from "../services/recovery";
+import type { HealthService } from "../services/health";
 import type { ChatId, UserId } from "../types";
 
 type AdminDeps = {
@@ -23,6 +24,7 @@ type AdminDeps = {
   publisher: PublicationService;
   scheduler: SchedulerService;
   recovery: RecoveryService;
+  health: HealthService;
   logger: Logger;
   now: () => number;
 };
@@ -115,9 +117,10 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendHealth = async (ctx: Context): Promise<void> => {
-    const ages = deps.queue.listRenewalAges(deps.now());
-    const oldest = ages.sort((a, b) => b.ageMs - a.ageMs)[0];
-    await ctx.reply(["Health", `Database: available`, `Queue sources: ${ages.length}`, `Oldest physical source: ${oldest ? `${Math.floor(oldest.ageMs / 3_600_000)}h` : "none"}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`].join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) });
+    const health = deps.health.snapshot();
+    const oldest = health.oldestPhysicalAgeMs === undefined ? "none" : `${Math.floor(health.oldestPhysicalAgeMs / 3_600_000)}h`;
+    const pending = Object.entries(health.pendingUpdates).map(([state, count]) => `${state}=${count}`).join(", ") || "none";
+    await ctx.reply(["Health", `Database: ${health.databaseOk ? "available" : "failed"}`, `Boot: ${health.bootId ?? "unknown"} · lease ${health.leaseOwned ? "owned" : "lost"}`, `Queue head: ${health.queueHead ?? "empty"} · oldest physical source: ${oldest}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`, `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`, `Pending updates: ${pending}`, `Orphans: ${health.orphanCounts.unresolved} unresolved · ${health.orphanCounts.terminal} manual`, `Renewal capacity: ${health.renewalCapacity.safe ? "safe" : "unsafe"}`, `Active alerts: ${health.alerts.active}`].join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) });
   };
 
   const handlePrompt = async (ctx: Context, text: string): Promise<boolean> => {

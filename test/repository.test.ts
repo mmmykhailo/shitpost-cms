@@ -138,4 +138,20 @@ describe("schedule repository", () => {
     expect(schedule.run(occurrence)?.status).toBe("empty");
     expect(schedule.slots()).toEqual([60]);
   });
+
+  test("enforces the 96-slot limit and strict effective occurrence boundary", () => {
+    const { schedule } = open();
+    expect(() => schedule.setEnabled(true, 1, 1)).toThrow(/1–96/);
+    for (let minute = 0; minute < 96; minute += 1) schedule.addSlot(minute, 1, 1);
+    schedule.setEnabled(true, 1, 1);
+    expect(schedule.slots()).toHaveLength(96);
+    expect(() => schedule.addSlot(96, 1, 2)).toThrow(/1–96/);
+    const occurrence = Date.parse("2026-10-05T02:00:00Z");
+    const boundary = open();
+    boundary.schedule.addSlot(120, 1, occurrence);
+    expect(boundary.schedule.materialize(occurrence)).toBe(false);
+    boundary.schedule.removeSlot(120, 1, occurrence);
+    boundary.schedule.addSlot(120, 1, occurrence - 1);
+    expect(boundary.schedule.materialize(occurrence)).toBe(true);
+  });
 });

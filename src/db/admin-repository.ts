@@ -41,5 +41,11 @@ export const createAdminRepository = (database: AppDatabase) => {
     database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(eventType, actor, itemId ?? null, operationId ?? null, JSON.stringify(metadata), now);
   };
 
-  return { setPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit };
+  const purgeExpiredTokensAndPrompts = (now: number): { tokens: number; prompts: number } => database.transaction(() => {
+    const tokens = Number(database.raw.query("DELETE FROM callback_tokens WHERE (consumed_at IS NOT NULL AND consumed_at < ?) OR expires_at < ?").run(now - 7 * 86_400_000, now).changes);
+    const prompts = Number(database.raw.query("DELETE FROM admin_prompts WHERE expires_at < ?").run(now).changes);
+    return { tokens, prompts };
+  });
+
+  return { setPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit, purgeExpiredTokensAndPrompts };
 };

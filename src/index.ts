@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { Bot } from "grammy";
 import { parseConfig } from "./config";
 import { createLogger, safeErrorDescription } from "./logger";
 import { createDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
+import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
 import { createPendingUpdateRepository } from "./db/pending-update-repository";
 import { createRecoveryRepository } from "./db/recovery-repository";
@@ -15,11 +17,15 @@ import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
+import { createAlertService } from "./services/alerts";
+import { createHealthService } from "./services/health";
+import { createRetentionService } from "./services/retention";
+import { createBackupService } from "./services/backup";
 import { abortableSleep, createOperationTracker, createTaskSupervisor } from "./services/task-supervisor";
 import { registerAdminHandlers } from "./handlers/admin";
 import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
-import { systemClock } from "./types";
+import { systemClock, type UserId } from "./types";
 
 const RENEWAL_INTERVAL_MS = 15 * 60_000;
 const RENEWAL_START_AGE_MS = 36 * 60 * 60_000;
@@ -38,6 +44,7 @@ const main = async (): Promise<void> => {
   const pending = createPendingUpdateRepository(database);
   const recoveryRepository = createRecoveryRepository(database);
   const orphanRepository = createOrphanRepository(database);
+  const alertRepository = createAlertRepository(database);
   const runtime = createRuntimeLease(database, `${process.pid}-${bootId}`, systemClock);
   const supervisor = createTaskSupervisor({ logger });
   const operationTracker = createOperationTracker();
@@ -56,6 +63,9 @@ const main = async (): Promise<void> => {
   const bot = new Bot(config.botToken);
   const adminChatId = adminChatIdFromUserId(config.adminUserId);
   const gateway = createTelegramGateway(bot.api, adminChatId);
+  const alerts = createAlertService({ alert: alertRepository, gateway, adminChatId, logger });
+  let validatedBotId: UserId | undefined;
+  let lastRightsCheckAt = 0;
   let stopped = false;
   let shutdownPromise: Promise<void> | undefined;
 
@@ -92,6 +102,7 @@ const main = async (): Promise<void> => {
 
   try {
     const identity = await gateway.getBotIdentity();
+    validatedBotId = identity.id;
     database.raw.query("UPDATE app_state SET bot_id = ?, bot_username = ? WHERE id = 1").run(identity.id, identity.username ?? null);
     const [queueChat, targetChat] = await Promise.all([gateway.getChat(config.queueChannelId), gateway.getChat(config.targetChannelId)]);
     if (queueChat.type !== "channel" || targetChat.type !== "channel") throw new Error("QUEUE_CHANNEL_ID and TARGET_CHANNEL_ID must both resolve to channels");
@@ -113,6 +124,9 @@ const main = async (): Promise<void> => {
   const scheduler = createSchedulerService({ schedule, publisher, clock: systemClock, logger });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId });
   const orphanCleanup = createOrphanCleanupService({ orphan: orphanRepository, gateway, clock: systemClock, logger });
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns });
+  const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });
+  const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: systemClock.now });
   registerQueueChannelHandlers(bot, ingestion);
   registerAdminHandlers(bot, {
     config,
@@ -124,6 +138,7 @@ const main = async (): Promise<void> => {
     publisher,
     scheduler,
     recovery,
+    health,
     logger,
     now: systemClock.now,
   });
@@ -155,6 +170,50 @@ const main = async (): Promise<void> => {
       try { await orphanCleanup.runOnce(); }
       catch (error) { logger.error("orphan_cleanup_worker_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 15 * 60_000, signal);
+    }
+  });
+  supervisor.start("alerts", async (signal) => {
+    while (!signal.aborted && !stopped) {
+      try {
+        const now = systemClock.now();
+        if (validatedBotId !== undefined && now - lastRightsCheckAt >= 6 * 60 * 60_000) {
+          lastRightsCheckAt = now;
+          const [queueRights, targetRights] = await Promise.all([gateway.getBotMembership(config.queueChannelId, validatedBotId), gateway.getBotMembership(config.targetChannelId, validatedBotId)]);
+          const rightsOkay = queueRights.canPostMessages && queueRights.canDeleteMessages && targetRights.canPostMessages && targetRights.canEditMessages && targetRights.canDeleteMessages;
+          if (!rightsOkay) await alerts.raise(`permissions:${config.queueChannelId}`, "immediate", "Telegram permissions no longer satisfy queue/destination cleanup requirements.", now);
+          else await alerts.resolve(`permissions:${config.queueChannelId}`, "Telegram permissions restored.", now);
+        }
+        for (const entry of queue.listRenewalAges(now)) {
+          if (entry.ageMs >= 47 * 60 * 60_000) await alerts.raise(`renewal_critical:${entry.item.id}`, "critical", `Physical queue source for item #${entry.item.id} is at least 47 hours old. IDs: ${entry.sourceIds.join(", ")}`, now);
+          else if (entry.ageMs >= 46 * 60 * 60_000) await alerts.raise(`renewal_warning:${entry.item.id}`, "immediate", `Physical queue source for item #${entry.item.id} is at least 46 hours old.`, now);
+          else if (entry.ageMs >= 42 * 60 * 60_000) await alerts.raise(`renewal_notice:${entry.item.id}`, "normal", `Physical queue source for item #${entry.item.id} is at least 42 hours old.`, now);
+        }
+        for (const item of queue.listActive(10_000)) {
+          if (item.status === "uncertain_publish") await alerts.raise(`uncertain_publish:${item.id}`, "immediate", `Publication for queue item #${item.id} is uncertain and requires admin resolution.`, now);
+          if (item.maintenanceStatus === "uncertain_renewal") await alerts.raise(`uncertain_renewal:${item.id}`, "immediate", `Renewal for queue item #${item.id} is uncertain and requires admin resolution.`, now);
+        }
+        const orphanCounts = orphanRepository.counts();
+        if (orphanCounts.terminal > 0) await alerts.raise("orphan_manual", "immediate", `${orphanCounts.terminal} orphaned queue source(s) require manual cleanup.`, now);
+        const capacity = health.snapshot().renewalCapacity;
+        if (!capacity.safe) await alerts.raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`, now);
+      } catch (error) {
+        logger.error("alert_worker_failed", { error: safeErrorDescription(error) });
+      }
+      await abortableSleep(systemClock, 60_000, signal);
+    }
+  });
+  supervisor.start("retention", async (signal) => {
+    while (!signal.aborted && !stopped) {
+      try { retention.runOnce(); }
+      catch (error) { logger.error("retention_worker_failed", { error: safeErrorDescription(error) }); }
+      await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
+    }
+  });
+  supervisor.start("backup", async (signal) => {
+    while (!signal.aborted && !stopped) {
+      try { backup.runOnce(); }
+      catch (error) { logger.error("backup_worker_failed", { error: safeErrorDescription(error) }); }
+      await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
     }
   });
   supervisor.start("scheduler", async (signal) => scheduler.run(signal));
