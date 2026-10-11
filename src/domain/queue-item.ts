@@ -54,7 +54,7 @@ export const isBlockingHead = (item: QueueItemRecord, now: number): boolean => {
 const validTransitions: Record<QueueItemStatus, readonly QueueItemStatus[]> = {
   collecting: ["queued", "needs_review", "deleted_external", "deleted"],
   queued: ["publishing", "blocked", "needs_edit", "needs_review", "deleted", "deleted_external", "collecting"],
-  publishing: ["queued", "published_cleanup_pending", "uncertain_publish", "blocked", "needs_edit", "deleted_external", "deleted"],
+  publishing: ["queued", "published_cleanup_pending", "uncertain_publish", "blocked", "needs_edit", "needs_review", "deleted_external", "deleted"],
   published_cleanup_pending: ["done", "uncertain_publish", "deleted_external"],
   blocked: ["queued", "publishing", "needs_review", "deleted", "deleted_external"],
   needs_edit: ["queued", "publishing", "deleted", "deleted_external"],

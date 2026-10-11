@@ -244,6 +244,10 @@ export const createQueueRepository = (database: AppDatabase) => {
   const updateSnapshot = (chatId: number, messageId: number, snapshot: StoredMessageSnapshot): QueueItemRecord | undefined => database.transaction(() => {
     const item = findBySource(chatId, messageId);
     if (!item || !isSourceBearing(item.status)) return item;
+    // Once destination transfer has begun, the captured contract owns the
+    // operation. An edit update must not change the version that a cleanup
+    // CAS will later compare against.
+    if (item.status === "publishing" || item.status === "published_cleanup_pending") return item;
     const current = getMessages(item.id).find((message) => message.telegramMessageId === messageId);
     if (!current) return item;
     const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
@@ -333,6 +337,18 @@ export const createQueueRepository = (database: AppDatabase) => {
     return (database.raw.query(`SELECT telegram_message_id FROM operation_outputs WHERE operation_id = ? AND ${column} = ? ORDER BY ordinal, telegram_message_id`).all(operationId, value) as Array<{ telegram_message_id: number }>).map((row) => row.telegram_message_id as MessageId);
   };
 
+  const operationSourceIds = (operationId: string): MessageId[] => {
+    const row = database.raw.query("SELECT source_ids_json FROM operations WHERE id = ?").get(operationId) as { source_ids_json: string | null } | null;
+    if (!row?.source_ids_json) return [];
+    try {
+      const parsed = JSON.parse(row.source_ids_json) as unknown;
+      if (!Array.isArray(parsed) || parsed.some((value) => !Number.isInteger(value))) return [];
+      return parsed as MessageId[];
+    } catch {
+      return [];
+    }
+  };
+
   const recoverExpiredOperations = (now: number): number[] => database.transaction(() => {
     const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null }>;
     const recovered: number[] = [];
@@ -361,7 +377,7 @@ export const createQueueRepository = (database: AppDatabase) => {
         database.raw.query("UPDATE queue_items SET status = 'queued', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
         setOperationPhase(row.id, "failed", now, "startup_recovery");
         setOperationState(row.id, "failed", now, "startup_recovery");
-      } else if (row.phase === "source_cleanup_pending" || item.status === "published_cleanup_pending") {
+      } else if (row.phase === "output_complete" || row.phase === "source_cleanup_pending" || item.status === "published_cleanup_pending") {
         database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', claimed_at = NULL WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
         setOperationPhase(row.id, "source_cleanup_pending", now, "startup_recovery");
         setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
@@ -396,6 +412,16 @@ export const createQueueRepository = (database: AppDatabase) => {
     );
     if (Number(result.changes) !== 1) throw new Error("Publication contract guard conflict");
   });
+
+  const beginPublicationTransfer = (guard: OperationGuard, now: number): void => {
+    const result = database.raw.query("UPDATE operations SET phase = 'transfer_pending', updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'claimed' AND EXISTS (SELECT 1 FROM queue_items WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?)").run(now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration, guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Publication transfer guard conflict");
+  };
+
+  const markPartialCleanupPending = (guard: OperationGuard, now: number, errorCode: string, errorText: string): void => {
+    const result = database.raw.query("UPDATE operations SET state = 'cleanup_pending', phase = 'partial_cleanup_pending', error_code = ?, error_json = ?, updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase IN ('transfer_pending','attribution_pending')").run(errorCode, JSON.stringify({ message: errorText }), now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Partial cleanup phase guard conflict");
+  };
 
   const guardRow = (guard: OperationGuard): { phase: string; type: string; maintenanceStatus: MaintenanceStatus; status: QueueItemStatus } | undefined => {
     const row = database.raw.query("SELECT o.phase, o.type, qi.status, qi.maintenance_status FROM operations o JOIN queue_items qi ON qi.id = o.item_id WHERE o.id = ? AND o.item_id = ? AND o.captured_content_version = ? AND o.captured_source_generation = ?").get(guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration) as { phase: string; type: string; status: QueueItemStatus; maintenance_status: MaintenanceStatus } | null;
@@ -592,9 +618,12 @@ export const createQueueRepository = (database: AppDatabase) => {
     failRenewal,
     operationForItem,
     operationOutputIds,
+    operationSourceIds,
     recoverExpiredOperations,
     recordOutput,
     persistPublicationContract,
+    beginPublicationTransfer,
+    markPartialCleanupPending,
     recordCompleteBaseOutputs,
     markAttributionPending,
     markPublicationOutputComplete,

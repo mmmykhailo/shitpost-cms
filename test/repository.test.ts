@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
-import { asChatId, asMessageId, asUserId } from "../src/types";
+import { asChatId, asMessageId, asUserId, type PublicationContract } from "../src/types";
 import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ close(): void; path: string }> = [];
@@ -75,6 +75,30 @@ describe("queue repository", () => {
     expect(claimed?.item.status).toBe("blocked");
     expect(claimed?.item.maintenanceStatus).toBe("renewing");
     expect(queue.findItemById(1)?.status).toBe("blocked");
+  });
+
+  test("startup recovery never treats recorded base output as complete publication", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(24) }), 1_000);
+    const claimed = queue.claimPublication("partial-op", "publish", 1_000)!;
+    const contract: PublicationContract = {
+      capturedLogicalStatus: "queued",
+      capturedContentVersion: claimed.capturedContentVersion,
+      capturedSourceGeneration: claimed.capturedSourceGeneration,
+      sourceIds: [asMessageId(24)],
+      policy: { kind: "copy", reason: "direct_queue_post" },
+      expectedTransferredMessageCount: 1,
+      expectedOutputMessageCount: 1,
+      requiresInlineEdit: false,
+      requiresSeparateByline: false,
+    };
+    const guard = { operationId: "partial-op", itemId: 1, capturedContentVersion: 1, capturedSourceGeneration: 0 };
+    queue.persistPublicationContract("partial-op", contract, 1_001);
+    queue.beginPublicationTransfer(guard, 1_002);
+    queue.recordCompleteBaseOutputs(guard, [{ chatId: -200, messageId: 901, ordinal: 0 }], 1_003);
+    expect(queue.recoverExpiredOperations(302_000)).toEqual([1]);
+    expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
+    expect((database.raw.query("SELECT phase FROM operations WHERE id = 'partial-op'").get() as { phase: string }).phase).toBe("uncertain");
   });
 });
 
