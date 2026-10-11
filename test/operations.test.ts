@@ -108,6 +108,45 @@ describe("operations safety net", () => {
     expect(Bun.file(second.previousPath!).size).toBeGreaterThan(0);
   });
 
+  test("expires, validates, consumes, and purges admin state", () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-admin-state-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    resources.push({ directory, close: database.close });
+    const admin = createAdminRepository(database);
+
+    expect(admin.getPrompt(7, 100)).toBeUndefined();
+    admin.setPrompt(7, "author", { step: "name" }, 44, 100, 10);
+    expect(admin.getPrompt(7, 109)).toEqual({ kind: "author", state: { step: "name" }, expectedReplyToMessageId: 44 });
+    expect(admin.getPrompt(7, 110)).toBeUndefined();
+
+    admin.setPrompt(7, "author", { step: "alias" }, undefined, 200, 100);
+    expect(admin.getPrompt(7, 201)).toEqual({ kind: "author", state: { step: "alias" } });
+    database.raw.query("UPDATE admin_prompts SET state_json = ? WHERE admin_id = ?").run("[]", 7);
+    expect(admin.getPrompt(7, 202)).toBeUndefined();
+    admin.setPrompt(7, "author", { step: "clear" }, undefined, 300);
+    admin.clearPrompt(7);
+    expect(admin.getPrompt(7, 301)).toBeUndefined();
+
+    const expired = admin.createCallbackToken(7, "expired", { item: 1 }, 400, undefined, 1);
+    expect(admin.consumeCallbackToken(999, expired, 400)).toBeUndefined();
+    expect(admin.consumeCallbackToken(7, expired, 401)).toBeUndefined();
+
+    const valid = admin.createCallbackToken(7, "publish", { item: 2 }, 500, 3, 100);
+    expect(admin.consumeCallbackToken(7, valid, 501)).toEqual({ action: "publish", payload: { item: 2 }, itemVersion: 3 });
+    expect(admin.consumeCallbackToken(7, valid, 502)).toBeUndefined();
+
+    const corrupt = admin.createCallbackToken(7, "corrupt", { item: 3 }, 600, undefined, 100);
+    database.raw.query("UPDATE callback_tokens SET payload_json = ? WHERE token = ?").run("[]", corrupt);
+    expect(admin.consumeCallbackToken(7, corrupt, 601)).toBeUndefined();
+
+    admin.createCallbackToken(7, "old", { item: 4 }, 0, undefined, 1);
+    admin.setPrompt(7, "expired", { old: true }, undefined, 0, 1);
+    admin.audit("old", "admin:7", 1, undefined, undefined, { old: true });
+    admin.audit("new", "admin:7", 20, undefined, "op-1");
+    expect(admin.purgeExpiredTokensAndPrompts(8 * 86_400_000)).toEqual({ tokens: 4, prompts: 1 });
+    expect(admin.purgeAuditEvents(10)).toBe(1);
+  });
+
   test("retention purges old terminal pending-update rows", () => {
     const directory = mkdtempSync(join(tmpdir(), "queuebot-retention-"));
     const database = createDatabase(join(directory, "bot.sqlite"));
