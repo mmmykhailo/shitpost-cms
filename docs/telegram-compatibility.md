@@ -1,6 +1,6 @@
 # Telegram compatibility gate
 
-The automated Bun/grammY spike is covered by `test/compatibility-spike.test.ts`. It type-checks and constructs the narrow gateway for `forwardMessages`, `copyMessages`, `deleteMessages`, and message edits without making network calls.
+The automated Bun/grammY spike is covered by `test/compatibility-spike.test.ts`. As of 2026-10-06 it exercises the actual gateway adapter with grammY-shaped `{ message_id }` responses for `forwardMessages` and `copyMessages`, verifies ordered numeric IDs and numeric deletion payloads, and classifies malformed responses as ambiguous without making network calls. The publisher-plus-adapter regression matrix also covers copied and forwarded single messages and albums.
 
 The real Telegram checklist remains a deployment prerequisite. It requires a disposable bot, a private queue channel, and a disposable destination channel; no credentials or channels were supplied to this workspace, so these observations are intentionally not fabricated:
 
