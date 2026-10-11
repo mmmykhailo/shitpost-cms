@@ -22,6 +22,10 @@ const integer = (value: unknown, field: string): number => {
   return value as number;
 };
 
+const logicalStatuses = new Set<PublicationContract["capturedLogicalStatus"]>([
+  "collecting", "queued", "publishing", "published_cleanup_pending", "blocked", "needs_edit", "needs_review", "uncertain_publish", "delete_blocked", "done", "deleted", "deleted_external",
+]);
+
 const optionalString = (value: unknown, field: string): string | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new StoredDataValidationError(`${field} must be a string`);
@@ -115,6 +119,7 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     telegramDate: integer(candidate.telegramDate, "telegramDate"),
     hasReplyMarkup: candidate.hasReplyMarkup === true,
   };
+  if (result.messageId <= 0) throw new StoredDataValidationError("messageId must be positive");
   if (result.ordinal < 0) throw new StoredDataValidationError("ordinal must be non-negative");
   const mediaGroupId = optionalString(candidate.mediaGroupId, "mediaGroupId");
   const text = optionalString(candidate.text, "text");
@@ -146,7 +151,11 @@ export const parseStoredMessageSnapshot = (value: string): StoredMessageSnapshot
 
 export const validateOrderedMessageIds = (value: unknown, field = "messageIds"): MessageId[] => {
   if (!Array.isArray(value) || value.length < 1 || value.length > 100) throw new StoredDataValidationError(`${field} must contain 1–100 IDs`);
-  const ids = value.map((candidate, index) => asMessageId(integer(candidate, `${field}[${index}]`)));
+  const ids = value.map((candidate, index) => {
+    const id = integer(candidate, `${field}[${index}]`);
+    if (id <= 0) throw new StoredDataValidationError(`${field}[${index}] must be positive`);
+    return asMessageId(id);
+  });
   for (let index = 1; index < ids.length; index += 1) if (ids[index]! <= ids[index - 1]!) throw new StoredDataValidationError(`${field} must be strictly increasing`);
   return ids;
 };
@@ -161,9 +170,19 @@ export const validatePublicationContract = (value: unknown): PublicationContract
   const candidate = record(value);
   const sourceIds = validateOrderedMessageIds(candidate.sourceIds, "contract.sourceIds");
   const capturedLogicalStatus = candidate.capturedLogicalStatus;
-  if (typeof capturedLogicalStatus !== "string") throw new StoredDataValidationError("contract.capturedLogicalStatus is required");
+  if (typeof capturedLogicalStatus !== "string" || !logicalStatuses.has(capturedLogicalStatus as PublicationContract["capturedLogicalStatus"])) throw new StoredDataValidationError("contract.capturedLogicalStatus is invalid");
   const policy = record(candidate.policy);
   if (typeof policy.kind !== "string") throw new StoredDataValidationError("contract.policy.kind is required");
+  switch (policy.kind) {
+    case "forward": if (policy.reason !== "whitelisted_channel") throw new StoredDataValidationError("contract.policy.reason is invalid"); break;
+    case "copy": if (!["unlisted_channel", "direct_queue_post", "chat_origin", "unknown_origin"].includes(String(policy.reason))) throw new StoredDataValidationError("contract.policy.reason is invalid"); break;
+    case "copy_with_inline_byline":
+    case "copy_with_separate_byline": if (typeof policy.name !== "string" || policy.name.length === 0) throw new StoredDataValidationError("contract.policy.name is required"); break;
+    case "blocked": if (!["unknown_origin", "unsupported_content", "mixed_album_origin"].includes(String(policy.reason))) throw new StoredDataValidationError("contract.policy.reason is invalid"); break;
+    default: throw new StoredDataValidationError("contract.policy.kind is invalid");
+  }
+  if (candidate.requiresInlineEdit !== undefined && typeof candidate.requiresInlineEdit !== "boolean") throw new StoredDataValidationError("contract.requiresInlineEdit must be boolean");
+  if (candidate.requiresSeparateByline !== undefined && typeof candidate.requiresSeparateByline !== "boolean") throw new StoredDataValidationError("contract.requiresSeparateByline must be boolean");
   const result: PublicationContract = {
     capturedLogicalStatus: capturedLogicalStatus as PublicationContract["capturedLogicalStatus"],
     capturedContentVersion: integer(candidate.capturedContentVersion, "contract.capturedContentVersion"),
@@ -177,6 +196,6 @@ export const validatePublicationContract = (value: unknown): PublicationContract
   };
   const bylineText = optionalString(candidate.bylineText, "contract.bylineText");
   if (bylineText !== undefined) result.bylineText = bylineText;
-  if (result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length) throw new StoredDataValidationError("contract output counts are inconsistent");
+  if (result.capturedContentVersion < 1 || result.capturedSourceGeneration < 0 || result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length) throw new StoredDataValidationError("contract output counts are inconsistent");
   return result;
 };

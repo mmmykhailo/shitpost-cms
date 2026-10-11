@@ -82,7 +82,7 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     attempts: row.attempts,
     enqueuedAt: row.enqueued_at,
     physicalCreatedAt: row.physical_created_at,
-    destinationMessageIds: row.destination_message_ids_json ? JSON.parse(row.destination_message_ids_json) as MessageId[] : [],
+    destinationMessageIds: row.destination_message_ids_json ? validateOrderedMessageIds(JSON.parse(row.destination_message_ids_json) as unknown, "destinationMessageIds") : [],
   };
   if (row.media_group_id !== null) item.mediaGroupId = row.media_group_id;
   for (const [key, value] of [
@@ -178,6 +178,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const observeQueueSnapshot = (snapshot: StoredMessageSnapshot, now: number): { item: QueueItemRecord; inserted: boolean } => {
+    snapshot = validateStoredMessageSnapshot(snapshot);
     return database.transaction(() => {
       const existing = findBySource(snapshot.chatId, snapshot.messageId);
       if (existing) {
@@ -214,6 +215,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const addAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot, now: number): QueueItemRecord => {
+    snapshot = validateStoredMessageSnapshot(snapshot);
     return database.transaction(() => {
       const item = findItemById(itemId);
       if (!item || item.status !== "collecting") throw new Error("Album is no longer collecting");
@@ -226,7 +228,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     });
   };
 
-  const addLateAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot): QueueItemRecord => database.transaction(() => {
+  const addLateAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot): QueueItemRecord => {
+    snapshot = validateStoredMessageSnapshot(snapshot);
+    return database.transaction(() => {
     const item = findItemById(itemId);
     if (!item || item.mediaGroupId !== snapshot.mediaGroupId || !isSourceBearing(item.status)) throw new Error("Album cannot accept a late member");
     if (!findBySource(snapshot.chatId, snapshot.messageId)) insertSnapshot(itemId, item.sourceGeneration, snapshot);
@@ -234,9 +238,11 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const updated = findItemById(itemId);
     if (!updated) throw new Error("Album disappeared after late member insert");
     return updated;
-  });
+    });
+  };
 
   const insertRecoveredSnapshots = (snapshots: readonly StoredMessageSnapshot[], now: number): QueueItemRecord => database.transaction(() => {
+    snapshots = snapshots.map((snapshot) => validateStoredMessageSnapshot(snapshot));
     if (snapshots.length < 1 || snapshots.length > 10) throw new Error("Recovered item must contain 1–10 snapshots");
     const first = snapshots[0]!;
     if (snapshots.some((snapshot, ordinal) => snapshot.chatId !== first.chatId || snapshot.ordinal !== ordinal || originKey(snapshot.origin) !== originKey(first.origin))) throw new Error("Recovered snapshots are not a compatible ordered album");
@@ -269,7 +275,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return finalized;
   });
 
-  const updateSnapshot = (chatId: number, messageId: number, snapshot: StoredMessageSnapshot): QueueItemRecord | undefined => database.transaction(() => {
+  const updateSnapshot = (chatId: number, messageId: number, snapshot: StoredMessageSnapshot): QueueItemRecord | undefined => {
+    snapshot = validateStoredMessageSnapshot(snapshot);
+    return database.transaction(() => {
     const item = findBySource(chatId, messageId);
     if (!item || !isSourceBearing(item.status)) return item;
     // Once destination transfer has begun, the captured contract owns the
@@ -287,7 +295,8 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);
     database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ? WHERE id = ?").run(persistedSnapshot.contentType, item.id);
     return findItemById(item.id);
-  });
+    });
+  };
 
   const listActive = (limit = 100, offset = 0): QueueItemRecord[] => {
     const rows = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external') ORDER BY logical_sequence LIMIT ? OFFSET ?").all(limit, offset) as QueueRow[];
@@ -711,6 +720,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     if (!item) throw new Error("Queue item disappeared during renewal resolution");
     const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL)");
     for (const messageId of validatedOrphanIds) orphanInsert.run(itemId, sourceGeneration, item.queueChatId, messageId, "admin_manual_cleanup", now, now, now);
+    database.raw.query("UPDATE pending_queue_updates SET state = 'discarded', last_error = ? WHERE candidate_operation_id = ? AND state = 'quarantined_renewal_candidate'").run(`renewal_resolution:${mode}`, operationId);
     database.raw.query("UPDATE operations SET state = 'failed', phase = 'failed', error_code = ?, updated_at = ? WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").run(mode, now, operationId, itemId, contentVersion, sourceGeneration);
     database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_renewal_resolved', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ mode, orphanIds: validatedOrphanIds }), now);
   });

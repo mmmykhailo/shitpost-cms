@@ -1,5 +1,5 @@
 import type { AppDatabase } from "./database";
-import { parseStoredMessageSnapshot } from "../domain/validation";
+import { parseStoredMessageSnapshot, validateOrderedMessageIds } from "../domain/validation";
 import type { MessageId, RecoveryPhase, StoredMessageSnapshot } from "../types";
 
 export type RecoverySessionRecord = {
@@ -28,7 +28,8 @@ export type RecoveryRepository = ReturnType<typeof createRecoveryRepository>;
 
 export const createRecoveryRepository = (database: AppDatabase) => {
   const createSession = (id: string, sourceIds: readonly MessageId[], bootId: string, now: number, leaseMs = 300_000): void => {
-    database.raw.query("INSERT INTO recovery_sessions (id, phase, source_ids_json, item_id, boot_id, lease_expires_at, last_error, created_at, updated_at) VALUES (?, 'claimed', ?, NULL, ?, ?, NULL, ?, ?)").run(id, JSON.stringify(sourceIds), bootId, now + leaseMs, now, now);
+    const validatedSourceIds = validateOrderedMessageIds(sourceIds, "recovery.sourceIds");
+    database.raw.query("INSERT INTO recovery_sessions (id, phase, source_ids_json, item_id, boot_id, lease_expires_at, last_error, created_at, updated_at) VALUES (?, 'claimed', ?, NULL, ?, ?, NULL, ?, ?)").run(id, JSON.stringify(validatedSourceIds), bootId, now + leaseMs, now, now);
   };
 
   const setPhase = (id: string, phase: RecoveryPhase, now: number, error?: string): void => {
@@ -53,7 +54,7 @@ export const createRecoveryRepository = (database: AppDatabase) => {
   const session = (id: string): RecoverySessionRecord | undefined => {
     const row = database.raw.query("SELECT * FROM recovery_sessions WHERE id = ?").get(id) as { id: string; phase: RecoveryPhase; source_ids_json: string; item_id: number | null; boot_id: string; lease_expires_at: number; last_error: string | null; created_at: number; updated_at: number } | null;
     if (!row) return undefined;
-    const result: RecoverySessionRecord = { id: row.id, phase: row.phase, sourceIds: JSON.parse(row.source_ids_json) as MessageId[], bootId: row.boot_id, leaseExpiresAt: row.lease_expires_at, createdAt: row.created_at, updatedAt: row.updated_at };
+    const result: RecoverySessionRecord = { id: row.id, phase: row.phase, sourceIds: validateOrderedMessageIds(JSON.parse(row.source_ids_json) as unknown, "recovery.sourceIds"), bootId: row.boot_id, leaseExpiresAt: row.lease_expires_at, createdAt: row.created_at, updatedAt: row.updated_at };
     if (row.item_id !== null) result.itemId = row.item_id;
     if (row.last_error !== null) result.lastError = row.last_error;
     return result;
