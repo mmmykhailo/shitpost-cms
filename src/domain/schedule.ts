@@ -51,5 +51,6 @@ export const validateSlotCount = (slots: readonly number[], enabled: boolean): v
   const unique = new Set(slots);
   if (unique.size !== slots.length) throw new Error("Publication slots must be unique");
   if (slots.some((slot) => !Number.isInteger(slot) || slot < 0 || slot >= MINUTES_PER_DAY)) throw new Error("Publication slot is out of range");
-  if (enabled && (slots.length < 1 || slots.length > 96)) throw new Error("Enabled scheduling requires 1–96 UTC slots");
+  if (slots.length > 96) throw new Error("Publication schedules support at most 96 UTC slots");
+  if (enabled && slots.length < 1) throw new Error("Enabled scheduling requires 1–96 UTC slots");
 };

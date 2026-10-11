@@ -223,7 +223,10 @@ describe("schedule repository", () => {
     for (let minute = 0; minute < 96; minute += 1) schedule.addSlot(minute, 1, 1);
     schedule.setEnabled(true, 1, 1);
     expect(schedule.slots()).toHaveLength(96);
-    expect(() => schedule.addSlot(96, 1, 2)).toThrow(/1–96/);
+    expect(() => schedule.addSlot(96, 1, 2)).toThrow(/96/);
+    const paused = open();
+    for (let minute = 0; minute < 96; minute += 1) paused.schedule.addSlot(minute, 1, 1);
+    expect(() => paused.schedule.addSlot(96, 1, 2)).toThrow(/at most 96/);
     const occurrence = Date.parse("2026-10-05T02:00:00Z");
     const boundary = open();
     boundary.schedule.addSlot(120, 1, occurrence);
