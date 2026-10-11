@@ -65,7 +65,7 @@ activate() {
   rm -f -- "$temporary_link"
   ln -s "$target" "$temporary_link"
   mv -Tf "$temporary_link" "$CURRENT_LINK"
-  sudo -n /usr/bin/systemctl restart "$SERVICE_NAME"
+  /usr/bin/sudo -n /usr/bin/systemctl restart "$SERVICE_NAME"
 }
 
 show_failure() {
