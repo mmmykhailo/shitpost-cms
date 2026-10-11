@@ -29,10 +29,15 @@ export const createAlertService = (input: { alert: AlertRepository; gateway: Tel
     if (!raised.shouldSend) return;
     try {
       await input.gateway.sendAdminMessage({ chatId: input.adminChatId, text: `[${severity}] ${text}` });
-      input.alert.markSent(dedupeKey, now);
     } catch (error) {
       // Alert delivery must never change the queue state or fail a worker.
       input.logger.error("admin_alert_send_failed", { dedupeKey, error: error instanceof Error ? error.message : "unknown" });
+      return;
+    }
+    try {
+      input.alert.markSent(dedupeKey, now);
+    } catch (error) {
+      input.logger.error("admin_alert_mark_sent_failed", { dedupeKey, error: error instanceof Error ? error.message : "unknown" });
     }
   };
 
