@@ -15,7 +15,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "permission_denied" | "telegram_age_limit" = "transient_network") => {
+const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "permission_denied" | "telegram_age_limit" = "transient_network", failDelete = true) => {
   let nextId = 900;
   let fail = true;
   const calls: string[] = [];
@@ -31,7 +31,7 @@ const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "perm
     sendText: async () => asMessageId(nextId++),
     deleteMessages: async () => {
       calls.push("delete");
-      if (fail) { fail = false; throw { kind: deleteFailureKind, description: deleteFailureKind === "telegram_age_limit" ? "message can't be deleted for everyone" : "old source temporarily unavailable" }; }
+      if (fail && failDelete) { fail = false; throw { kind: deleteFailureKind, description: deleteFailureKind === "telegram_age_limit" ? "message can't be deleted for everyone" : "old source temporarily unavailable" }; }
     },
     sendAdminMessage: async () => asMessageId(nextId++),
     editAdminMessage: async () => {},
@@ -123,5 +123,23 @@ describe("renewal service", () => {
     expect((await orphanCleanup.runOnce()).attempted).toBe(1);
     expect(alerts).toHaveLength(1);
     expect((database.raw.query("SELECT next_attempt_at FROM orphaned_sources WHERE telegram_message_id = 903").get() as { next_attempt_at: number }).next_attempt_at).toBeGreaterThan(100_000);
+  });
+
+  test("retries a durable post-install cleanup phase without republishing", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, renewal, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(55), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    const claimed = queue.claimRenewal("renew-cleanup", 100_000, 64_000)!;
+    const guard = { operationId: claimed.operationId, itemId: 1, capturedContentVersion: claimed.capturedContentVersion, capturedSourceGeneration: claimed.capturedSourceGeneration };
+    queue.setOperationPhase("renew-cleanup", "replacement_pending", 100_001);
+    queue.recordReplacementOutput("renew-cleanup", -100, 905, 0, 100_002);
+    queue.markReplacementOutputsRecorded(guard, 100_003);
+    const original = queue.getCurrentSnapshotSet(1)[0]!;
+    queue.installRenewedGeneration(guard, [{ ...original, messageId: asMessageId(905), ordinal: 0, telegramDate: 100_004 }], 100_004);
+
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    expect((await renewal.cleanupPending(1)).kind).toBe("renewed");
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    expect((database.raw.query("SELECT phase FROM operations WHERE id = 'renew-cleanup'").get() as { phase: string }).phase).toBe("completed");
   });
 });

@@ -173,6 +173,7 @@ const main = async (): Promise<void> => {
   supervisor.start("renewal", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
+        for (const item of queue.listActive(10_000).filter((entry) => entry.maintenanceStatus === "renewal_cleanup_pending")) await renewal.cleanupPending(item.id);
         await renewal.renewNext(RENEWAL_START_AGE_MS);
       } catch (error) {
         logger.error("renewal_worker_failed", { error: safeErrorDescription(error) });
