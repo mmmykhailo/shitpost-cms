@@ -90,12 +90,15 @@ The readiness record is non-secret and must show `state=ready`, the expected ful
 
 Use a retained release whose directory name is a full lowercase SHA. Do not point `current` at an arbitrary path, a symlink, or a release outside `/srv/shitpost-cms/releases`:
 
+The release SHA in `bot.env` must match the code SHA. For a manual rollback, stage a copy of the existing environment with only `RELEASE_SHA` changed, then invoke that release's `release.sh`; do not edit the live file in place:
+
 ```sh
 ROLLBACK_SHA=RETAINED_40_CHARACTER_SHA
+printf '%s' "$ROLLBACK_SHA" | grep -Eq '^[0-9a-f]{40}$'
 ssh -i ./administrator_key -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile=./vps_known_hosts \
   deploy@VPS_HOST \
-  "set -euo pipefail; printf '%s' '$ROLLBACK_SHA' | grep -Eq '^[0-9a-f]{40}$'; test -d '/srv/shitpost-cms/releases/$ROLLBACK_SHA'; ln -s '/srv/shitpost-cms/releases/$ROLLBACK_SHA' /srv/shitpost-cms/current.manual.tmp; mv -Tf /srv/shitpost-cms/current.manual.tmp /srv/shitpost-cms/current; /usr/bin/sudo -n /usr/bin/systemctl restart shitpost-cms.service"
+  "set -euo pipefail; test -d '/srv/shitpost-cms/releases/$ROLLBACK_SHA'; tmp=/srv/shitpost-cms/bot.env.next.tmp; sed -E 's/^RELEASE_SHA=.*/RELEASE_SHA=$ROLLBACK_SHA/' /srv/shitpost-cms/bot.env > \"\$tmp\"; chmod 0600 \"\$tmp\"; mv -f \"\$tmp\" /srv/shitpost-cms/bot.env.next; bash '/srv/shitpost-cms/releases/$ROLLBACK_SHA/deploy/release.sh' '$ROLLBACK_SHA'"
 ```
 
 Then inspect the service and readiness record. A code rollback never overwrites SQLite; the next start still makes a pre-start backup. If readiness fails, restore the previous retained release and leave the service stopped for diagnosis.
@@ -125,7 +128,7 @@ Review `/health`, uncertain operations, quarantined updates, terminal orphans, a
 
 ## 6. Rotate credentials or move hosts
 
-For a token rotation, update only the `BOT_TOKEN` Environment secret and run `workflow_dispatch`. The workflow replaces `bot.env` through a temporary file and atomic rename; it does not change code or the database.
+For a token rotation, update only the `BOT_TOKEN` Environment secret and run `workflow_dispatch`. The workflow stages `bot.env.next`; the release activator verifies the matching SHA, promotes it atomically, and restores the previous environment if restart/readiness fails. It does not change code or the database.
 
 For deploy-key rotation:
 
