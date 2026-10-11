@@ -34,10 +34,8 @@ export const displayNameForOrigin = (origin: SemanticOrigin, alias?: string): st
       return undefined;
     case "unknown":
       return undefined;
-    default: {
-      const exhaustive: never = origin;
-      return exhaustive;
-    }
+    default:
+      return undefined;
   }
 };
 
@@ -66,9 +64,6 @@ export const classifyPublicationPlan = (input: {
     case "chat": return { kind: "copy", reason: "chat_origin" };
     case "absent": return { kind: "copy", reason: "direct_queue_post" };
     case "unknown": return { kind: "blocked", reason: "unknown_origin" };
-    default: {
-      const exhaustive: never = origin;
-      return exhaustive;
-    }
+    default: return { kind: "blocked", reason: "unknown_origin" };
   }
 };

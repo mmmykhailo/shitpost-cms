@@ -148,6 +148,13 @@ describe("byline and publication policy matrix", () => {
     expect(displayNameForOrigin({ kind: "absent" })).toBeUndefined();
     expect(displayNameForOrigin({ kind: "chat", chatId: asChatId(-1) })).toBeUndefined();
   });
+
+  test("fails closed for malformed runtime policy values", () => {
+    const malformedOrigin = { kind: "future_origin" } as unknown as SemanticOrigin;
+    expect(displayNameForOrigin(malformedOrigin)).toBeUndefined();
+    expect(classifyPublicationPlan({ origin: malformedOrigin, contentType: "text", channelIsWhitelisted: false })).toEqual({ kind: "blocked", reason: "unknown_origin" });
+    expect(classifyPublicationPlan({ origin: { kind: "user", userId: asUserId(7), displayName: "Ada" }, contentType: "future_content" as ContentType, channelIsWhitelisted: false })).toEqual({ kind: "blocked", reason: "unsupported_content" });
+  });
 });
 
 describe("queue state and schedule boundaries", () => {
