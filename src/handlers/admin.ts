@@ -11,7 +11,7 @@ import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { AppConfig } from "../config";
 import type { Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
-import type { PublicationService } from "../services/publisher";
+import type { PublicationOutcome, PublicationService } from "../services/publisher";
 import type { SchedulerService } from "../services/scheduler";
 import type { RecoveryService } from "../services/recovery";
 import type { HealthService } from "../services/health";
@@ -146,12 +146,29 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await ctx.reply(dashboardText(deps), { reply_markup: await dashboardKeyboard() });
   };
 
+  const uncertainPublicationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: InlineKeyboardMarkup } | undefined> => {
+    const item = deps.queue.findItemById(itemId);
+    const evidence = deps.queue.operationEvidence(itemId);
+    if (!item || item.status !== "uncertain_publish" || !evidence) return undefined;
+    const retry = await button(deps, "I confirm nothing was published — retry", "uncertain_publish_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion);
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[retry]];
+    if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Destination is complete", "uncertain_publish_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+    if (evidence.expectedOutputCount !== undefined) rows.push([await button(deps, "Enter exact destination IDs", "uncertain_publish_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedOutputCount, phase: evidence.phase }, item.contentVersion)]);
+    if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount === evidence.sourceIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Delete known outputs and retry", "uncertain_publish_delete_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+    rows.push([await button(deps, "Delete queue item", "queue_delete", { itemId }, item.contentVersion)], [await button(deps, "Back", "queue")]);
+    return {
+      text: [`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "The destination may already contain this post. The item remains the active FIFO head until an explicit resolution prevents duplication.", "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"),
+      replyMarkup: keyboard(rows),
+    };
+  };
+
   const sendQueue = async (ctx: Context, offset = 0): Promise<void> => {
     const pageSize = 10;
     const page = deps.queue.listActive(pageSize + 1, Math.max(0, offset));
     const items = page.slice(0, pageSize);
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
     const lines = [`Queue (FIFO) · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`, ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
+    if (deps.queue.getHead()?.status === "uncertain_publish") lines.splice(1, 0, "The destination may already contain this post. This item stays in the active FIFO queue until an explicit resolution prevents duplication.");
     for (const item of items) {
       const actions: Array<Awaited<ReturnType<typeof button>>> = [await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion)];
       if (item.status === "uncertain_publish") actions.push(await button(deps, `Resolve #${item.id}`, "queue_uncertain", { itemId: item.id }, item.contentVersion));
@@ -166,6 +183,43 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (navigation.length > 0) rows.push(navigation);
     rows.push([await button(deps, "Back", "dashboard")]);
     await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+  };
+
+  const sendPublicationOutcome = async (ctx: Context, outcome: PublicationOutcome): Promise<void> => {
+    const queue = await button(deps, "Queue", "queue");
+    const dashboard = await button(deps, "Dashboard", "dashboard");
+    switch (outcome.kind) {
+      case "published":
+        await ctx.reply(`Queue item #${outcome.itemId} was published and source cleanup completed.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "cleanup_pending":
+        await ctx.reply(`Queue item #${outcome.itemId} was published, but source cleanup is pending. Do not republish it; cleanup will be retried safely.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "uncertain": {
+        const response = await uncertainPublicationResponse(outcome.itemId);
+        if (response) {
+          await ctx.reply(response.text, { reply_markup: response.replyMarkup });
+          return;
+        }
+        await ctx.reply(`Publication for queue item #${outcome.itemId} may already exist. The FIFO head remains blocked; automatic retry is unsafe. Reopen Queue to resolve it.`, { reply_markup: keyboard([[await button(deps, `Resolve #${outcome.itemId}`, "queue_uncertain", { itemId: outcome.itemId })], [queue]]) });
+        return;
+      }
+      case "retry_scheduled":
+        await ctx.reply(`Queue item #${outcome.itemId} was not published; retry is scheduled for ${new Date(outcome.retryAt).toISOString()}.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "blocked":
+        await ctx.reply(`Queue item #${outcome.itemId} remains blocked in status ${outcome.status}: ${outcome.reason}. Review the item before retrying.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "failed":
+        await ctx.reply(`Queue item #${outcome.itemId} failed in status ${outcome.status}: ${outcome.error}. Review the item and choose a safe next action.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "deleted_external":
+        await ctx.reply(`Queue source for item #${outcome.itemId} was already missing; the item was removed without publishing.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        return;
+      case "empty":
+        await ctx.reply("The queue is empty.", { reply_markup: keyboard([[dashboard]]) });
+        return;
+    }
   };
 
   const sendSafety = async (ctx: Context, offset = 0): Promise<void> => {
@@ -377,7 +431,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         if (!item || deps.queue.getHead()?.id !== item.id || item.status !== "queued" || item.maintenanceStatus !== "idle" || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The queue head changed; reopen the dashboard.");
         const outcome = await deps.scheduler.manualPublish();
         deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
-        return sendDashboard(ctx);
+        return sendPublicationOutcome(ctx, outcome);
       }
       case "slot_add": return beginPrompt(ctx, { kind: "slot_add", state: {}, text: "Reply with the daily UTC slot as HH:MM.", placeholder: "HH:MM UTC" });
       case "slot_remove": if (typeof payload.minuteOfDay === "number") deps.schedule.removeSlot(payload.minuteOfDay, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
@@ -427,16 +481,9 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       case "queue_uncertain": {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
-        const item = deps.queue.findItemById(itemId);
-        const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || item.status !== "uncertain_publish" || !evidence) return ctx.reply("This publication is no longer awaiting uncertainty resolution.");
-        const retry = await button(deps, "I confirm nothing was published — retry", "uncertain_publish_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion);
-        const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[retry]];
-        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Destination is complete", "uncertain_publish_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
-        if (evidence.expectedOutputCount !== undefined) rows.push([await button(deps, "Enter exact destination IDs", "uncertain_publish_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedOutputCount, phase: evidence.phase }, item.contentVersion)]);
-        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount === evidence.sourceIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Delete known outputs and retry", "uncertain_publish_delete_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
-        rows.push([await button(deps, "Delete queue item", "queue_delete", { itemId }, item.contentVersion)], [await button(deps, "Back", "queue")]);
-        return ctx.reply([`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"), { reply_markup: keyboard(rows) });
+        const response = await uncertainPublicationResponse(itemId);
+        if (!response) return ctx.reply("This publication is no longer awaiting uncertainty resolution.");
+        return ctx.reply(response.text, { reply_markup: response.replyMarkup });
       }
       case "uncertain_publish_retry": {
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");

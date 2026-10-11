@@ -5,14 +5,16 @@ import { describe, expect, test } from "bun:test";
 import { Bot } from "grammy";
 import type { InlineKeyboardMarkup, Message, Update, User } from "@grammyjs/types";
 import { registerAdminHandlers } from "../src/handlers/admin";
+import type { PublicationOutcome } from "../src/services/publisher";
 import { createDatabase } from "../src/db/database";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
 import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import type { TelegramGateway } from "../src/telegram";
-import { asChatId, asUserId } from "../src/types";
+import { asChatId, asMessageId, asUserId, type PublicationContract } from "../src/types";
 import type { LogFields } from "../src/logger";
+import { snapshotFixture } from "./fixtures";
 
 const ADMIN_ID = asUserId(42);
 const ADMIN_CHAT_ID = Number(ADMIN_ID);
@@ -66,7 +68,7 @@ const callbackUpdate = (updateId: number, callbackId: string, data: string, mess
   callback_query: { id: callbackId, from, chat_instance: "test-chat", message, data },
 } as Update);
 
-const createHarness = () => {
+const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = async (): Promise<PublicationOutcome> => ({ kind: "empty" })) => {
   const directory = mkdtempSync(join(tmpdir(), "shitpost-cms-admin-"));
   const database = createDatabase(join(directory, "bot.sqlite"));
   const queue = createQueueRepository(database, { bootId: "admin-test" });
@@ -137,7 +139,7 @@ const createHarness = () => {
     orphan,
     gateway,
     publisher: {} as AdminDeps["publisher"],
-    scheduler: { nextAt: () => undefined, manualPublish: async () => ({ kind: "empty" as const }) } as AdminDeps["scheduler"],
+    scheduler: { nextAt: () => undefined, manualPublish } as AdminDeps["scheduler"],
     recovery: {} as AdminDeps["recovery"],
     health: {} as AdminDeps["health"],
     logger,
@@ -147,6 +149,7 @@ const createHarness = () => {
 
   return {
     bot,
+    queue,
     admin,
     schedule,
     calls,
@@ -302,6 +305,61 @@ describe("admin schedule handlers", () => {
           errorKind: "permission_denied",
         },
       }]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("renders an explicit successful manual publication result", async () => {
+    const harness = createHarness(async () => ({ kind: "published", itemId: 1, destinationMessageIds: [asMessageId(701)], operationId: "published-1" }));
+    try {
+      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(51) }), NOW);
+      const source = makeMessage(901, "publish menu", BOT_INFO);
+      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW, 1);
+
+      await harness.run(callbackUpdate(902, "callback-publish", `v1:${token}`, source));
+
+      expect(harness.lastSent().message.text).toBe("Queue item #1 was published and source cleanup completed.");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("renders the shared uncertainty resolution menu after manual publication", async () => {
+    let harness!: ReturnType<typeof createHarness>;
+    harness = createHarness(async () => {
+      const claimed = harness.queue.claimPublication("uncertain-1", "manual_publish", NOW)!;
+      const contract: PublicationContract = {
+        capturedLogicalStatus: "queued",
+        capturedContentVersion: claimed.capturedContentVersion,
+        capturedSourceGeneration: claimed.capturedSourceGeneration,
+        sourceIds: [asMessageId(52)],
+        policy: { kind: "copy", reason: "direct_queue_post" },
+        expectedTransferredMessageCount: 1,
+        expectedOutputMessageCount: 1,
+        requiresInlineEdit: false,
+        requiresSeparateByline: false,
+      };
+      const guard = { operationId: claimed.operationId, itemId: 1, capturedContentVersion: claimed.capturedContentVersion, capturedSourceGeneration: claimed.capturedSourceGeneration };
+      harness.queue.persistPublicationContract(claimed.operationId, contract, NOW);
+      harness.queue.beginPublicationTransfer(guard, NOW);
+      harness.queue.transition(1, "publishing", "uncertain_publish", NOW, "ambiguous_send_result", "Telegram response was lost");
+      harness.queue.setOperationState(claimed.operationId, "uncertain", NOW, "ambiguous_send_result");
+      harness.queue.setOperationPhase(claimed.operationId, "uncertain", NOW, "ambiguous_send_result");
+      return { kind: "uncertain", itemId: 1, operationId: claimed.operationId };
+    });
+    try {
+      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(52) }), NOW);
+      const source = makeMessage(903, "publish menu", BOT_INFO);
+      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW, 1);
+
+      await harness.run(callbackUpdate(904, "callback-uncertain", `v1:${token}`, source));
+
+      const response = harness.lastSent();
+      expect(response.message.text).toContain("Uncertain publication #1");
+      expect(response.message.text).toContain("destination may already contain this post");
+      expect(response.message.text).toContain("retrying can duplicate");
+      expect(harness.callbackData(response, "Enter exact destination IDs")).toMatch(/^v1:/);
     } finally {
       harness.close();
     }
