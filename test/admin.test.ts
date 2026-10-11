@@ -209,6 +209,38 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   };
 };
 
+const prepareUncertainPublication = (harness: ReturnType<typeof createHarness>, messageId: number, destinationIds: number[] = []) => {
+  const item = harness.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(messageId) }), NOW).item;
+  const claimed = harness.queue.claimPublication("admin-uncertain", "manual_publish", NOW)!;
+  const contract: PublicationContract = {
+    capturedLogicalStatus: "queued",
+    capturedContentVersion: claimed.capturedContentVersion,
+    capturedSourceGeneration: claimed.capturedSourceGeneration,
+    sourceIds: [asMessageId(messageId)],
+    policy: { kind: "copy", reason: "direct_queue_post" },
+    expectedTransferredMessageCount: 1,
+    expectedOutputMessageCount: destinationIds.length > 0 ? destinationIds.length : 1,
+    requiresInlineEdit: false,
+    requiresSeparateByline: false,
+  };
+  const guard = { operationId: claimed.operationId, itemId: item.id, capturedContentVersion: claimed.capturedContentVersion, capturedSourceGeneration: claimed.capturedSourceGeneration };
+  harness.queue.persistPublicationContract(claimed.operationId, contract, NOW);
+  harness.queue.beginPublicationTransfer(guard, NOW);
+  for (const [ordinal, destinationId] of destinationIds.entries()) harness.queue.recordOutput(claimed.operationId, "transferred", TARGET_CHAT_ID, asMessageId(destinationId), ordinal, NOW);
+  harness.queue.transition(item.id, "publishing", "uncertain_publish", NOW, "ambiguous_send_result", "response lost");
+  harness.queue.setOperationState(claimed.operationId, "uncertain", NOW, "ambiguous_send_result");
+  harness.queue.setOperationPhase(claimed.operationId, "uncertain", NOW, "ambiguous_send_result");
+  return { item, operationId: claimed.operationId };
+};
+
+const prepareUncertainRenewal = (harness: ReturnType<typeof createHarness>, messageId: number, replacementIds: number[] = []) => {
+  const item = harness.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(messageId), telegramDate: 0 }), 1).item;
+  const claimed = harness.queue.claimRenewal("admin-renewal", NOW, NOW)!;
+  harness.queue.setRenewalUncertain(item.id, claimed.operationId, NOW, "transient_network", "response lost");
+  for (const [ordinal, replacementId] of replacementIds.entries()) harness.queue.recordReplacementOutput(claimed.operationId, QUEUE_CHAT_ID, asMessageId(replacementId), ordinal, NOW);
+  return { item, operationId: claimed.operationId };
+};
+
 describe("admin schedule handlers", () => {
   test("binds Add UTC slot to its ForceReply question and renders Resume after adding", async () => {
     const harness = createHarness();
@@ -640,6 +672,134 @@ describe("admin command, queue, and publication handlers", () => {
       expect(harness.lastSent().message.text.toLowerCase()).toContain(expectedText);
     } finally {
       harness.close();
+    }
+  });
+});
+
+describe("admin uncertainty resolution handlers", () => {
+  test("retries, adopts, and prompts for uncertain publication evidence", async () => {
+    const retryHarness = createHarness();
+    try {
+      const prepared = prepareUncertainPublication(retryHarness, 1100);
+      await retryHarness.run(commandUpdate(400, 400, "queue"));
+      const menu = retryHarness.lastSent();
+      await retryHarness.run(callbackUpdate(401, "resolve-publication", retryHarness.callbackData(menu, "Resolve #1"), menu.message));
+      expect(retryHarness.lastSent().message.text).toContain("Uncertain publication #1");
+      const retryToken = retryHarness.admin.createCallbackToken(ADMIN_ID, "uncertain_publish_retry", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      await retryHarness.run(callbackUpdate(402, "retry-publication", `v1:${retryToken}`, makeMessage(402, "menu", BOT_INFO)));
+      expect(retryHarness.queue.findItemById(1)?.status).toBe("queued");
+    } finally {
+      retryHarness.close();
+    }
+
+    const adoptHarness = createHarness();
+    try {
+      const prepared = prepareUncertainPublication(adoptHarness, 1101, [710]);
+      const adoptToken = adoptHarness.admin.createCallbackToken(ADMIN_ID, "uncertain_publish_adopt_known", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      await adoptHarness.run(callbackUpdate(403, "adopt-publication", `v1:${adoptToken}`, makeMessage(403, "menu", BOT_INFO)));
+      expect(adoptHarness.queue.findItemById(1)?.status).toBe("published_cleanup_pending");
+    } finally {
+      adoptHarness.close();
+    }
+
+    const promptHarness = createHarness();
+    try {
+      const prepared = prepareUncertainPublication(promptHarness, 1102);
+      const promptToken = promptHarness.admin.createCallbackToken(ADMIN_ID, "uncertain_publish_adopt_prompt", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, expectedCount: 1, phase: "uncertain" }, NOW);
+      await promptHarness.run(callbackUpdate(404, "prompt-publication", `v1:${promptToken}`, makeMessage(404, "menu", BOT_INFO)));
+      const question = promptHarness.lastSent();
+      await promptHarness.run(replyUpdate(405, 405, "not ids", question.message));
+      expect(promptHarness.lastSent().message.text).toContain("exactly 1");
+      await promptHarness.run(replyUpdate(406, 406, "711", question.message));
+      expect(promptHarness.queue.findItemById(1)?.status).toBe("published_cleanup_pending");
+    } finally {
+      promptHarness.close();
+    }
+  });
+
+  test("resolves uncertain renewal by adoption, no replacement, and explicit cleanup", async () => {
+    const noReplacement = createHarness();
+    try {
+      const prepared = prepareUncertainRenewal(noReplacement, 1200);
+      await noReplacement.run(commandUpdate(410, 410, "queue"));
+      const menu = noReplacement.lastSent();
+      await noReplacement.run(callbackUpdate(411, "resolve-renewal", noReplacement.callbackData(menu, "Resolve renewal #1"), menu.message));
+      const noReplacementToken = noReplacement.admin.createCallbackToken(ADMIN_ID, "renewal_no_replacement", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      await noReplacement.run(callbackUpdate(412, "no-replacement", `v1:${noReplacementToken}`, makeMessage(412, "menu", BOT_INFO)));
+      expect(noReplacement.queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    } finally {
+      noReplacement.close();
+    }
+
+    const adopt = createHarness();
+    try {
+      const prepared = prepareUncertainRenewal(adopt, 1201, [801]);
+      const token = adopt.admin.createCallbackToken(ADMIN_ID, "renewal_adopt_known", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      await adopt.run(callbackUpdate(413, "adopt-renewal", `v1:${token}`, makeMessage(413, "menu", BOT_INFO)));
+      expect(adopt.queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    } finally {
+      adopt.close();
+    }
+
+    const prompt = createHarness();
+    try {
+      const prepared = prepareUncertainRenewal(prompt, 1202);
+      const token = prompt.admin.createCallbackToken(ADMIN_ID, "renewal_adopt_prompt", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, expectedCount: 1, phase: "uncertain" }, NOW);
+      await prompt.run(callbackUpdate(414, "prompt-renewal", `v1:${token}`, makeMessage(414, "menu", BOT_INFO)));
+      const question = prompt.lastSent();
+      await prompt.run(replyUpdate(415, 415, "801 802", question.message));
+      expect(prompt.lastSent().message.text).toContain("exactly 1");
+      await prompt.run(replyUpdate(416, 416, "802", question.message));
+      expect(prompt.queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    } finally {
+      prompt.close();
+    }
+
+    const cleanup = createHarness();
+    try {
+      const prepared = prepareUncertainRenewal(cleanup, 1203, [803]);
+      const token = cleanup.admin.createCallbackToken(ADMIN_ID, "renewal_cleanup_prompt", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      await cleanup.run(callbackUpdate(417, "cleanup-prompt", `v1:${token}`, makeMessage(417, "menu", BOT_INFO)));
+      const question = cleanup.lastSent();
+      await cleanup.run(replyUpdate(418, 418, "803", question.message));
+      expect(cleanup.queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    } finally {
+      cleanup.close();
+    }
+  });
+
+  test("handles known-output cleanup success, missing output, and failure", async () => {
+    const missing = createHarness();
+    try {
+      const prepared = prepareUncertainPublication(missing, 1300, [901]);
+      const token = missing.admin.createCallbackToken(ADMIN_ID, "uncertain_publish_delete_retry", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      missing.setDeleteFailure({ kind: "source_missing", description: "message not found" });
+      await missing.run(callbackUpdate(420, "missing-output", `v1:${token}`, makeMessage(420, "menu", BOT_INFO)));
+      expect(missing.queue.findItemById(1)?.status).toBe("queued");
+    } finally {
+      missing.close();
+    }
+
+    const failed = createHarness();
+    try {
+      const prepared = prepareUncertainPublication(failed, 1301, [902]);
+      const token = failed.admin.createCallbackToken(ADMIN_ID, "uncertain_publish_delete_retry", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      failed.setDeleteFailure({ kind: "permission_denied", description: "not enough rights" });
+      await failed.run(callbackUpdate(421, "failed-output", `v1:${token}`, makeMessage(421, "menu", BOT_INFO)));
+      expect(failed.lastSent().message.text).toContain("Known output cleanup failed");
+    } finally {
+      failed.close();
+    }
+
+    const renewalDelete = createHarness();
+    try {
+      const prepared = prepareUncertainRenewal(renewalDelete, 1302, [903]);
+      const token = renewalDelete.admin.createCallbackToken(ADMIN_ID, "renewal_delete_replacements", { itemId: 1, operationId: prepared.operationId, sourceGeneration: 0, phase: "uncertain" }, NOW);
+      renewalDelete.setDeleteFailure({ kind: "source_missing", description: "message not found" });
+      await renewalDelete.run(callbackUpdate(422, "missing-replacement", `v1:${token}`, makeMessage(422, "menu", BOT_INFO)));
+      expect(renewalDelete.queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    } finally {
+      renewalDelete.close();
     }
   });
 });
