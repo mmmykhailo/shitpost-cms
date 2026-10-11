@@ -13,6 +13,7 @@ import type { PublicationService } from "../services/publisher";
 import type { SchedulerService } from "../services/scheduler";
 import type { RecoveryService } from "../services/recovery";
 import type { HealthService } from "../services/health";
+import type { OperationTracker } from "../services/task-supervisor";
 import type { ChatId, MessageId, UserId } from "../types";
 
 type AdminDeps = {
@@ -27,6 +28,7 @@ type AdminDeps = {
   recovery: RecoveryService;
   health: HealthService;
   logger: Logger;
+  operationTracker?: OperationTracker;
   now: () => number;
 };
 
@@ -410,6 +412,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
         if (!item) return ctx.reply("Queue item no longer exists.");
+        const finish = deps.operationTracker?.begin(`delete:${itemId}:${deps.now()}`);
         try {
           await deps.gateway.deleteMessages(deps.config.queueChannelId, deps.queue.currentSourceIds(itemId));
           deps.queue.markAdminDeleted(itemId, deps.now());
@@ -422,6 +425,8 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
             return sendQueue(ctx);
           }
           return ctx.reply(`Deletion failed (${normalized.kind}); the SQLite item was kept.`);
+        } finally {
+          finish?.();
         }
       }
       default: return ctx.reply("Unknown or stale action.");

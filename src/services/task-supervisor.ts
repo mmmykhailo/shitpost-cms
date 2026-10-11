@@ -58,11 +58,40 @@ export const createTaskSupervisor = (input: { logger: Logger }) => {
   let stopPromise: Promise<boolean> | undefined;
   let stopping = false;
 
+  const sleepWithSignal = (milliseconds: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
+    if (signal.aborted || milliseconds <= 0) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, milliseconds);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+
   const start = (name: string, task: (signal: AbortSignal) => Promise<void>): void => {
     if (stopping || tasks.has(name)) return;
-    const promise = task(controller.signal).catch((error: unknown) => {
-      if (!controller.signal.aborted) input.logger.error("supervised_task_failed", { task: name, error: error instanceof Error ? error.message : String(error) });
-    }).finally(() => {
+    const promise = (async () => {
+      const backoffMs = [1_000, 5_000, 30_000, 60_000];
+      let failures = 0;
+      while (!controller.signal.aborted) {
+        try {
+          await task(controller.signal);
+          return;
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          const delay = backoffMs[Math.min(failures, backoffMs.length - 1)]!;
+          failures += 1;
+          input.logger.error("supervised_task_failed", { task: name, error: error instanceof Error ? error.message : String(error), restartInMs: delay, failureCount: failures });
+          await sleepWithSignal(delay, controller.signal);
+          if (failures >= backoffMs.length && !controller.signal.aborted) {
+            input.logger.error("supervised_task_disabled_after_restarts", { task: name, failureCount: failures });
+            return;
+          }
+        }
+      }
+    })().finally(() => {
       tasks.delete(name);
     });
     tasks.set(name, promise);

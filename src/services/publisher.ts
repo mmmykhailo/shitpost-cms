@@ -7,6 +7,7 @@ import { classifyTelegramError } from "../errors";
 import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PublicationContract, PublicationPlan, QueueItemStatus, StoredMessageSnapshot } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { ChatId } from "../types";
+import type { OperationTracker } from "./task-supervisor";
 
 export type PublicationOutcome =
   | { kind: "empty" }
@@ -45,8 +46,15 @@ export const createPublicationService = (input: {
   clock: Clock;
   logger: Logger;
   operationId?: () => string;
+  operationTracker?: OperationTracker;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
+
+  const tracked = async <T>(operationId: string, work: () => Promise<T>): Promise<T> => {
+    const finish = input.operationTracker?.begin(operationId);
+    try { return await work(); }
+    finally { finish?.(); }
+  };
 
   const cleanupDestination = async (ids: readonly MessageId[]): Promise<boolean> => {
     if (ids.length === 0) return true;
@@ -258,22 +266,24 @@ export const createPublicationService = (input: {
   const cleanupPending = async (itemId: number): Promise<PublicationOutcome> => {
     const operation = input.queue.operationForItem(itemId);
     if (!operation) return { kind: "failed", itemId, status: "published_cleanup_pending", error: "Missing publication operation" };
-    const sourceIds = input.queue.operationSourceIds(operation.id);
-    if (sourceIds.length === 0) return { kind: "uncertain", itemId, operationId: operation.id };
-    try {
-      await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
-      input.queue.markCompleted(itemId, operation.id, input.clock.now());
-      return { kind: "published", itemId, destinationMessageIds: input.queue.operationOutputIds(operation.id, "destination"), operationId: operation.id };
-    } catch (error) {
-      const normalized = classifyTelegramError(error);
-      if (normalized.kind === "source_missing") {
-        input.queue.markMissing(itemId, operation.id, input.clock.now());
+    return tracked(operation.id, async () => {
+      const sourceIds = input.queue.operationSourceIds(operation.id);
+      if (sourceIds.length === 0) return { kind: "uncertain", itemId, operationId: operation.id };
+      try {
+        await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
+        input.queue.markCompleted(itemId, operation.id, input.clock.now());
         return { kind: "published", itemId, destinationMessageIds: input.queue.operationOutputIds(operation.id, "destination"), operationId: operation.id };
+      } catch (error) {
+        const normalized = classifyTelegramError(error);
+        if (normalized.kind === "source_missing") {
+          input.queue.markMissing(itemId, operation.id, input.clock.now());
+          return { kind: "published", itemId, destinationMessageIds: input.queue.operationOutputIds(operation.id, "destination"), operationId: operation.id };
+        }
+        input.queue.setOperationState(operation.id, "cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
+        input.queue.setOperationPhase(operation.id, "source_cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
+        return { kind: "cleanup_pending", itemId, operationId: operation.id };
       }
-      input.queue.setOperationState(operation.id, "cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
-      input.queue.setOperationPhase(operation.id, "source_cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
-      return { kind: "cleanup_pending", itemId, operationId: operation.id };
-    }
+    });
   };
 
   const publishNext = async (type: "publish" | "manual_publish" = "publish"): Promise<PublicationOutcome> => {
@@ -291,7 +301,7 @@ export const createPublicationService = (input: {
     const operationId = newOperationId();
     const claimed = input.queue.claimPublication(operationId, type, input.clock.now());
     if (!claimed) return { kind: "blocked", itemId: head.id, status: "claimed_elsewhere", reason: "concurrent_claim" };
-    return publishClaimed(claimed, preparation);
+    return tracked(operationId, () => publishClaimed(claimed, preparation));
   };
 
   return { publishNext, cleanupPending, publishClaimed };

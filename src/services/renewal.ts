@@ -4,6 +4,7 @@ import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } fr
 import type { Logger } from "../logger";
 import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, StoredMessageSnapshot } from "../types";
 import type { TelegramGateway } from "../telegram";
+import type { OperationTracker } from "./task-supervisor";
 
 export type RenewalOutcome =
   | { kind: "nothing_due" }
@@ -25,8 +26,15 @@ export const createRenewalService = (input: {
   clock: Clock;
   logger: Logger;
   operationId?: () => string;
+  operationTracker?: OperationTracker;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
+
+  const tracked = async <T>(operationId: string, work: () => Promise<T>): Promise<T> => {
+    const finish = input.operationTracker?.begin(operationId);
+    try { return await work(); }
+    finally { finish?.(); }
+  };
 
   const replacementSnapshots = (snapshots: readonly StoredMessageSnapshot[], messageIds: readonly MessageId[], now: number): StoredMessageSnapshot[] => {
     if (snapshots.length !== messageIds.length) throw new Error("Renewal output count does not match source count");
@@ -141,24 +149,28 @@ export const createRenewalService = (input: {
     }
   };
 
+  const renewClaimedTracked = async (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): Promise<RenewalOutcome> => tracked(claimed.operationId, () => renewClaimed(claimed));
+
   const renewNext = async (minimumAgeMs: number): Promise<RenewalOutcome> => {
     const now = input.clock.now();
     const claimed = input.queue.claimRenewal(newOperationId(), now, now - minimumAgeMs);
     if (!claimed) return { kind: "nothing_due" };
-    return renewClaimed(claimed);
+    return renewClaimedTracked(claimed);
   };
 
   const cleanupPending = async (itemId: number): Promise<RenewalOutcome> => {
     const item = input.queue.findItemById(itemId);
     const operation = input.queue.operationForItem(itemId);
     if (!item || !operation || item.maintenanceStatus !== "renewal_cleanup_pending" || item.sourceGeneration < 1) return { kind: "blocked", itemId, reason: "renewal_cleanup_not_pending" };
-    const oldSourceIds = input.queue.getMessages(itemId, operation.capturedSourceGeneration).map((message) => message.telegramMessageId);
-    return cleanupOldGeneration({
-      item: { ...item, maintenanceStatus: "renewing" },
-      operationId: operation.id,
-      capturedContentVersion: operation.capturedContentVersion,
-      capturedSourceGeneration: operation.capturedSourceGeneration,
-    }, oldSourceIds, item.sourceGeneration);
+    return tracked(operation.id, async () => {
+      const oldSourceIds = input.queue.getMessages(itemId, operation.capturedSourceGeneration).map((message) => message.telegramMessageId);
+      return cleanupOldGeneration({
+        item: { ...item, maintenanceStatus: "renewing" },
+        operationId: operation.id,
+        capturedContentVersion: operation.capturedContentVersion,
+        capturedSourceGeneration: operation.capturedSourceGeneration,
+      }, oldSourceIds, item.sourceGeneration);
+    });
   };
 
   return { renewNext, renewClaimed, cleanupPending };

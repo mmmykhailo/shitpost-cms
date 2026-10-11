@@ -119,10 +119,10 @@ const main = async (): Promise<void> => {
   }
 
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: systemClock.now });
-  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock: systemClock, logger });
-  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock: systemClock, logger });
+  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock: systemClock, logger, operationTracker });
+  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock: systemClock, logger, operationTracker });
   const scheduler = createSchedulerService({ schedule, publisher, clock: systemClock, logger });
-  const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId });
+  const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId, operationTracker });
   const orphanCleanup = createOrphanCleanupService({ orphan: orphanRepository, gateway, clock: systemClock, logger });
   const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns });
   const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });
@@ -140,6 +140,7 @@ const main = async (): Promise<void> => {
     recovery,
     health,
     logger,
+    operationTracker,
     now: systemClock.now,
   });
   bot.catch((error) => {
@@ -149,9 +150,7 @@ const main = async (): Promise<void> => {
   supervisor.start("renewal", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
-        const finish = operationTracker.begin("renewal");
-        try { await renewal.renewNext(RENEWAL_START_AGE_MS); }
-        finally { finish(); }
+        await renewal.renewNext(RENEWAL_START_AGE_MS);
       } catch (error) {
         logger.error("renewal_worker_failed", { error: safeErrorDescription(error) });
       }

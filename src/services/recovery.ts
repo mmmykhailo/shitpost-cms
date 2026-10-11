@@ -7,6 +7,7 @@ import type { Logger } from "../logger";
 import type { ChatId, Clock, MessageId, SemanticOrigin, UserId } from "../types";
 import { asChatId, asMessageId } from "../types";
 import type { TelegramGateway } from "../telegram";
+import type { OperationTracker } from "./task-supervisor";
 
 export const queueInternalId = (queueChannelId: ChatId): string => {
   const value = String(Math.abs(queueChannelId));
@@ -62,6 +63,7 @@ export const createRecoveryService = (input: {
   recovery?: RecoveryRepository;
   bootId?: string;
   operationId?: () => string;
+  operationTracker?: OperationTracker;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
   const bootId = input.bootId ?? "manual-recovery";
@@ -83,8 +85,7 @@ export const createRecoveryService = (input: {
     }
   };
 
-  const recover = async (reference: string | readonly number[]): Promise<{ itemId: number; sourceIds: MessageId[] }> => {
-    const operationId = newOperationId();
+  const recoverUntracked = async (operationId: string, reference: string | readonly number[]): Promise<{ itemId: number; sourceIds: MessageId[] }> => {
     const numericIds = typeof reference === "string" ? parseRecoveryReference(reference, input.queueChannelId) : [...reference];
     if (numericIds.length < 1 || numericIds.length > 10) throw new Error("Recovery accepts 1–10 messages");
     if (numericIds.some((id) => !Number.isSafeInteger(id) || id < 1) || numericIds.some((id, index) => index > 0 && id <= numericIds[index - 1]!)) throw new Error("Recovery IDs must be strictly increasing");
@@ -120,6 +121,13 @@ export const createRecoveryService = (input: {
       else input.recovery?.setPhase(operationId, "failed", input.clock.now(), error instanceof Error ? error.message : "recovery failed");
       throw error;
     }
+  };
+
+  const recover = async (reference: string | readonly number[]): Promise<{ itemId: number; sourceIds: MessageId[] }> => {
+    const operationId = newOperationId();
+    const finish = input.operationTracker?.begin(operationId);
+    try { return await recoverUntracked(operationId, reference); }
+    finally { finish?.(); }
   };
 
   return { recover };
