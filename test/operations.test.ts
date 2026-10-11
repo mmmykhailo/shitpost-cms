@@ -7,7 +7,7 @@ import { createAlertRepository } from "../src/db/alert-repository";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
 import { createGeneratedMessageRepository, createQueueRepository } from "../src/db/repositories";
-import { createAlertService } from "../src/services/alerts";
+import { createAlertService, resolutionTextForDedupeKey } from "../src/services/alerts";
 import { calculateRenewalCapacity } from "../src/services/capacity";
 import { createBackupService } from "../src/services/backup";
 import { createRestoreService } from "../src/services/restore";
@@ -45,6 +45,31 @@ describe("operations safety net", () => {
     await service.resolve("permissions:-100", "Rights restored", 1_002);
     await service.raise("permissions:-100", "immediate", "Rights lost again", 1_003);
     expect(messages).toHaveLength(3);
+  });
+
+  test("labels alert resolutions with the exact publication item", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-alert-labels-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    resources.push({ directory, close: database.close });
+    const messages: string[] = [];
+    const gateway = {
+      getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
+      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
+      sendAdminMessage: async ({ text }: { text: string }) => { messages.push(text); return asMessageId(messages.length); },
+    } satisfies TelegramGateway;
+    const service = createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") });
+
+    await service.raise("uncertain_publish:1", "immediate", "Publication for queue item #1 is uncertain.", 1_000);
+    await service.resolve("uncertain_publish:1", resolutionTextForDedupeKey("uncertain_publish:1"), 1_001);
+    await service.raise("uncertain_publish:2", "immediate", "Publication for queue item #2 is uncertain.", 1_002);
+
+    expect(messages).toEqual([
+      "[immediate] Publication for queue item #1 is uncertain.",
+      "Resolved: Publication uncertainty for queue item #1 cleared.",
+      "[immediate] Publication for queue item #2 is uncertain.",
+    ]);
+    expect(service.active().map((alert) => alert.dedupeKey)).toEqual(["uncertain_publish:2"]);
+    expect(resolutionTextForDedupeKey("future_condition:example")).toBe("Condition future_condition:example cleared.");
   });
 
   test("projects renewal throughput against the 46-hour deadline", () => {

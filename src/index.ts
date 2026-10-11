@@ -17,7 +17,7 @@ import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
-import { createAlertService } from "./services/alerts";
+import { createAlertService, resolutionTextForDedupeKey } from "./services/alerts";
 import { createHealthService } from "./services/health";
 import { createRetentionService } from "./services/retention";
 import { createBackupService } from "./services/backup";
@@ -318,7 +318,7 @@ const main = async (): Promise<void> => {
         if (!capacity.safe) await raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`);
         for (const existing of alertRepository.active()) {
           const dynamic = /^(?:renewal_warning|renewal_critical|blocked_head|needs_edit|needs_review|uncertain_publish|uncertain_renewal|deleted_external|orphan_manual|renewal_capacity|permissions):/.test(existing.dedupeKey) || existing.dedupeKey === "renewal_capacity";
-          if (dynamic && !activeConditions.has(existing.dedupeKey)) await alerts.resolve(existing.dedupeKey, "Condition cleared.", now);
+          if (dynamic && !activeConditions.has(existing.dedupeKey)) await alerts.resolve(existing.dedupeKey, resolutionTextForDedupeKey(existing.dedupeKey), now);
         }
       } catch (error) {
         logger.error("alert_worker_failed", { error: safeErrorDescription(error) });
