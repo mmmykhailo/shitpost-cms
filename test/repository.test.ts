@@ -98,6 +98,20 @@ describe("queue repository", () => {
     expect((database.raw.query("SELECT phase, state FROM operations WHERE id = 'renew-recover'").get() as { phase: string; state: string })).toEqual({ phase: "generation_installed", state: "cleanup_pending" });
   });
 
+  test("admin adoption installs renewal replacements without changing logical status", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(27), telegramDate: 0 }), 1_000);
+    queue.transition(1, "queued", "blocked", 2_000, "manual_block", "keep blocked");
+    const claimed = queue.claimRenewal("renew-adopt", 100_000, 64_000)!;
+    queue.setRenewalUncertain(1, claimed.operationId, 100_001, "ambiguous_send_result", "Telegram response was lost");
+    queue.adoptUncertainRenewalGeneration({ operationId: claimed.operationId, itemId: 1, capturedContentVersion: claimed.capturedContentVersion, capturedSourceGeneration: claimed.capturedSourceGeneration }, [asMessageId(903)], 100_002);
+
+    expect(queue.findItemById(1)?.status).toBe("blocked");
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    expect(queue.currentSourceIds(1)).toEqual([asMessageId(903)]);
+    expect((database.raw.query("SELECT kind FROM generated_messages WHERE chat_id = -100 AND message_id = 903").get() as { kind: string }).kind).toBe("renewal");
+  });
+
   test("startup recovery never treats recorded base output as complete publication", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(24) }), 1_000);

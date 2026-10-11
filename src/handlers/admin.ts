@@ -3,6 +3,7 @@ import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { classifyTelegramError } from "../errors";
 import { validateAlias } from "../domain/byline";
 import { formatUtcSlot, parseUtcSlot } from "../domain/schedule";
+import { validateOrderedMessageIds } from "../domain/validation";
 import type { PolicyRepository, QueueRepository, ScheduleRepository } from "../db/repositories";
 import type { AdminRepository } from "../db/admin-repository";
 import type { AppConfig } from "../config";
@@ -12,7 +13,7 @@ import type { PublicationService } from "../services/publisher";
 import type { SchedulerService } from "../services/scheduler";
 import type { RecoveryService } from "../services/recovery";
 import type { HealthService } from "../services/health";
-import type { ChatId, UserId } from "../types";
+import type { ChatId, MessageId, UserId } from "../types";
 
 type AdminDeps = {
   config: AppConfig;
@@ -30,6 +31,13 @@ type AdminDeps = {
 };
 
 const cleanDisplay = (value: string | undefined): string => (value ?? "").replace(/[\u0000-\u001F\u007F]/gu, " ").slice(0, 120);
+
+const parseMessageIds = (text: string, expectedCount?: number): MessageId[] => {
+  const parts = text.split(/[\s,]+/u).filter(Boolean);
+  if (expectedCount !== undefined && parts.length !== expectedCount) throw new Error(`Enter exactly ${expectedCount} message ID${expectedCount === 1 ? "" : "s"}, in Telegram order.`);
+  if (parts.some((part) => !/^\d+$/u.test(part))) throw new Error("Message IDs must be positive decimal integers.");
+  return validateOrderedMessageIds(parts.map((part) => Number(part)), "messageIds");
+};
 
 const isAuthorized = (ctx: Context, adminUserId: UserId): boolean => ctx.from?.id === adminUserId && ctx.chat?.type === "private";
 
@@ -184,6 +192,47 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       return true;
     }
+    if (prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup") {
+      const state = prompt.state && typeof prompt.state === "object" ? prompt.state as Record<string, unknown> : {};
+      const itemId = typeof state.itemId === "number" ? state.itemId : undefined;
+      const operationId = typeof state.operationId === "string" ? state.operationId : undefined;
+      const sourceGeneration = typeof state.sourceGeneration === "number" ? state.sourceGeneration : undefined;
+      const expectedCount = typeof state.expectedCount === "number" ? state.expectedCount : undefined;
+      const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
+      const evidence = itemId === undefined ? undefined : deps.queue.operationEvidence(itemId);
+      if (itemId === undefined || !item || !evidence || operationId === undefined || sourceGeneration === undefined || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== operationId || evidence.capturedSourceGeneration !== sourceGeneration) {
+        deps.admin.clearPrompt(deps.config.adminUserId);
+        await ctx.reply("This renewal resolution is stale; reopen the queue.");
+        return true;
+      }
+      try {
+        if (prompt.kind === "renewal_adopt") {
+          if (expectedCount === undefined) throw new Error("This renewal has no captured replacement count; use manual cleanup.");
+          const ids = parseMessageIds(text.trim(), expectedCount);
+          deps.queue.adoptUncertainRenewalGeneration({ operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: sourceGeneration }, ids, deps.now());
+          deps.admin.clearPrompt(deps.config.adminUserId);
+          await ctx.reply(`Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.`);
+        } else {
+          const ids = parseMessageIds(text.trim());
+          try {
+            await deps.gateway.deleteMessages(deps.config.queueChannelId, ids);
+            deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), [], "manual_cleanup");
+          } catch (error) {
+            const normalized = classifyTelegramError(error);
+            if (normalized.kind !== "source_missing") {
+              deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), ids, "manual_cleanup");
+            } else {
+              deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), [], "manual_cleanup");
+            }
+          }
+          deps.admin.clearPrompt(deps.config.adminUserId);
+          await ctx.reply(`Recorded explicit cleanup handling for queue item #${itemId}.`);
+        }
+      } catch (error) {
+        await ctx.reply(error instanceof Error ? error.message : "Could not apply that renewal resolution.");
+      }
+      return true;
+    }
     return false;
   };
 
@@ -298,11 +347,34 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const evidence = deps.queue.operationEvidence(itemId);
         if (!item || item.maintenanceStatus !== "uncertain_renewal" || !evidence) return ctx.reply("This renewal is no longer awaiting resolution.");
         const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
+        if (evidence.expectedSourceCount !== undefined && evidence.knownReplacementIds.length === evidence.expectedSourceCount) rows.push([await button(deps, "Adopt known replacements", "renewal_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        if (evidence.expectedSourceCount !== undefined) rows.push([await button(deps, "Enter exact replacements", "renewal_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedSourceCount }, item.contentVersion)]);
         if (evidence.knownReplacementIds.length === 0) rows.push([await button(deps, "Confirm no replacement exists", "renewal_no_replacement", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
         else rows.push([await button(deps, "Delete known replacements", "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        rows.push([await button(deps, "Enter manual cleanup IDs", "renewal_cleanup_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
         rows.push([await button(deps, "Back", "queue")]);
-        return ctx.reply([`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs: ${evidence.knownReplacementIds.join(", ") || "none"}`, "The logical publication status remains unchanged until a physical resolution is confirmed."].join("\n"), { reply_markup: keyboard(rows) });
+        return ctx.reply([`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs: ${evidence.knownReplacementIds.join(", ") || "none"}`, `Expected replacement count: ${evidence.expectedSourceCount ?? "unknown"}`, "The logical publication status remains unchanged until a physical resolution is confirmed."].join("\n"), { reply_markup: keyboard(rows) });
       }
+      case "renewal_adopt_known": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedSourceCount !== evidence.knownReplacementIds.length) return ctx.reply("This renewal evidence is incomplete or stale; enter the exact replacement IDs instead.");
+        try {
+          deps.queue.adoptUncertainRenewalGeneration({ operationId: evidence.operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration }, evidence.knownReplacementIds, deps.now());
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Could not adopt those replacement IDs.");
+        }
+      }
+      case "renewal_adopt_prompt":
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number") return ctx.reply("Invalid renewal resolution.");
+        deps.admin.setPrompt(deps.config.adminUserId, "renewal_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount }, ctx.callbackQuery?.message?.message_id, deps.now());
+        return ctx.reply(`Reply with exactly ${payload.expectedCount} replacement message IDs in Telegram order, separated by spaces or commas.`);
+      case "renewal_cleanup_prompt":
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        deps.admin.setPrompt(deps.config.adminUserId, "renewal_manual_cleanup", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration }, ctx.callbackQuery?.message?.message_id, deps.now());
+        return ctx.reply("Reply with the exact replacement message IDs to delete or retry, in Telegram order. The item remains blocked until this explicit cleanup decision is recorded.");
       case "renewal_no_replacement": {
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
@@ -317,8 +389,13 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const evidence = deps.queue.operationEvidence(itemId);
         if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This renewal resolution is stale.");
         try {
-          await deps.gateway.deleteMessages(deps.config.queueChannelId, evidence.knownReplacementIds);
-          deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "no_replacement");
+          try {
+            await deps.gateway.deleteMessages(deps.config.queueChannelId, evidence.knownReplacementIds);
+          } catch (error) {
+            const normalized = classifyTelegramError(error);
+            if (normalized.kind !== "source_missing") throw error;
+          }
+          deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "manual_cleanup");
           return sendQueue(ctx);
         } catch (error) {
           return ctx.reply(`Replacement cleanup failed (${classifyTelegramError(error).kind}); the item remains uncertain.`);

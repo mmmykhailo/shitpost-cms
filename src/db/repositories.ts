@@ -631,6 +631,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   const operationEvidence = (itemId: number): {
     operationId: string;
     type: string;
+    expectedSourceCount?: number;
     phase: string;
     expectedOutputCount?: number;
     sourceIds: MessageId[];
@@ -639,11 +640,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     capturedContentVersion: number;
     capturedSourceGeneration: number;
   } | undefined => {
-    const operation = database.raw.query("SELECT id, type, phase, expected_output_count, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; type: string; phase: string; expected_output_count: number | null; captured_content_version: number; captured_source_generation: number } | null;
+    const operation = database.raw.query("SELECT id, type, phase, expected_source_count, expected_output_count, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; type: string; phase: string; expected_source_count: number | null; expected_output_count: number | null; captured_content_version: number; captured_source_generation: number } | null;
     if (!operation) return undefined;
     const result: {
       operationId: string;
       type: string;
+      expectedSourceCount?: number;
       phase: string;
       expectedOutputCount?: number;
       sourceIds: MessageId[];
@@ -661,6 +663,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       capturedContentVersion: operation.captured_content_version,
       capturedSourceGeneration: operation.captured_source_generation,
     };
+    if (operation.expected_source_count !== null) result.expectedSourceCount = operation.expected_source_count;
     if (operation.expected_output_count !== null) result.expectedOutputCount = operation.expected_output_count;
     return result;
   };
@@ -693,14 +696,48 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const resolveUncertainRenewal = (itemId: number, operationId: string, contentVersion: number, sourceGeneration: number, now: number, orphanIds: readonly number[], mode: "no_replacement" | "manual_cleanup"): void => database.transaction(() => {
+    const validatedOrphanIds = orphanIds.length === 0 ? [] : validateOrderedMessageIds(orphanIds, "orphanMessageIds");
     const itemResult = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL, last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_status = 'uncertain_renewal' AND maintenance_operation_id = ? AND content_version = ? AND source_generation = ?").run(mode, mode, itemId, operationId, contentVersion, sourceGeneration);
-    if (Number(itemResult.changes) !== 1) throw new Error("Uncertain renewal resolution is stale");
+    if (Number(itemResult.changes) !== 1) throw conflict("Uncertain renewal resolution is stale");
     const item = findItemById(itemId);
     if (!item) throw new Error("Queue item disappeared during renewal resolution");
     const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL)");
-    for (const messageId of orphanIds) orphanInsert.run(itemId, sourceGeneration, item.queueChatId, messageId, "admin_manual_cleanup", now, now, now);
+    for (const messageId of validatedOrphanIds) orphanInsert.run(itemId, sourceGeneration, item.queueChatId, messageId, "admin_manual_cleanup", now, now, now);
     database.raw.query("UPDATE operations SET state = 'failed', phase = 'failed', error_code = ?, updated_at = ? WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").run(mode, now, operationId, itemId, contentVersion, sourceGeneration);
-    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_renewal_resolved', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ mode, orphanIds }), now);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_renewal_resolved', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ mode, orphanIds: validatedOrphanIds }), now);
+  });
+
+  const adoptUncertainRenewalGeneration = (guard: OperationGuard, replacementIds: readonly number[], now: number): number => database.transaction(() => {
+    const validatedReplacementIds = validateOrderedMessageIds(replacementIds, "replacementMessageIds");
+    const operation = database.raw.query("SELECT type, phase, expected_source_count FROM operations WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ?").get(guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration) as { type: string; phase: string; expected_source_count: number | null } | null;
+    if (!operation || operation.type !== "renew" || operation.phase !== "uncertain" || operation.expected_source_count !== validatedReplacementIds.length) throw conflict("Uncertain renewal adoption contract is stale");
+    const item = findItemById(guard.itemId);
+    if (!item || item.maintenanceStatus !== "uncertain_renewal" || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Uncertain renewal adoption guard conflict");
+    const originals = getMessages(item.id, guard.capturedSourceGeneration).sort((left, right) => left.ordinal - right.ordinal);
+    if (originals.length !== validatedReplacementIds.length) throw conflict("Uncertain renewal adoption source count does not match the captured contract");
+    for (const messageId of validatedReplacementIds) {
+      const outputOwner = database.raw.query("SELECT operation_id FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(item.queueChatId, messageId) as { operation_id: string } | null;
+      if (outputOwner && outputOwner.operation_id !== guard.operationId) throw conflict("A replacement message belongs to another operation");
+      const generatedOwner = database.raw.query("SELECT operation_id FROM generated_messages WHERE chat_id = ? AND message_id = ?").get(item.queueChatId, messageId) as { operation_id: string } | null;
+      if (generatedOwner && generatedOwner.operation_id !== guard.operationId) throw conflict("A replacement message is already registered to another operation");
+    }
+    for (const [ordinal, messageId] of validatedReplacementIds.entries()) {
+      recordOutput(guard.operationId, "replacement", item.queueChatId, messageId, ordinal, now);
+      database.raw.query("INSERT OR IGNORE INTO generated_messages (chat_id, message_id, operation_id, kind, created_at, consumed_at) VALUES (?, ?, ?, 'renewal', ?, NULL)").run(item.queueChatId, messageId, guard.operationId, now);
+    }
+    const recordedIds = operationOutputIds(guard.operationId, "replacement");
+    if (recordedIds.length !== validatedReplacementIds.length || recordedIds.some((messageId, index) => messageId !== validatedReplacementIds[index])) throw conflict("Replacement output evidence changed during adoption");
+    const nextGeneration = guard.capturedSourceGeneration + 1;
+    for (const [ordinal, message] of originals.entries()) {
+      const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
+      insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: validatedReplacementIds[ordinal]!, ordinal, telegramDate: now });
+    }
+    const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_status = 'uncertain_renewal' AND maintenance_operation_id = ? AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw conflict("Uncertain renewal adoption lost its item guard");
+    setOperationState(guard.operationId, "cleanup_pending", now);
+    setOperationPhase(guard.operationId, "generation_installed", now);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_renewal_replacements_adopted', 'admin', ?, ?, ?, ?)").run(item.id, guard.operationId, JSON.stringify({ replacementIds: validatedReplacementIds }), now);
+    return nextGeneration;
   });
 
   const moveToEnd = (itemId: number, now: number): void => database.transaction(() => {
@@ -805,6 +842,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     requeueUncertainPublication,
     adoptConfirmedPublicationOutputs,
     resolveUncertainRenewal,
+    adoptUncertainRenewalGeneration,
     moveToEnd,
     statusCounts,
     currentSourceIds,
