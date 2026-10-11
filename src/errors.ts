@@ -56,6 +56,3 @@ export const classifyTelegramError = (error: unknown, method?: string): Normaliz
   if (method !== undefined) normalized.method = method;
   return normalized;
 };
-
-export const isRetryable = (error: NormalizedTelegramError): boolean =>
-  error.kind === "rate_limited" || error.kind === "transient_network" || error.kind === "transient_server";

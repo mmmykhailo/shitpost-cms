@@ -64,4 +64,20 @@ describe("error boundaries", () => {
   test("classifies Telegram's ordinary age-limit deletion response", () => {
     expect(classifyTelegramError(new Error("Bad Request: message can't be deleted for everyone")).kind).toBe("telegram_age_limit");
   });
+
+  test("classifies Telegram descriptions at the boundary", () => {
+    const cases = [
+      [new Error("Too Many Requests: retry later"), "rate_limited"],
+      [new Error("Bad Request: message to delete not found"), "source_missing"],
+      [new Error("Bad Request: the message can't be forwarded"), "content_protected"],
+      [new Error("Forbidden: not enough rights"), "permission_denied"],
+      [new Error("Bad Request: chat not found"), "destination_unavailable"],
+      [new Error("Bad Request: message is too long"), "invalid_content_or_entities"],
+      [new Error("Bad Request: unsupported paid media"), "unsupported_content"],
+      [Object.assign(new Error("server failed"), { error_code: 500 }), "transient_server"],
+      [new Error("fetch failed: socket reset"), "transient_network"],
+    ] as const;
+    for (const [error, kind] of cases) expect(classifyTelegramError(error).kind).toBe(kind);
+    expect(classifyTelegramError(new Error("forbidden"), "deleteMessages").method).toBe("deleteMessages");
+  });
 });
