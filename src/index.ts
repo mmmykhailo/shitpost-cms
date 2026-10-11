@@ -289,6 +289,7 @@ const main = async (): Promise<void> => {
       if (signal.aborted || stopped) return;
       if (!runtime.heartbeat()) {
         logger.error("singleton_lease_lost", {});
+        void alerts.raise("runtime_lease", "immediate", "The queue bot lost its singleton database lease and is shutting down.", systemClock.now()).catch((error) => logger.error("runtime_lease_alert_failed", { error: safeErrorDescription(error) }));
         void shutdown("lease_lost");
         return;
       }
