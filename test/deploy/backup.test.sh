@@ -34,7 +34,7 @@ backup_count="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.sqlite' -print |
 [ "$backup_count" -eq 8 ]
 [ -f "$FIRST_BACKUP" ]
 [ -f "${FIRST_BACKUP}.keep" ]
-[ "$(stat -f '%Lp' "$BACKUP_DIR" 2>/dev/null || stat -c '%a' "$BACKUP_DIR")" = 700 ]
+[ "$(stat -c '%a' "$BACKUP_DIR" 2>/dev/null || stat -f '%Lp' "$BACKUP_DIR")" = 700 ]
 
 printf '%s\n' 'not a SQLite database' > "$FAKE_ROOT/data/bot.sqlite"
 if DATABASE_PATH="$FAKE_ROOT/data/bot.sqlite" RELEASE_SHA="$BASE_RELEASE_SHA" "$SCRIPT_PATH" > "$FAKE_ROOT/integrity-failure.log" 2>&1; then
