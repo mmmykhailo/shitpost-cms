@@ -329,4 +329,81 @@ describe("admin schedule handlers", () => {
       harness.close();
     }
   });
+
+  test("binds every callback-created prompt to its own outgoing question", async () => {
+    const harness = createHarness();
+    const cases = [
+      { action: "slot_add", payload: {}, kind: "slot_add", state: {}, placeholder: "HH:MM UTC" },
+      { action: "whitelist_add", payload: {}, kind: "whitelist_add", state: {}, placeholder: "@channel or numeric ID" },
+      { action: "alias_add", payload: {}, kind: "alias_add", state: {}, placeholder: "user and alias" },
+      {
+        action: "uncertain_publish_adopt_prompt",
+        payload: { itemId: 7, operationId: "publish-7", sourceGeneration: 2, expectedCount: 3, phase: "uncertain" },
+        kind: "uncertain_publish_adopt",
+        state: { itemId: 7, operationId: "publish-7", sourceGeneration: 2, expectedCount: 3, phase: "uncertain" },
+        placeholder: "message IDs",
+      },
+      {
+        action: "renewal_adopt_prompt",
+        payload: { itemId: 8, operationId: "renew-8", sourceGeneration: 4, expectedCount: 2, phase: "uncertain" },
+        kind: "renewal_adopt",
+        state: { itemId: 8, operationId: "renew-8", sourceGeneration: 4, expectedCount: 2, phase: "uncertain" },
+        placeholder: "message IDs",
+      },
+      {
+        action: "renewal_cleanup_prompt",
+        payload: { itemId: 9, operationId: "renew-9", sourceGeneration: 5, phase: "uncertain" },
+        kind: "renewal_manual_cleanup",
+        state: { itemId: 9, operationId: "renew-9", sourceGeneration: 5, phase: "uncertain" },
+        placeholder: "message IDs",
+      },
+    ] as const;
+    try {
+      for (const [index, entry] of cases.entries()) {
+        const source = makeMessage(800 + index, "admin menu", BOT_INFO);
+        const token = harness.admin.createCallbackToken(ADMIN_ID, entry.action, entry.payload, NOW);
+        await harness.run(callbackUpdate(100 + index, `callback-prompt-${index}`, `v1:${token}`, source));
+        const question = harness.lastSent();
+        expect(question.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: entry.placeholder });
+        expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: entry.kind, state: entry.state, expectedReplyToMessageId: question.message.message_id });
+        expect(harness.admin.getPrompt(ADMIN_ID, NOW)?.expectedReplyToMessageId).not.toBe(source.message_id);
+      }
+
+      await harness.run(commandUpdate(200, 200, "recover"));
+      const recoveryQuestion = harness.lastSent();
+      expect(recoveryQuestion.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: "queue link or message ID" });
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: "recover", state: {}, expectedReplyToMessageId: recoveryQuestion.message.message_id });
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("replaces schedule menus after pause and resume", async () => {
+    const harness = createHarness();
+    try {
+      harness.schedule.addSlot(300, ADMIN_ID, NOW);
+      harness.schedule.setEnabled(true, ADMIN_ID, NOW);
+      await harness.run(commandUpdate(210, 210, "schedule"));
+      const runningMenu = harness.lastSent();
+      expect(runningMenu.message.text).toContain("Schedule is running. Slots: 05:00 UTC");
+
+      await harness.run(callbackUpdate(211, "callback-pause", harness.callbackData(runningMenu, "Pause"), runningMenu.message));
+      const pausedMenu = harness.lastSent();
+      expect(harness.schedule.enabled()).toBe(false);
+      expect(pausedMenu.message.text).toContain("Schedule is paused. Slots: 05:00 UTC");
+      expect(harness.callbackData(pausedMenu, "Resume")).toMatch(/^v1:/);
+
+      await harness.run(callbackUpdate(212, "callback-resume", harness.callbackData(pausedMenu, "Resume"), pausedMenu.message));
+      const resumedMenu = harness.lastSent();
+      expect(harness.schedule.enabled()).toBe(true);
+      expect(resumedMenu.message.text).toContain("Schedule is running. Slots: 05:00 UTC");
+      expect(harness.callbackData(resumedMenu, "Pause")).toMatch(/^v1:/);
+      expect(harness.deleted).toEqual([
+        { chatId: ADMIN_CHAT_ID, messageIds: [runningMenu.message.message_id] },
+        { chatId: ADMIN_CHAT_ID, messageIds: [pausedMenu.message.message_id] },
+      ]);
+    } finally {
+      harness.close();
+    }
+  });
 });
