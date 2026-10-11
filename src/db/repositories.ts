@@ -578,12 +578,86 @@ export const createQueueRepository = (database: AppDatabase) => {
   });
 
   const markAdminDeleted = (itemId: number, now: number): void => {
-    database.raw.query("UPDATE queue_items SET status = 'deleted', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND status NOT IN ('done','deleted','deleted_external')").run(now, itemId);
+    database.raw.query("UPDATE queue_items SET status = 'deleted', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL, maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ? AND status NOT IN ('done','deleted','deleted_external')").run(now, itemId);
   };
 
   const retryItem = (itemId: number, now: number): void => {
     database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND maintenance_status = 'idle' AND status IN ('blocked','needs_edit','needs_review','delete_blocked')").run(itemId);
   };
+
+  const operationEvidence = (itemId: number): {
+    operationId: string;
+    type: string;
+    phase: string;
+    expectedOutputCount?: number;
+    sourceIds: MessageId[];
+    knownDestinationIds: MessageId[];
+    knownReplacementIds: MessageId[];
+    capturedContentVersion: number;
+    capturedSourceGeneration: number;
+  } | undefined => {
+    const operation = database.raw.query("SELECT id, type, phase, expected_output_count, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; type: string; phase: string; expected_output_count: number | null; captured_content_version: number; captured_source_generation: number } | null;
+    if (!operation) return undefined;
+    const result: {
+      operationId: string;
+      type: string;
+      phase: string;
+      expectedOutputCount?: number;
+      sourceIds: MessageId[];
+      knownDestinationIds: MessageId[];
+      knownReplacementIds: MessageId[];
+      capturedContentVersion: number;
+      capturedSourceGeneration: number;
+    } = {
+      operationId: operation.id,
+      type: operation.type,
+      phase: operation.phase,
+      sourceIds: operationSourceIds(operation.id),
+      knownDestinationIds: operationOutputIds(operation.id, "destination"),
+      knownReplacementIds: operationOutputIds(operation.id, "replacement"),
+      capturedContentVersion: operation.captured_content_version,
+      capturedSourceGeneration: operation.captured_source_generation,
+    };
+    if (operation.expected_output_count !== null) result.expectedOutputCount = operation.expected_output_count;
+    return result;
+  };
+
+  const requeueUncertainPublication = (itemId: number, operationId: string, contentVersion: number, sourceGeneration: number, now: number, reason: string): void => database.transaction(() => {
+    const result = database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = ?, last_error = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND status = 'uncertain_publish' AND content_version = ? AND source_generation = ?").run(reason, reason, itemId, contentVersion, sourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Uncertain publication resolution is stale");
+    const operation = database.raw.query("UPDATE operations SET state = 'failed', phase = 'failed', error_code = ?, updated_at = ? WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").run(reason, now, operationId, itemId, contentVersion, sourceGeneration);
+    if (Number(operation.changes) !== 1) throw new Error("Uncertain publication operation resolution is stale");
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_publication_retry_confirmed', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ reason, duplicateRisk: true }), now);
+  });
+
+  const adoptConfirmedPublicationOutputs = (itemId: number, operationId: string, contentVersion: number, sourceGeneration: number, destinationChatId: number, destinationIds: readonly number[], now: number): void => database.transaction(() => {
+    const operation = database.raw.query("SELECT expected_output_count FROM operations WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").get(operationId, itemId, contentVersion, sourceGeneration) as { expected_output_count: number | null } | null;
+    if (!operation || operation.expected_output_count === null || operation.expected_output_count !== destinationIds.length) throw new Error("Confirmed destination output count does not match the captured contract");
+    const item = findItemById(itemId);
+    if (!item || item.status !== "uncertain_publish" || item.contentVersion !== contentVersion || item.sourceGeneration !== sourceGeneration) throw new Error("Uncertain publication resolution is stale");
+    for (const [ordinal, messageId] of destinationIds.entries()) recordOutput(operationId, ordinal === destinationIds.length - 1 && destinationIds.length > inputExpectedTransferred(operationId) ? "separate_byline" : "transferred", destinationChatId, messageId, ordinal, now);
+    const itemResult = database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', destination_message_ids_json = ?, claimed_operation_id = ?, claimed_at = ? WHERE id = ? AND status = 'uncertain_publish' AND content_version = ? AND source_generation = ?").run(JSON.stringify(destinationIds), operationId, now, itemId, contentVersion, sourceGeneration);
+    if (Number(itemResult.changes) !== 1) throw new Error("Confirmed destination output adoption lost its item guard");
+    setOperationState(operationId, "cleanup_pending", now);
+    setOperationPhase(operationId, "source_cleanup_pending", now);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_publication_destination_confirmed', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ destinationIds }), now);
+  });
+
+  const inputExpectedTransferred = (operationId: string): number => {
+    const row = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(operationId) as { expected_source_count: number | null } | null;
+    return row?.expected_source_count ?? Number.MAX_SAFE_INTEGER;
+  };
+
+  const resolveUncertainRenewal = (itemId: number, operationId: string, contentVersion: number, sourceGeneration: number, now: number, orphanIds: readonly number[], mode: "no_replacement" | "manual_cleanup"): void => database.transaction(() => {
+    const itemResult = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL, last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_status = 'uncertain_renewal' AND maintenance_operation_id = ? AND content_version = ? AND source_generation = ?").run(mode, mode, itemId, operationId, contentVersion, sourceGeneration);
+    if (Number(itemResult.changes) !== 1) throw new Error("Uncertain renewal resolution is stale");
+    const item = findItemById(itemId);
+    if (!item) throw new Error("Queue item disappeared during renewal resolution");
+    const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL)");
+    for (const messageId of orphanIds) orphanInsert.run(itemId, sourceGeneration, item.queueChatId, messageId, "admin_manual_cleanup", now, now, now);
+    database.raw.query("UPDATE operations SET state = 'failed', phase = 'failed', error_code = ?, updated_at = ? WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").run(mode, now, operationId, itemId, contentVersion, sourceGeneration);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_renewal_resolved', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ mode, orphanIds }), now);
+  });
 
   const moveToEnd = (itemId: number, now: number): void => database.transaction(() => {
     const nextSequence = database.raw.query("SELECT COALESCE(MAX(logical_sequence), 0) + 1 AS value FROM queue_items").get() as { value: number };
@@ -661,6 +735,10 @@ export const createQueueRepository = (database: AppDatabase) => {
     markMissing,
     markAdminDeleted,
     retryItem,
+    operationEvidence,
+    requeueUncertainPublication,
+    adoptConfirmedPublicationOutputs,
+    resolveUncertainRenewal,
     moveToEnd,
     statusCounts,
     currentSourceIds,
@@ -808,8 +886,8 @@ export const createScheduleRepository = (database: AppDatabase) => {
   const markRun = (occurrenceAt: number, status: string, now: number, itemId?: number, operationId?: string, errorCode?: string): void => {
     database.raw.query("UPDATE schedule_runs SET status = ?, item_id = ?, operation_id = ?, completed_at = ?, error_code = ? WHERE occurrence_at = ? AND status IN ('pending','running')").run(status, itemId ?? null, operationId ?? null, now, errorCode ?? null, occurrenceAt);
   };
-  const markRunning = (occurrenceAt: number, operationId: string, now: number): boolean => {
-    const result = database.raw.query("UPDATE schedule_runs SET status = 'running', operation_id = ?, started_at = ? WHERE occurrence_at = ? AND status = 'pending'").run(operationId, now, occurrenceAt);
+  const markRunning = (occurrenceAt: number, now: number): boolean => {
+    const result = database.raw.query("UPDATE schedule_runs SET status = 'running', operation_id = NULL, started_at = ? WHERE occurrence_at = ? AND status = 'pending'").run(now, occurrenceAt);
     return Number(result.changes) === 1;
   };
   const lastScan = (): number | undefined => {

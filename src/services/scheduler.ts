@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { nextOccurrence, occurrencesBetween } from "../domain/schedule";
 import type { ScheduleRepository } from "../db/repositories";
 import type { Logger } from "../logger";
@@ -18,18 +17,16 @@ export const createSchedulerService = (input: {
 }) => {
   let scanBusy = false;
   let loopRunning = false;
-  const newOperationId = input.operationId ?? randomUUID;
-
-  const outcomeToRun = (outcome: PublicationOutcome): { status: "published" | "empty" | "blocked" | "failed"; itemId?: number; errorCode?: string } => {
+  const outcomeToRun = (outcome: PublicationOutcome): { status: "published" | "empty" | "blocked" | "failed"; itemId?: number; operationId: string | undefined; errorCode?: string } => {
     switch (outcome.kind) {
-      case "published": return { status: "published", itemId: outcome.itemId };
-      case "empty": return { status: "empty" };
-      case "blocked": return { status: "blocked", itemId: outcome.itemId, errorCode: outcome.reason };
-      case "cleanup_pending": return { status: "published", itemId: outcome.itemId, errorCode: "cleanup_pending" };
-      case "deleted_external": return { status: "failed", itemId: outcome.itemId, errorCode: "source_missing" };
-      case "retry_scheduled": return { status: "failed", itemId: outcome.itemId, errorCode: "retry_scheduled" };
-      case "uncertain": return { status: "failed", itemId: outcome.itemId, errorCode: "uncertain_publish" };
-      case "failed": return { status: "failed", itemId: outcome.itemId, errorCode: outcome.status };
+      case "published": return { status: "published", itemId: outcome.itemId, operationId: outcome.operationId };
+      case "empty": return { status: "empty", operationId: undefined };
+      case "blocked": return { status: "blocked", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: outcome.reason };
+      case "cleanup_pending": return { status: "published", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: "cleanup_pending" };
+      case "deleted_external": return { status: "failed", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: "source_missing" };
+      case "retry_scheduled": return { status: "failed", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: "retry_scheduled" };
+      case "uncertain": return { status: "failed", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: "uncertain_publish" };
+      case "failed": return { status: "failed", itemId: outcome.itemId, operationId: outcome.operationId, errorCode: outcome.status };
       default: {
         const exhaustive: never = outcome;
         return exhaustive;
@@ -62,11 +59,10 @@ export const createSchedulerService = (input: {
         }
         const current = input.schedule.run(occurrenceAt);
         if (!current || ["published", "empty", "blocked", "failed", "skipped_downtime"].includes(current.status)) continue;
-        const operationId = newOperationId();
-        if (!input.schedule.markRunning(occurrenceAt, operationId, now)) continue;
+        if (!input.schedule.markRunning(occurrenceAt, now)) continue;
         const outcome = await input.publisher.publishNext("publish");
         const run = outcomeToRun(outcome);
-        input.schedule.markRun(occurrenceAt, run.status, input.clock.now(), run.itemId, operationId, run.errorCode);
+        input.schedule.markRun(occurrenceAt, run.status, input.clock.now(), run.itemId, run.operationId, run.errorCode);
         input.schedule.setLastScan(input.clock.now());
         input.logger.info("schedule_run", { occurrenceAt, status: run.status, itemId: run.itemId, errorCode: run.errorCode });
         return { ran: true, occurrenceAt, outcome };

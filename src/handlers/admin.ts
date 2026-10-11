@@ -50,7 +50,7 @@ const dashboardText = (deps: AdminDeps): string => {
     "Telegram queue manager",
     `Schedule: ${status} · ${slots.map(formatUtcSlot).join(", ") || "no UTC slots"}`,
     `Next run: ${nextText}`,
-    `Queue: ${counts.queued ?? 0} queued · ${counts.blocked ?? 0} blocked · ${(counts.uncertain_publish ?? 0) + (counts.uncertain_renewal ?? 0)} uncertain`,
+    `Queue: ${counts.queued ?? 0} queued · ${counts.blocked ?? 0} blocked · ${(counts.uncertain_publish ?? 0) + deps.queue.listActive(10_000).filter((item) => item.maintenanceStatus === "uncertain_renewal").length} uncertain`,
     `Head: ${headText}`,
     `Renewal warnings: ${deps.queue.listRenewalAges(deps.now()).filter((entry) => entry.ageMs >= 42 * 60 * 60 * 1000).length}`,
   ].join("\n");
@@ -75,8 +75,15 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   const sendQueue = async (ctx: Context): Promise<void> => {
     const items = deps.queue.listActive(10, 0);
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
-    const lines = ["Queue (FIFO)", ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
-    for (const item of items) rows.push([await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion), await button(deps, `Retry #${item.id}`, "queue_retry", { itemId: item.id }, item.contentVersion), await button(deps, `Move #${item.id}`, "queue_move_end", { itemId: item.id }, item.contentVersion)]);
+    const lines = ["Queue (FIFO)", ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
+    for (const item of items) {
+      const actions: Array<Awaited<ReturnType<typeof button>>> = [await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion)];
+      if (item.status === "uncertain_publish") actions.push(await button(deps, `Resolve #${item.id}`, "queue_uncertain", { itemId: item.id }, item.contentVersion));
+      else if (item.maintenanceStatus === "uncertain_renewal") actions.push(await button(deps, `Resolve renewal #${item.id}`, "renewal_uncertain", { itemId: item.id }, item.contentVersion));
+      else if (["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status)) actions.push(await button(deps, `Retry #${item.id}`, "queue_retry", { itemId: item.id }, item.contentVersion));
+      actions.push(await button(deps, `Move #${item.id}`, "queue_move_end", { itemId: item.id }, item.contentVersion));
+      rows.push(actions);
+    }
     rows.push([await button(deps, "Back", "dashboard")]);
     await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
@@ -116,6 +123,10 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   const handlePrompt = async (ctx: Context, text: string): Promise<boolean> => {
     const prompt = deps.admin.getPrompt(deps.config.adminUserId, deps.now());
     if (!prompt) return false;
+    if (prompt.expectedReplyToMessageId !== undefined && ctx.message?.reply_to_message?.message_id !== prompt.expectedReplyToMessageId) {
+      await ctx.reply("Reply to the active admin prompt to continue, or use /cancel.");
+      return true;
+    }
     if (prompt.kind === "slot_add") {
       try {
         const slot = parseUtcSlot(text);
@@ -174,8 +185,8 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const handleCallback = async (ctx: Context): Promise<unknown> => {
-    await ctx.answerCallbackQuery();
     if (!isAuthorized(ctx, deps.config.adminUserId)) return reject(ctx);
+    await ctx.answerCallbackQuery();
     const data = ctx.callbackQuery?.data;
     if (!data?.startsWith("v1:")) return ctx.reply("Stale action.");
     const token = data.slice(3);
@@ -191,9 +202,22 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "whitelist": return sendWhitelist(ctx);
       case "authors": return sendAuthors(ctx);
       case "health": return sendHealth(ctx);
-      case "publish": await deps.scheduler.manualPublish(); return sendDashboard(ctx);
+      case "publish": {
+        const head = deps.queue.getHead();
+        if (!head) return ctx.reply("The queue is empty.");
+        if (head.status !== "queued" || head.maintenanceStatus !== "idle") return ctx.reply(`The head is ${head.status}${head.maintenanceStatus === "idle" ? "" : ` (${head.maintenanceStatus})`} and cannot be published automatically.`);
+        const confirm = await button(deps, "Confirm publish", "publish_execute", { itemId: head.id, sourceGeneration: head.sourceGeneration }, head.contentVersion);
+        return ctx.reply(`Publish queue head #${head.id} now? This captures the current policy and deletes the source only after complete destination output.`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "dashboard")]]) });
+      }
+      case "publish_execute": {
+        const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
+        if (!item || item.status !== "queued" || item.maintenanceStatus !== "idle" || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The queue head changed; reopen the dashboard.");
+        const outcome = await deps.scheduler.manualPublish();
+        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, outcome.kind === "cleanup_pending" || outcome.kind === "uncertain" ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
+        return sendDashboard(ctx);
+      }
       case "slot_add": deps.admin.setPrompt(deps.config.adminUserId, "slot_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send the exact daily UTC slot as HH:MM.");
-      case "slot_remove": if (typeof payload.minuteOfDay === "number") deps.schedule.removeSlot(payload.minuteOfDay); return sendSchedule(ctx);
+      case "slot_remove": if (typeof payload.minuteOfDay === "number") deps.schedule.removeSlot(payload.minuteOfDay, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
       case "schedule_pause": deps.schedule.setEnabled(false, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
       case "schedule_resume": if (deps.schedule.slots().length === 0) return ctx.reply("Add at least one UTC slot first."); deps.schedule.setEnabled(true, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
       case "whitelist_add": deps.admin.setPrompt(deps.config.adminUserId, "whitelist_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send an exact public @handle or numeric channel ID.");
@@ -209,8 +233,94 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId); return sendWhitelist(ctx);
       case "alias_add": deps.admin.setPrompt(deps.config.adminUserId, "alias_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send `<user id or @observed_username> <alias>`.");
       case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId); return sendAuthors(ctx);
-      case "queue_retry": if (itemId !== undefined) deps.queue.retryItem(itemId, deps.now()); return sendQueue(ctx);
-      case "queue_move_end": if (itemId !== undefined) deps.queue.moveToEnd(itemId, deps.now()); return sendQueue(ctx);
+      case "queue_retry": {
+        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        const item = deps.queue.findItemById(itemId);
+        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return ctx.reply("Uncertain and active-maintenance items require their state-specific resolution flow.");
+        deps.queue.retryItem(itemId, deps.now());
+        deps.admin.audit("queue_retry", String(deps.config.adminUserId), deps.now(), itemId, undefined, { previousStatus: item.status });
+        return sendQueue(ctx);
+      }
+      case "queue_move_end": {
+        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        const item = deps.queue.findItemById(itemId);
+        if (!item) return ctx.reply("Queue item no longer exists.");
+        const confirm = await button(deps, "Confirm move to end", "queue_move_execute", { itemId }, item.contentVersion);
+        return ctx.reply(`Move queue item #${itemId} to the FIFO end?`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "queue")]]) });
+      }
+      case "queue_move_execute": {
+        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        const item = deps.queue.findItemById(itemId);
+        if (!item || item.status === "done" || item.status === "deleted" || item.status === "deleted_external") return ctx.reply("Queue item changed; reopen the queue.");
+        deps.queue.moveToEnd(itemId, deps.now());
+        deps.admin.audit("queue_moved_to_end", String(deps.config.adminUserId), deps.now(), itemId, undefined, { contentVersion: item.contentVersion });
+        return sendQueue(ctx);
+      }
+      case "queue_uncertain": {
+        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || item.status !== "uncertain_publish" || !evidence) return ctx.reply("This publication is no longer awaiting uncertainty resolution.");
+        const retry = await button(deps, "I confirm nothing was published — retry", "uncertain_publish_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion);
+        const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[retry]];
+        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Destination is complete", "uncertain_publish_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        rows.push([await button(deps, "Delete queue item", "queue_delete", { itemId }, item.contentVersion)], [await button(deps, "Back", "queue")]);
+        return ctx.reply([`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"), { reply_markup: keyboard(rows) });
+      }
+      case "uncertain_publish_retry": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid uncertainty resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        deps.queue.requeueUncertainPublication(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), "admin_confirmed_nothing_published");
+        deps.admin.audit("uncertain_publication_retry", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { duplicateRiskConfirmed: true });
+        return sendQueue(ctx);
+      }
+      case "uncertain_publish_adopt_known": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid uncertainty resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        try {
+          deps.queue.adoptConfirmedPublicationOutputs(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.config.targetChannelId, evidence.knownDestinationIds, deps.now());
+          deps.admin.audit("uncertain_publication_destination_adopted", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { destinationIds: evidence.knownDestinationIds });
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Could not adopt those destination IDs.");
+        }
+      }
+      case "renewal_uncertain": {
+        if (itemId === undefined) return ctx.reply("Invalid renewal item.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || item.maintenanceStatus !== "uncertain_renewal" || !evidence) return ctx.reply("This renewal is no longer awaiting resolution.");
+        const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
+        if (evidence.knownReplacementIds.length === 0) rows.push([await button(deps, "Confirm no replacement exists", "renewal_no_replacement", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        else rows.push([await button(deps, "Delete known replacements", "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        rows.push([await button(deps, "Back", "queue")]);
+        return ctx.reply([`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs: ${evidence.knownReplacementIds.join(", ") || "none"}`, "The logical publication status remains unchanged until a physical resolution is confirmed."].join("\n"), { reply_markup: keyboard(rows) });
+      }
+      case "renewal_no_replacement": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.knownReplacementIds.length > 0) return ctx.reply("This renewal resolution is stale or replacements are known.");
+        deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "no_replacement");
+        return sendQueue(ctx);
+      }
+      case "renewal_delete_replacements": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This renewal resolution is stale.");
+        try {
+          await deps.gateway.deleteMessages(deps.config.queueChannelId, evidence.knownReplacementIds);
+          deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "no_replacement");
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(`Replacement cleanup failed (${classifyTelegramError(error).kind}); the item remains uncertain.`);
+        }
+      }
       case "queue_delete": {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
         const confirm = await button(deps, `Confirm delete #${itemId}`, "queue_delete_confirm", { itemId }, resolved.itemVersion);
