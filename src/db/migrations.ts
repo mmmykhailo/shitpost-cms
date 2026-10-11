@@ -191,6 +191,21 @@ const migrations: readonly Migration[] = [
       `CREATE INDEX schedule_runs_status_idx ON schedule_runs(status, occurrence_at)`,
     ],
   },
+  {
+    version: 2,
+    statements: [
+      `CREATE TABLE generated_messages (
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('renewal','recovery_preview')),
+        created_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        PRIMARY KEY (chat_id, message_id)
+      )`,
+      `CREATE INDEX generated_messages_pending_idx ON generated_messages(chat_id, message_id, consumed_at)`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database): void => {

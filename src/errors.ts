@@ -21,6 +21,11 @@ const descriptionOf = (error: unknown): string => {
 const numeric = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
 
 export const classifyTelegramError = (error: unknown, method?: string): NormalizedTelegramError => {
+  if (typeof error === "object" && error !== null && "kind" in error && "description" in error) {
+    const normalized = error as NormalizedTelegramError;
+    if (method !== undefined && normalized.method === undefined) return { ...normalized, method };
+    return normalized;
+  }
   const candidate = typeof error === "object" && error !== null ? (error as TelegramLikeError) : {};
   const code = numeric(candidate.error_code) ?? numeric(candidate.status);
   const description = descriptionOf(error);
@@ -33,7 +38,7 @@ export const classifyTelegramError = (error: unknown, method?: string): Normaliz
   else if (lower.includes("not enough rights") || lower.includes("forbidden") || code === 401 || code === 403) kind = "permission_denied";
   else if (lower.includes("chat not found") || lower.includes("destination")) kind = "destination_unavailable";
   else if (lower.includes("can't copy") || lower.includes("cannot copy") || lower.includes("unsupported") || lower.includes("paid media") || lower.includes("invoice") || lower.includes("giveaway")) kind = "unsupported_content";
-  else if (lower.includes("entity") || lower.includes("caption") || lower.includes("message is too long") || lower.includes("text is too long")) kind = "invalid_content_or_entities";
+  else if (lower.includes("entity") || lower.includes("caption") || lower.includes("message is too long") || lower.includes("text is too long") || lower.includes("exceeds telegram limit") || lower.includes("exceeds the limit")) kind = "invalid_content_or_entities";
   else if (code !== undefined && code >= 500) kind = "transient_server";
   else if (error instanceof TypeError || error instanceof Error && /fetch|network|timeout|socket|econn|reset/i.test(error.message)) kind = "transient_network";
   else kind = "unknown_permanent";

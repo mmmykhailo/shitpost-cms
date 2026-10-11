@@ -125,6 +125,16 @@ export const createQueueRepository = (database: AppDatabase) => {
     return row ? rowToItem(row) : undefined;
   };
 
+  const findCollectingAlbum = (queueChatId: number, mediaGroupId: string): QueueItemRecord | undefined => {
+    const row = database.raw.query("SELECT * FROM queue_items WHERE queue_chat_id = ? AND media_group_id = ? AND status = 'collecting' LIMIT 1").get(queueChatId, mediaGroupId) as QueueRow | null;
+    return row ? rowToItem(row) : undefined;
+  };
+
+  const findAlbum = (queueChatId: number, mediaGroupId: string): QueueItemRecord | undefined => {
+    const row = database.raw.query("SELECT * FROM queue_items WHERE queue_chat_id = ? AND media_group_id = ? AND status NOT IN ('done','deleted','deleted_external') ORDER BY logical_sequence LIMIT 1").get(queueChatId, mediaGroupId) as QueueRow | null;
+    return row ? rowToItem(row) : undefined;
+  };
+
   const getMessages = (itemId: number, generation?: number): QueueMessageRecord[] => {
     const item = findItemById(itemId);
     const selectedGeneration = generation ?? item?.sourceGeneration;
@@ -194,6 +204,16 @@ export const createQueueRepository = (database: AppDatabase) => {
       return updated;
     });
   };
+
+  const addLateAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot): QueueItemRecord => database.transaction(() => {
+    const item = findItemById(itemId);
+    if (!item || item.mediaGroupId !== snapshot.mediaGroupId || !isSourceBearing(item.status)) throw new Error("Album cannot accept a late member");
+    if (!findBySource(snapshot.chatId, snapshot.messageId)) insertSnapshot(itemId, item.sourceGeneration, snapshot);
+    database.raw.query("UPDATE queue_items SET status = 'needs_review', content_version = content_version + 1 WHERE id = ?").run(itemId);
+    const updated = findItemById(itemId);
+    if (!updated) throw new Error("Album disappeared after late member insert");
+    return updated;
+  });
 
   const finalizeAlbums = (now: number): QueueItemRecord[] => database.transaction(() => {
     const rows = database.raw.query("SELECT * FROM queue_items WHERE status = 'collecting' AND (album_quiet_deadline <= ? OR album_max_deadline <= ?)").all(now, now) as QueueRow[];
@@ -268,6 +288,14 @@ export const createQueueRepository = (database: AppDatabase) => {
     database.raw.query("UPDATE operations SET state = ?, error_code = ?, error_json = ?, updated_at = ? WHERE id = ?").run(state, errorCode ?? null, errorJson ?? null, now, operationId);
   };
 
+  const operationForItem = (itemId: number): { id: string; state: string; type: string } | undefined => {
+    const row = database.raw.query("SELECT id, state, type FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; state: string; type: string } | null;
+    return row ?? undefined;
+  };
+
+  const operationOutputIds = (operationId: string, kind: "destination" | "replacement" | "temporary_preview"): MessageId[] =>
+    (database.raw.query("SELECT telegram_message_id FROM operation_outputs WHERE operation_id = ? AND kind = ? ORDER BY ordinal, telegram_message_id").all(operationId, kind) as Array<{ telegram_message_id: number }>).map((row) => row.telegram_message_id as MessageId);
+
   const recordOutput = (operationId: string, kind: "destination" | "replacement" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
     database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?)").run(operationId, kind, chatId, messageId, ordinal, now);
   };
@@ -309,6 +337,26 @@ export const createQueueRepository = (database: AppDatabase) => {
     if (operationId) setOperationState(operationId, "done", now, "source_missing");
   });
 
+  const markAdminDeleted = (itemId: number, now: number): void => {
+    database.raw.query("UPDATE queue_items SET status = 'deleted', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND status NOT IN ('done','deleted','deleted_external')").run(now, itemId);
+  };
+
+  const retryItem = (itemId: number, now: number): void => {
+    database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND status IN ('blocked','needs_edit','needs_review','uncertain_publish','uncertain_renewal','delete_blocked')").run(itemId);
+  };
+
+  const moveToEnd = (itemId: number, now: number): void => database.transaction(() => {
+    const nextSequence = database.raw.query("SELECT COALESCE(MAX(logical_sequence), 0) + 1 AS value FROM queue_items").get() as { value: number };
+    database.raw.query("UPDATE queue_items SET logical_sequence = ?, last_error_code = 'moved_to_end', last_error = NULL WHERE id = ? AND status NOT IN ('done','deleted','deleted_external')").run(nextSequence.value, itemId);
+  });
+
+  const statusCounts = (): Record<string, number> => {
+    const counts: Record<string, number> = {};
+    const rows = database.raw.query("SELECT status, COUNT(*) AS count FROM queue_items GROUP BY status").all() as Array<{ status: string; count: number }>;
+    for (const row of rows) counts[row.status] = row.count;
+    return counts;
+  };
+
   const currentSourceIds = (itemId: number): MessageId[] => getMessages(itemId).map((message) => message.telegramMessageId);
 
   const getCurrentSnapshotSet = (itemId: number): StoredMessageSnapshot[] => getMessages(itemId).map((message) => message.snapshot);
@@ -328,9 +376,12 @@ export const createQueueRepository = (database: AppDatabase) => {
   return {
     findItemById,
     findBySource,
+    findCollectingAlbum,
+    findAlbum,
     getMessages,
     observeQueueSnapshot,
     addAlbumMember,
+    addLateAlbumMember,
     finalizeAlbums,
     updateSnapshot,
     listActive,
@@ -339,6 +390,8 @@ export const createQueueRepository = (database: AppDatabase) => {
     claimRenewal,
     transition,
     setOperationState,
+    operationForItem,
+    operationOutputIds,
     recordOutput,
     setDestinationMessageIds,
     installRenewedGeneration,
@@ -346,6 +399,10 @@ export const createQueueRepository = (database: AppDatabase) => {
     markCompleted,
     markRenewedCleanupComplete,
     markMissing,
+    markAdminDeleted,
+    retryItem,
+    moveToEnd,
+    statusCounts,
     currentSourceIds,
     getCurrentSnapshotSet,
     cloneSnapshotsWithIds,
@@ -426,6 +483,23 @@ export const createPolicyRepository = (database: AppDatabase) => {
   return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, aliasForOrigin, setAlias, removeAlias, listAuthors };
 };
 
+export type GeneratedMessageRepository = ReturnType<typeof createGeneratedMessageRepository>;
+
+export const createGeneratedMessageRepository = (database: AppDatabase) => {
+  const register = (chatId: number, messageIds: readonly number[], operationId: string, kind: "renewal" | "recovery_preview", now: number): void => {
+    const statement = database.raw.query("INSERT OR REPLACE INTO generated_messages (chat_id, message_id, operation_id, kind, created_at, consumed_at) VALUES (?, ?, ?, ?, ?, NULL)");
+    for (const messageId of messageIds) statement.run(chatId, messageId, operationId, kind, now);
+  };
+  const consume = (chatId: number, messageId: number): { operationId: string; kind: string } | undefined => {
+    const row = database.raw.query("SELECT operation_id, kind FROM generated_messages WHERE chat_id = ? AND message_id = ? AND consumed_at IS NULL").get(chatId, messageId) as { operation_id: string; kind: string } | null;
+    if (!row) return undefined;
+    database.raw.query("UPDATE generated_messages SET consumed_at = ? WHERE chat_id = ? AND message_id = ? AND consumed_at IS NULL").run(Date.now(), chatId, messageId);
+    return { operationId: row.operation_id, kind: row.kind };
+  };
+  const purge = (before: number): void => { database.raw.query("DELETE FROM generated_messages WHERE created_at < ?").run(before); };
+  return { register, consume, purge };
+};
+
 export type ScheduleRepository = ReturnType<typeof createScheduleRepository>;
 
 export const createScheduleRepository = (database: AppDatabase) => {
@@ -456,10 +530,14 @@ export const createScheduleRepository = (database: AppDatabase) => {
   const markRun = (occurrenceAt: number, status: string, now: number, itemId?: number, operationId?: string, errorCode?: string): void => {
     database.raw.query("UPDATE schedule_runs SET status = ?, item_id = ?, operation_id = ?, completed_at = ?, error_code = ? WHERE occurrence_at = ? AND status IN ('pending','running')").run(status, itemId ?? null, operationId ?? null, now, errorCode ?? null, occurrenceAt);
   };
+  const markRunning = (occurrenceAt: number, operationId: string, now: number): boolean => {
+    const result = database.raw.query("UPDATE schedule_runs SET status = 'running', operation_id = ?, started_at = ? WHERE occurrence_at = ? AND status = 'pending'").run(operationId, now, occurrenceAt);
+    return Number(result.changes) === 1;
+  };
   const lastScan = (): number | undefined => {
     const row = database.raw.query("SELECT last_scheduler_scan_at FROM app_state WHERE id = 1").get() as { last_scheduler_scan_at: number | null };
     return row.last_scheduler_scan_at ?? undefined;
   };
   const setLastScan = (now: number): void => { database.raw.query("UPDATE app_state SET last_scheduler_scan_at = ? WHERE id = 1").run(now); };
-  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, lastScan, setLastScan };
+  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, markRunning, lastScan, setLastScan };
 };

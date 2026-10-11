@@ -55,7 +55,7 @@ const validTransitions: Record<QueueItemStatus, readonly QueueItemStatus[]> = {
   queued: ["publishing", "renewing", "blocked", "needs_edit", "needs_review", "deleted", "deleted_external", "collecting"],
   publishing: ["queued", "published_cleanup_pending", "uncertain_publish", "blocked", "needs_edit", "deleted_external", "deleted"],
   published_cleanup_pending: ["done", "uncertain_publish", "deleted_external"],
-  renewing: ["queued", "blocked", "renewed_cleanup_pending", "uncertain_renewal", "deleted_external", "deleted"],
+  renewing: ["queued", "blocked", "needs_review", "renewed_cleanup_pending", "uncertain_renewal", "deleted_external", "deleted"],
   renewed_cleanup_pending: ["queued", "blocked", "uncertain_renewal", "deleted_external"],
   blocked: ["queued", "publishing", "renewing", "needs_review", "deleted", "deleted_external"],
   needs_edit: ["queued", "publishing", "renewing", "deleted", "deleted_external"],
