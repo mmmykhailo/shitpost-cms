@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Bot } from "grammy";
-import { parseConfig } from "./config";
+import { parseConfig, type AppConfig } from "./config";
 import { createLogger, safeErrorDescription, type Logger } from "./logger";
-import { createDatabase } from "./db/database";
+import { createDatabase, type AppDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
 import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
@@ -11,7 +11,7 @@ import { createPendingUpdateRepository } from "./db/pending-update-repository";
 import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
 import { createRuntimeLease } from "./db/runtime";
-import { createTelegramGateway, type BotMembership } from "./telegram";
+import { createTelegramGateway, type BotMembership, type TelegramGateway } from "./telegram";
 import { createIngestionService } from "./services/ingestion";
 import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
@@ -26,11 +26,33 @@ import { registerAdminHandlers } from "./handlers/admin";
 import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
 import { createRuntimeStatusWriter } from "./runtime-status";
-import { systemClock, type UserId } from "./types";
+import { systemClock, type Clock, type UserId } from "./types";
 
 const RENEWAL_INTERVAL_MS = 15 * 60_000;
 const RENEWAL_START_AGE_MS = 36 * 60 * 60_000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+type ApplicationProcess = {
+  pid: number;
+  exitCode: number;
+  once(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+};
+
+type RuntimeStatusWriter = ReturnType<typeof createRuntimeStatusWriter>;
+
+export type ApplicationOptions = {
+  config?: AppConfig;
+  logger?: Logger;
+  database?: AppDatabase;
+  databaseFactory?: (path: string) => AppDatabase;
+  bot?: Bot;
+  gateway?: TelegramGateway;
+  clock?: Clock;
+  bootId?: string;
+  process?: ApplicationProcess;
+  runtimeStatus?: RuntimeStatusWriter;
+  installSignalHandlers?: boolean;
+};
 
 export const waitForShutdownStage = async (
   name: string,
@@ -64,12 +86,14 @@ export const waitForShutdownStage = async (
   return true;
 };
 
-export const main = async (): Promise<void> => {
-  const config = parseConfig();
-  const logger = createLogger(config.logLevel);
-  const database = createDatabase(config.databasePath);
-  const bootId = randomUUID();
-  const bootStartedAt = Date.now();
+export const main = async (options: ApplicationOptions = {}): Promise<void> => {
+  const processLike = options.process ?? process;
+  const config = options.config ?? parseConfig();
+  const logger = options.logger ?? createLogger(config.logLevel);
+  const database = options.database ?? (options.databaseFactory ?? createDatabase)(config.databasePath);
+  const clock = options.clock ?? systemClock;
+  const bootId = options.bootId ?? randomUUID();
+  const bootStartedAt = clock.now();
   const queue = createQueueRepository(database, { bootId });
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
@@ -79,13 +103,14 @@ export const main = async (): Promise<void> => {
   const recoveryRepository = createRecoveryRepository(database);
   const orphanRepository = createOrphanRepository(database);
   const alertRepository = createAlertRepository(database);
-  const runtime = createRuntimeLease(database, `${process.pid}-${bootId}`, systemClock);
+  const runtime = createRuntimeLease(database, `${processLike.pid}-${bootId}`, clock);
   const supervisor = createTaskSupervisor({ logger });
   const operationTracker = createOperationTracker();
-  const runtimeStatus = createRuntimeStatusWriter({
+  const runtimeStatus = options.runtimeStatus ?? createRuntimeStatusWriter({
     releaseSha: config.releaseSha,
-    pid: process.pid,
+    pid: processLike.pid,
     processStartedAt: new Date(bootStartedAt).toISOString(),
+    now: () => new Date(clock.now()),
     ...(config.runtimeStatusPath === undefined ? {} : { path: config.runtimeStatusPath }),
   });
   if (!runtime.acquire()) {
@@ -102,14 +127,14 @@ export const main = async (): Promise<void> => {
   }
   queue.setBootId(bootId);
   database.raw.query("UPDATE app_state SET current_boot_id = ? WHERE id = 1").run(bootId);
-  const recoveredOperations = queue.recoverExpiredOperations(Date.now(), bootId);
+  const recoveredOperations = queue.recoverExpiredOperations(clock.now(), bootId);
   if (recoveredOperations.length > 0) logger.warn("prior_boot_operations_recovered", { count: recoveredOperations.length });
-  const interruptedRuns = schedule.recoverInterruptedRuns(Date.now());
+  const interruptedRuns = schedule.recoverInterruptedRuns(clock.now());
   if (interruptedRuns > 0) logger.warn("interrupted_schedule_runs_recovered", { count: interruptedRuns });
 
-  const bot = new Bot(config.botToken);
+  const bot = options.bot ?? new Bot(config.botToken);
   const adminChatId = adminChatIdFromUserId(config.adminUserId);
-  const gateway = createTelegramGateway(bot.api, adminChatId);
+  const gateway = options.gateway ?? createTelegramGateway(bot.api, adminChatId);
   const alerts = createAlertService({ alert: alertRepository, gateway, adminChatId, logger });
   let validatedBotId: UserId | undefined;
   let lastRightsCheckAt = 0;
@@ -127,46 +152,48 @@ export const main = async (): Promise<void> => {
       operationTracker.stopAccepting();
       supervisor.requestStop();
       logger.info("shutdown_started", { signal });
-      const shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+      const shutdownDeadline = clock.now() + SHUTDOWN_TIMEOUT_MS;
       try {
         runtimeStatus.writeStopping();
       } catch (error) {
         logger.error("runtime_status_write_failed", { state: "stopping", error: safeErrorDescription(error) });
       }
-      const botStopped = await waitForShutdownStage("bot_stop", () => bot.stop(), Math.max(0, shutdownDeadline - Date.now()), logger);
+      const botStopped = await waitForShutdownStage("bot_stop", () => bot.stop(), Math.max(0, shutdownDeadline - clock.now()), logger);
       const pollingStopped = pollingPromise === undefined
         ? true
-        : await waitForShutdownStage("polling_drain", () => pollingPromise as Promise<unknown>, Math.max(0, shutdownDeadline - Date.now()), logger);
-      const operationsDrained = await operationTracker.waitForEmpty(Math.max(0, shutdownDeadline - Date.now()));
-      const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - Date.now()));
+        : await waitForShutdownStage("polling_drain", () => pollingPromise as Promise<unknown>, Math.max(0, shutdownDeadline - clock.now()), logger);
+      const operationsDrained = await operationTracker.waitForEmpty(Math.max(0, shutdownDeadline - clock.now()));
+      const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - clock.now()));
       const clean = botStopped && pollingStopped && tasksDrained && operationsDrained;
       let checkpointed = false;
       try {
         if (!clean) logger.error("shutdown_drain_timeout", { tasks: supervisor.names().join(","), operations: operationTracker.names().join(",") });
         database.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         checkpointed = true;
-        if (clean) database.raw.query("UPDATE app_state SET last_clean_shutdown_at = ? WHERE id = 1").run(Date.now());
-        else database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('unclean_shutdown', 'runtime', ?, ?)").run(JSON.stringify({ signal, tasks: supervisor.names(), operations: operationTracker.names() }), Date.now());
+        if (clean) database.raw.query("UPDATE app_state SET last_clean_shutdown_at = ? WHERE id = 1").run(clock.now());
+        else database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('unclean_shutdown', 'runtime', ?, ?)").run(JSON.stringify({ signal, tasks: supervisor.names(), operations: operationTracker.names() }), clock.now());
       } catch (error) {
         logger.error("shutdown_checkpoint_failed", { error: safeErrorDescription(error) });
-        process.exitCode = 1;
+        processLike.exitCode = 1;
       } finally {
-        if (!clean || !checkpointed) process.exitCode = 1;
+        if (!clean || !checkpointed) processLike.exitCode = 1;
         runtime.release();
         database.close();
         try {
           runtimeStatus.remove();
         } catch (error) {
           logger.error("runtime_status_remove_failed", { error: safeErrorDescription(error) });
-          process.exitCode = 1;
+          processLike.exitCode = 1;
         }
       }
     })();
     return shutdownPromise;
   };
 
-  process.once("SIGINT", () => { void shutdown("SIGINT"); });
-  process.once("SIGTERM", () => { void shutdown("SIGTERM"); });
+  if (options.installSignalHandlers !== false) {
+    processLike.once("SIGINT", () => { void shutdown("SIGINT"); });
+    processLike.once("SIGTERM", () => { void shutdown("SIGTERM"); });
+  }
 
   try {
     const identity = await gateway.getBotIdentity();
@@ -177,7 +204,7 @@ export const main = async (): Promise<void> => {
     const [queueMembership, targetMembership] = await Promise.all([gateway.getBotMembership(config.queueChannelId, identity.id), gateway.getBotMembership(config.targetChannelId, identity.id)]);
     if (!queueMembership.canPostMessages || !queueMembership.canDeleteMessages) throw new Error("Bot needs can_post_messages and can_delete_messages in the queue channel");
     if (!targetMembership.canPostMessages || !targetMembership.canEditMessages || !targetMembership.canDeleteMessages) throw new Error("Bot needs post, edit, and delete rights in the destination channel");
-    lastSuccessfulRightsCheckAt = Date.now();
+    lastSuccessfulRightsCheckAt = clock.now();
     currentRights = { queue: queueMembership, target: targetMembership };
     logger.info("telegram_rights_validated", { botId: identity.id, queueChatId: config.queueChannelId, targetChatId: config.targetChannelId });
   } catch (error) {
@@ -188,24 +215,24 @@ export const main = async (): Promise<void> => {
     return;
   }
 
-  const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: systemClock.now });
-  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock: systemClock, logger, operationTracker });
-  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock: systemClock, logger, operationTracker });
-  const scheduler = createSchedulerService({ schedule, publisher, clock: systemClock, logger });
-  const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId, operationTracker });
+  const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: clock.now });
+  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker });
+  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker });
+  const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
+  const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
   if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);
   const orphanCleanup = createOrphanCleanupService({
     orphan: orphanRepository,
     gateway,
-    clock: systemClock,
+    clock,
     logger,
-    onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, systemClock.now()),
+    onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, clock.now()),
   });
-  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
-  const retention = createRetentionService({ queue, generated, pending, admin, alerts: alertRepository, clock: systemClock, logger });
-  const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: systemClock.now });
-  registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(systemClock.now()));
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
+  const retention = createRetentionService({ queue, generated, pending, admin, alerts: alertRepository, clock, logger });
+  const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: clock.now });
+  registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
   registerAdminHandlers(bot, {
     config,
     queue,
@@ -221,7 +248,7 @@ export const main = async (): Promise<void> => {
     health,
     logger,
     operationTracker,
-    now: systemClock.now,
+    now: clock.now,
   });
   bot.catch((error) => {
     logger.error("polling_error", { error: safeErrorDescription(error.error) });
@@ -236,14 +263,14 @@ export const main = async (): Promise<void> => {
       } catch (error) {
         logger.error("renewal_worker_failed", { error: safeErrorDescription(error) });
       }
-      await abortableSleep(systemClock, RENEWAL_INTERVAL_MS, signal);
+      await abortableSleep(clock, RENEWAL_INTERVAL_MS, signal);
     }
     });
     supervisor.start("pending_updates", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { ingestion.finalizeAlbums(); }
       catch (error) { logger.error("pending_update_finalizer_failed", { error: safeErrorDescription(error) }); }
-      await abortableSleep(systemClock, 1_000, signal);
+      await abortableSleep(clock, 1_000, signal);
     }
     });
     supervisor.start("publication_cleanup", async (signal) => {
@@ -253,33 +280,33 @@ export const main = async (): Promise<void> => {
       } catch (error) {
         logger.error("publication_cleanup_worker_failed", { error: safeErrorDescription(error) });
       }
-      await abortableSleep(systemClock, 60_000, signal);
+      await abortableSleep(clock, 60_000, signal);
     }
     });
     supervisor.start("operation_recovery", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
-        const now = systemClock.now();
+        const now = clock.now();
         queue.heartbeatOperations(now, bootId);
         const recovered = queue.recoverExpiredOperations(now, bootId);
         if (recovered.length > 0) logger.warn("expired_operations_recovered", { count: recovered.length });
       } catch (error) {
         logger.error("operation_recovery_worker_failed", { error: safeErrorDescription(error) });
       }
-      await abortableSleep(systemClock, 60_000, signal);
+      await abortableSleep(clock, 60_000, signal);
     }
     });
     supervisor.start("orphan_cleanup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { await orphanCleanup.runOnce(); }
       catch (error) { logger.error("orphan_cleanup_worker_failed", { error: safeErrorDescription(error) }); }
-      await abortableSleep(systemClock, 15 * 60_000, signal);
+      await abortableSleep(clock, 15 * 60_000, signal);
     }
     });
     supervisor.start("alerts", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
-        const now = systemClock.now();
+        const now = clock.now();
         const activeConditions = new Set<string>();
         const raise = async (key: string, severity: "normal" | "immediate" | "critical", text: string): Promise<void> => {
           activeConditions.add(key);
@@ -323,27 +350,27 @@ export const main = async (): Promise<void> => {
       } catch (error) {
         logger.error("alert_worker_failed", { error: safeErrorDescription(error) });
       }
-      await abortableSleep(systemClock, 60_000, signal);
+      await abortableSleep(clock, 60_000, signal);
     }
     });
     supervisor.start("retention", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { retention.runOnce(); }
       catch (error) { logger.error("retention_worker_failed", { error: safeErrorDescription(error) }); }
-      await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
+      await abortableSleep(clock, 24 * 60 * 60_000, signal);
     }
     });
     supervisor.start("backup", async (signal) => {
     while (!signal.aborted && !stopped) {
-      try { backup.runOnce(); lastSuccessfulBackupAt = systemClock.now(); }
+      try { backup.runOnce(); lastSuccessfulBackupAt = clock.now(); }
       catch (error) { logger.error("backup_worker_failed", { error: safeErrorDescription(error) }); }
-      await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
+      await abortableSleep(clock, 24 * 60 * 60_000, signal);
     }
     });
     supervisor.start("scheduler", async (signal) => scheduler.run(signal));
     supervisor.start("lease_heartbeat", async (signal) => {
     while (!signal.aborted && !stopped) {
-      await abortableSleep(systemClock, 20_000, signal);
+      await abortableSleep(clock, 20_000, signal);
       if (signal.aborted || stopped) return;
       if (!runtime.heartbeat()) {
         logger.error("singleton_lease_lost", {});
@@ -351,7 +378,7 @@ export const main = async (): Promise<void> => {
         try {
           // Keep this supervised task alive until alert bookkeeping finishes; shutdown
           // drains the task before closing SQLite.
-          await alerts.raise("runtime_lease", "immediate", "The queue bot lost its singleton database lease and is shutting down.", systemClock.now());
+          await alerts.raise("runtime_lease", "immediate", "The queue bot lost its singleton database lease and is shutting down.", clock.now());
         } catch (error) {
           logger.error("runtime_lease_alert_failed", { error: safeErrorDescription(error) });
         }
