@@ -28,6 +28,6 @@ export const createLogger = (minimum: LogLevel = "info"): Logger => ({
 });
 
 export const safeErrorDescription = (error: unknown): string => {
-  if (error instanceof Error) return error.message.replace(/\b\d{6,}:\w+\b/g, "[redacted]");
+  if (error instanceof Error) return error.message.replace(/\b\d{6,}:[A-Za-z0-9_-]{20,}\b/gu, "[redacted]");
   return "Unknown error";
 };

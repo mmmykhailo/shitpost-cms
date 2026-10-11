@@ -3,6 +3,8 @@ import { appendInlineByline, separateByline, validateAlias } from "../src/domain
 import { classifyPublicationPlan } from "../src/domain/origin-policy";
 import { formatUtcSlot, nextOccurrence, occurrencesBetween, parseUtcSlot } from "../src/domain/schedule";
 import { asChatId, asUserId } from "../src/types";
+import { safeErrorDescription } from "../src/logger";
+import { classifyTelegramError } from "../src/errors";
 
 const userOrigin = { kind: "user" as const, userId: asUserId(7), displayName: "Ada Lovelace", username: "ada" };
 
@@ -51,5 +53,15 @@ describe("UTC slots", () => {
     const slots = [60, 720, 1439];
     expect(nextOccurrence(now, slots)).toBe(Date.parse("2026-10-04T23:59:00Z"));
     expect(occurrencesBetween(Date.parse("2026-10-03T00:00:00Z"), now, slots)).toHaveLength(5);
+  });
+});
+
+describe("error boundaries", () => {
+  test("redacts Telegram bot tokens with URL-safe characters", () => {
+    expect(safeErrorDescription(new Error("request failed for 123456789:AAaa_bb-ccddeeff00112233445566778899"))).toBe("request failed for [redacted]");
+  });
+
+  test("classifies Telegram's ordinary age-limit deletion response", () => {
+    expect(classifyTelegramError(new Error("Bad Request: message can't be deleted for everyone")).kind).toBe("telegram_age_limit");
   });
 });

@@ -43,7 +43,7 @@ export const classifyTelegramError = (error: unknown, method?: string): Normaliz
   else if (lower.includes("message to delete not found") || lower.includes("message not found") || lower.includes("message_id_invalid")) kind = "source_missing";
   else if (lower.includes("protected content") || lower.includes("can't be forwarded") || lower.includes("cannot be forwarded")) kind = "content_protected";
   else if (lower.includes("not enough rights") || lower.includes("forbidden") || code === 401 || code === 403) kind = "permission_denied";
-  else if (lower.includes("48 hours") || lower.includes("too old") || lower.includes("message is too old") || lower.includes("can't be deleted after")) kind = "telegram_age_limit";
+  else if (lower.includes("48 hours") || lower.includes("too old") || lower.includes("message is too old") || lower.includes("can't be deleted after") || lower.includes("can't be deleted for everyone") || lower.includes("cannot be deleted for everyone")) kind = "telegram_age_limit";
   else if (lower.includes("chat not found") || lower.includes("destination")) kind = "destination_unavailable";
   else if (lower.includes("can't copy") || lower.includes("cannot copy") || lower.includes("unsupported") || lower.includes("paid media") || lower.includes("invoice") || lower.includes("giveaway")) kind = "unsupported_content";
   else if (lower.includes("entity") || lower.includes("caption") || lower.includes("message is too long") || lower.includes("text is too long") || lower.includes("exceeds telegram limit") || lower.includes("exceeds the limit")) kind = "invalid_content_or_entities";

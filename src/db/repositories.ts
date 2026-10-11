@@ -311,7 +311,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   });
 
   const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
-    const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending') AND maintenance_status = 'idle' AND physical_created_at <= ? ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore) as QueueRow | null;
+    const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending') AND maintenance_status = 'idle' AND physical_created_at <= ? AND (maintenance_retry_not_before IS NULL OR maintenance_retry_not_before <= ?) ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore, now) as QueueRow | null;
     if (!row) return undefined;
     const item = rowToItem(row);
     const changed = database.raw.query("UPDATE queue_items SET maintenance_status = 'renewing', maintenance_operation_id = ?, maintenance_retry_not_before = NULL, attempts = attempts + 1 WHERE id = ? AND status = ? AND maintenance_status = 'idle' AND source_generation = ? AND content_version = ?").run(operationId, item.id, item.status, item.sourceGeneration, item.contentVersion);
@@ -399,8 +399,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
           setOperationState(row.id, "failed", now, "startup_recovery");
         } else if (row.phase === "replacement_outputs_recorded") {
           const oldMessages = getMessages(item.id, row.captured_source_generation).sort((left, right) => left.ordinal - right.ordinal);
-          const replacementIds = operationOutputIds(row.id, "replacement");
-          const exactCount = row.expected_source_count !== null && row.expected_source_count === oldMessages.length && row.expected_source_count === replacementIds.length;
+          let replacementIds: MessageId[] | undefined;
+          try { replacementIds = validateOrderedMessageIds(operationOutputIds(row.id, "replacement"), "renewal replacement IDs"); }
+          catch { replacementIds = undefined; }
+          const sourceIds = operationSourceIds(row.id);
+          const sourceEvidenceMatches = sourceIds.length === oldMessages.length && sourceIds.every((messageId, index) => messageId === oldMessages[index]?.telegramMessageId);
+          const exactCount = replacementIds !== undefined && row.expected_source_count !== null && row.expected_source_count === oldMessages.length && row.expected_source_count === replacementIds.length && sourceEvidenceMatches;
           const guardMatches = item.maintenanceStatus === "renewing" && item.maintenanceOperationId === row.id && item.contentVersion === row.captured_content_version && item.sourceGeneration === row.captured_source_generation;
           if (!exactCount || !guardMatches) {
             markRenewalUncertain(item.id, row.id);
@@ -408,7 +412,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
             const nextGeneration = row.captured_source_generation + 1;
             for (const [ordinal, message] of oldMessages.entries()) {
               const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
-              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds[ordinal]!, ordinal, telegramDate: now });
+              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds![ordinal]!, ordinal, telegramDate: now });
             }
             const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
             if (Number(installed.changes) !== 1) {
@@ -963,12 +967,16 @@ export const createScheduleRepository = (database: AppDatabase) => {
     // Pausing and resuming establish a new scheduler cursor. This prevents a
     // pause or a just-created slot from manufacturing an old missed run.
     database.raw.query("UPDATE app_state SET last_scheduler_scan_at = ? WHERE id = 1").run(now);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('schedule_enabled_changed', ?, ?, ?)").run(String(adminId), JSON.stringify({ enabled: value }), now);
   });
   const addSlot = (minuteOfDay: number, adminId: number, now: number): void => database.transaction(() => {
     validateSlotCount([...slots(), minuteOfDay], enabled());
     if (!Number.isInteger(minuteOfDay) || minuteOfDay < 0 || minuteOfDay >= 1440) throw new Error("Publication slot is out of range");
     const result = database.raw.query("INSERT OR IGNORE INTO schedule_slots (minute_of_day, created_at, created_by_admin_id, effective_at) VALUES (?, ?, ?, ?)").run(minuteOfDay, now, adminId, now);
-    if (Number(result.changes) === 1) database.raw.query("INSERT INTO schedule_slot_history (minute_of_day, effective_from, effective_until, actor_admin_id) VALUES (?, ?, NULL, ?)").run(minuteOfDay, now, adminId);
+    if (Number(result.changes) === 1) {
+      database.raw.query("INSERT INTO schedule_slot_history (minute_of_day, effective_from, effective_until, actor_admin_id) VALUES (?, ?, NULL, ?)").run(minuteOfDay, now, adminId);
+      database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('schedule_slot_added', ?, ?, ?)").run(String(adminId), JSON.stringify({ minuteOfDay }), now);
+    }
   });
   const removeSlot = (minuteOfDay: number, adminId = 0, now = Date.now()): void => database.transaction(() => {
     const result = database.raw.query("DELETE FROM schedule_slots WHERE minute_of_day = ?").run(minuteOfDay);

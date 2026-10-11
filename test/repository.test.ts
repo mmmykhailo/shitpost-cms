@@ -112,6 +112,15 @@ describe("queue repository", () => {
     expect((database.raw.query("SELECT kind FROM generated_messages WHERE chat_id = -100 AND message_id = 903").get() as { kind: string }).kind).toBe("renewal");
   });
 
+  test("renewal retry backoff is enforced independently of logical status", () => {
+    const { queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(28), telegramDate: 0 }), 1_000);
+    const first = queue.claimRenewal("renew-backoff-1", 100_000, 64_000)!;
+    queue.setRetry(1, first.operationId, 100_001, 200_000, "rate_limited", "try later");
+    expect(queue.claimRenewal("renew-backoff-2", 100_002, 64_000)).toBeUndefined();
+    expect(queue.claimRenewal("renew-backoff-3", 200_000, 136_000)?.item.status).toBe("queued");
+  });
+
   test("startup recovery never treats recorded base output as complete publication", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(24) }), 1_000);
