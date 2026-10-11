@@ -232,4 +232,101 @@ describe("admin schedule handlers", () => {
       harness.close();
     }
   });
+
+  test("accepts only a reply to the active question and supports cancel", async () => {
+    const harness = createHarness();
+    try {
+      await harness.run(commandUpdate(20, 20, "schedule"));
+      const menu = harness.lastSent();
+      await harness.run(callbackUpdate(21, "callback-add", harness.callbackData(menu, "Add UTC slot"), menu.message));
+      const question = harness.lastSent();
+
+      await harness.run(replyUpdate(22, 22, "05:00", menu.message));
+      await harness.run(replyUpdate(23, 23, "05:00", makeMessage(23, "05:00")));
+
+      expect(harness.schedule.slots()).toEqual([]);
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)?.expectedReplyToMessageId).toBe(question.message.message_id);
+      expect(harness.lastSent().message.text).toBe("Reply to the active admin prompt to continue, or use /cancel.");
+
+      await harness.run(commandUpdate(24, 24, "cancel"));
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toBeUndefined();
+      await harness.run(replyUpdate(25, 25, "05:00", question.message));
+      expect(harness.schedule.slots()).toEqual([]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("a second prompt replaces the first question binding", async () => {
+    const harness = createHarness();
+    try {
+      await harness.run(commandUpdate(30, 30, "schedule"));
+      const firstMenu = harness.lastSent();
+      await harness.run(callbackUpdate(31, "callback-add-1", harness.callbackData(firstMenu, "Add UTC slot"), firstMenu.message));
+      const firstQuestion = harness.lastSent();
+
+      await harness.run(commandUpdate(32, 32, "schedule"));
+      const secondMenu = harness.lastSent();
+      await harness.run(callbackUpdate(33, "callback-add-2", harness.callbackData(secondMenu, "Add UTC slot"), secondMenu.message));
+      const secondQuestion = harness.lastSent();
+
+      expect(secondQuestion.message.message_id).not.toBe(firstQuestion.message.message_id);
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)?.expectedReplyToMessageId).toBe(secondQuestion.message.message_id);
+      await harness.run(replyUpdate(34, 34, "05:00", firstQuestion.message));
+      expect(harness.schedule.slots()).toEqual([]);
+      await harness.run(replyUpdate(35, 35, "05:00", secondQuestion.message));
+      expect(harness.schedule.slots()).toEqual([300]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("keeps a valid action running when callback-menu deletion fails", async () => {
+    const harness = createHarness();
+    try {
+      await harness.run(commandUpdate(40, 40, "schedule"));
+      const menu = harness.lastSent();
+      harness.setDeleteFailure({ kind: "permission_denied", description: "rights lost" });
+
+      await harness.run(callbackUpdate(41, "callback-resume", harness.callbackData(menu, "Resume"), menu.message));
+
+      expect(harness.schedule.enabled()).toBe(false);
+      expect(harness.lastSent().message.text).toContain("Add at least one UTC slot before resuming.");
+      expect(harness.deleted).toEqual([{ chatId: ADMIN_CHAT_ID, messageIds: [menu.message.message_id] }]);
+      expect(harness.warnings).toEqual([{
+        event: "admin_menu_delete_failed",
+        fields: {
+          chatId: ADMIN_CHAT_ID,
+          messageId: menu.message.message_id,
+          action: "schedule_resume",
+          errorKind: "permission_denied",
+        },
+      }]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("does not delete menus for unauthorized or malformed callbacks", async () => {
+    const harness = createHarness();
+    try {
+      await harness.run(commandUpdate(50, 50, "schedule"));
+      const menu = harness.lastSent();
+      const token = harness.callbackData(menu, "Add UTC slot");
+      const stranger: User = { id: 77, is_bot: false, first_name: "Stranger" };
+
+      await harness.run(callbackUpdate(51, "callback-unauthorized", token, menu.message, stranger));
+
+      expect(harness.deleted).toEqual([]);
+      expect(harness.calls.some((call) => call.method === "answerCallbackQuery" && call.payload.callback_query_id === "callback-unauthorized" && call.payload.text === "Not authorized" && call.payload.show_alert === true)).toBe(true);
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toBeUndefined();
+
+      await harness.run(callbackUpdate(52, "callback-malformed", "other:payload", menu.message));
+
+      expect(harness.deleted).toEqual([]);
+      expect(harness.lastSent().message.text).toBe("Stale action.");
+    } finally {
+      harness.close();
+    }
+  });
 });
