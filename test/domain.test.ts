@@ -5,6 +5,9 @@ import { formatUtcSlot, nextOccurrence, occurrencesBetween, parseUtcSlot } from 
 import { asChatId, asUserId } from "../src/types";
 import { safeErrorDescription } from "../src/logger";
 import { classifyTelegramError } from "../src/errors";
+import { validatePublicationContract, validateStoredMessageSnapshot } from "../src/domain/validation";
+import { asMessageId } from "../src/types";
+import { snapshotFixture } from "./fixtures";
 
 const userOrigin = { kind: "user" as const, userId: asUserId(7), displayName: "Ada Lovelace", username: "ada" };
 
@@ -79,5 +82,20 @@ describe("error boundaries", () => {
     ] as const;
     for (const [error, kind] of cases) expect(classifyTelegramError(error).kind).toBe(kind);
     expect(classifyTelegramError(new Error("forbidden"), "deleteMessages").method).toBe("deleteMessages");
+  });
+
+  test("rejects malformed stored booleans and incomplete contracts", () => {
+    expect(() => validateStoredMessageSnapshot({ ...snapshotFixture(), messageId: asMessageId(10), hasReplyMarkup: "false" })).toThrow(/hasReplyMarkup/);
+    expect(() => validatePublicationContract({
+      capturedLogicalStatus: "queued",
+      capturedContentVersion: 1,
+      capturedSourceGeneration: 0,
+      sourceIds: [asMessageId(10)],
+      policy: { kind: "copy_with_inline_byline", name: "Ada" },
+      expectedTransferredMessageCount: 1,
+      expectedOutputMessageCount: 1,
+      requiresInlineEdit: true,
+      requiresSeparateByline: false,
+    })).toThrow(/bylineText/);
   });
 });

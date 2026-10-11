@@ -109,6 +109,7 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
   if (candidate.schemaVersion !== 1) throw new StoredDataValidationError("Unsupported snapshot schema version");
   const contentType = candidate.contentType;
   if (typeof contentType !== "string" || !contentTypes.has(contentType as ContentType)) throw new StoredDataValidationError("Invalid snapshot content type");
+  if (typeof candidate.hasReplyMarkup !== "boolean") throw new StoredDataValidationError("hasReplyMarkup must be boolean");
   const result: StoredMessageSnapshot = {
     schemaVersion: 1,
     chatId: asChatId(integer(candidate.chatId, "chatId")),
@@ -117,7 +118,7 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     contentType: contentType as ContentType,
     origin: validateSemanticOrigin(candidate.origin),
     telegramDate: integer(candidate.telegramDate, "telegramDate"),
-    hasReplyMarkup: candidate.hasReplyMarkup === true,
+    hasReplyMarkup: candidate.hasReplyMarkup,
   };
   if (result.messageId <= 0) throw new StoredDataValidationError("messageId must be positive");
   if (result.ordinal < 0) throw new StoredDataValidationError("ordinal must be non-negative");
@@ -181,8 +182,8 @@ export const validatePublicationContract = (value: unknown): PublicationContract
     case "blocked": if (!["unknown_origin", "unsupported_content", "mixed_album_origin"].includes(String(policy.reason))) throw new StoredDataValidationError("contract.policy.reason is invalid"); break;
     default: throw new StoredDataValidationError("contract.policy.kind is invalid");
   }
-  if (candidate.requiresInlineEdit !== undefined && typeof candidate.requiresInlineEdit !== "boolean") throw new StoredDataValidationError("contract.requiresInlineEdit must be boolean");
-  if (candidate.requiresSeparateByline !== undefined && typeof candidate.requiresSeparateByline !== "boolean") throw new StoredDataValidationError("contract.requiresSeparateByline must be boolean");
+  if (typeof candidate.requiresInlineEdit !== "boolean") throw new StoredDataValidationError("contract.requiresInlineEdit must be boolean");
+  if (typeof candidate.requiresSeparateByline !== "boolean") throw new StoredDataValidationError("contract.requiresSeparateByline must be boolean");
   const result: PublicationContract = {
     capturedLogicalStatus: capturedLogicalStatus as PublicationContract["capturedLogicalStatus"],
     capturedContentVersion: integer(candidate.capturedContentVersion, "contract.capturedContentVersion"),
@@ -191,11 +192,12 @@ export const validatePublicationContract = (value: unknown): PublicationContract
     policy: policy as unknown as PublicationContract["policy"],
     expectedTransferredMessageCount: integer(candidate.expectedTransferredMessageCount, "contract.expectedTransferredMessageCount"),
     expectedOutputMessageCount: integer(candidate.expectedOutputMessageCount, "contract.expectedOutputMessageCount"),
-    requiresInlineEdit: candidate.requiresInlineEdit === true,
-    requiresSeparateByline: candidate.requiresSeparateByline === true,
+    requiresInlineEdit: candidate.requiresInlineEdit,
+    requiresSeparateByline: candidate.requiresSeparateByline,
   };
   const bylineText = optionalString(candidate.bylineText, "contract.bylineText");
   if (bylineText !== undefined) result.bylineText = bylineText;
-  if (result.capturedContentVersion < 1 || result.capturedSourceGeneration < 0 || result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length) throw new StoredDataValidationError("contract output counts are inconsistent");
+  if (result.capturedContentVersion < 1 || result.capturedSourceGeneration < 0 || result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length || result.expectedOutputMessageCount !== sourceIds.length + (result.requiresSeparateByline ? 1 : 0) || result.requiresInlineEdit && result.requiresSeparateByline) throw new StoredDataValidationError("contract output counts or attribution flags are inconsistent");
+  if ((result.policy.kind === "copy_with_inline_byline" || result.policy.kind === "copy_with_separate_byline") && result.bylineText === undefined) throw new StoredDataValidationError("contract.bylineText is required for attributed copies");
   return result;
 };
