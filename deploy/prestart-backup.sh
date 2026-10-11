@@ -63,10 +63,7 @@ done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.sqlite' -print | sort)
 UNMARKED_COUNT=0
 UNMARKED_BACKUPS=()
 for backup_name in "${BACKUPS[@]}"; do
-  case "$backup_name" in
-    [0-9T]*-[0-9a-f][0-9a-f]*.sqlite) ;;
-    *) fail "unexpected backup filename: $backup_name" ;;
-  esac
+  [[ "$backup_name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{40}(\.[0-9]+)?\.sqlite$ ]] || fail "unexpected backup filename: $backup_name"
   if [ -e "$BACKUP_DIR/${backup_name}.keep" ]; then
     continue
   fi
