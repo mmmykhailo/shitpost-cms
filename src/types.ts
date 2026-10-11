@@ -195,6 +195,7 @@ export type NormalizedTelegramErrorKind =
   | "content_protected"
   | "unsupported_content"
   | "permission_denied"
+  | "telegram_age_limit"
   | "invalid_content_or_entities"
   | "destination_unavailable"
   | "ambiguous_send_result"

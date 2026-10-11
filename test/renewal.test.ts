@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository } from "../src/db/repositories";
+import { createOrphanRepository } from "../src/db/orphan-repository";
+import { createOrphanCleanupService } from "../src/services/orphan-cleanup";
 import { createRenewalService } from "../src/services/renewal";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
@@ -54,7 +56,7 @@ const open = (gateway: TelegramGateway) => {
     operationId: (() => { let i = 0; return () => `renew-${++i}`; })(),
   });
   resources.push({ directory, close: database.close });
-  return { queue, renewal };
+  return { queue, renewal, database };
 };
 
 afterEach(() => {
@@ -68,7 +70,7 @@ afterEach(() => {
 describe("renewal service", () => {
   test("copies originless queue posts into a new generation and cleans the old source", async () => {
     const fake = gatewayWithDeleteFailure();
-    const { queue, renewal } = open(fake.gateway);
+    const { queue, renewal, database } = open(fake.gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(50), telegramDate: 0, origin: { kind: "absent" } }), 1);
     const result = await renewal.renewNext(36_000);
     expect(result.kind).toBe("renewed");
@@ -77,6 +79,10 @@ describe("renewal service", () => {
     expect(fake.calls).toEqual(["copy", "delete"]);
     expect(queue.findItemById(1)?.status).toBe("queued");
     expect(queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    expect((database.raw.query("SELECT COUNT(*) AS count FROM orphaned_sources WHERE resolved_at IS NULL").get() as { count: number }).count).toBe(1);
+    const orphanCleanup = createOrphanCleanupService({ orphan: createOrphanRepository(database), gateway: fake.gateway, clock: createFakeClock(100_000), logger: createLogger("error") });
+    expect((await orphanCleanup.runOnce()).resolved).toBe(1);
+    expect((database.raw.query("SELECT COUNT(*) AS count FROM orphaned_sources WHERE resolved_at IS NULL").get() as { count: number }).count).toBe(0);
   });
 
   test("re-forwards semantic channel origins", async () => {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
+import { createRecoveryRepository } from "../src/db/recovery-repository";
 import { createRecoveryService, parseRecoveryReference, queueInternalId } from "../src/services/recovery";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
@@ -41,9 +42,9 @@ const open = () => {
     editAdminMessage: async () => {},
     answerCallbackQuery: async () => {},
   };
-  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), operationId: () => "recover-1" });
+  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), recovery: createRecoveryRepository(database), gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), operationId: () => "recover-1" });
   resources.push({ directory, close: database.close });
-  return { recovery, deleted, queue: createQueueRepository(database) };
+  return { recovery, deleted, queue: createQueueRepository(database), database };
 };
 
 afterEach(() => {
@@ -65,11 +66,12 @@ describe("recovery", () => {
   });
 
   test("recovers direct queue posts as originless and removes admin previews", async () => {
-    const { recovery, deleted, queue } = open();
+    const { recovery, deleted, queue, database } = open();
     const recovered = await recovery.recover("t.me/c/1234567890/88");
     expect(recovered.sourceIds).toEqual([asMessageId(88)]);
     expect(queue.findItemById(recovered.itemId)?.status).toBe("queued");
     expect(queue.findItemById(recovered.itemId)?.origin).toEqual({ kind: "absent" });
     expect(deleted).toEqual([asMessageId(700)]);
+    expect((database.raw.query("SELECT phase FROM recovery_sessions WHERE id = 'recover-1'").get() as { phase: string }).phase).toBe("completed");
   });
 });

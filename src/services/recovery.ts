@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Message } from "@grammyjs/types";
 import { snapshotFromMessage } from "../domain/message";
+import type { RecoveryRepository } from "../db/recovery-repository";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
 import type { Logger } from "../logger";
 import type { ChatId, Clock, MessageId, SemanticOrigin, UserId } from "../types";
@@ -40,6 +41,14 @@ export const parseRecoveryReference = (input: string, queueChannelId: ChatId): n
 
 const originForRecoveredMessage = (origin: SemanticOrigin, queueChannelId: ChatId): SemanticOrigin => origin.kind === "channel" && origin.chatId === queueChannelId ? { kind: "absent" } : origin;
 
+const assertCompatibleAlbum = (snapshots: readonly ReturnType<typeof snapshotFromMessage>[]): void => {
+  if (snapshots.length <= 1) return;
+  const first = snapshots[0]!;
+  if (snapshots.some((snapshot) => snapshot.mediaGroupId === undefined || snapshot.mediaGroupId !== first.mediaGroupId)) throw new Error("Recovery messages are not members of one Telegram album");
+  if (snapshots.some((snapshot) => ["text", "service", "unknown", "paid_media", "giveaway"].includes(snapshot.contentType))) throw new Error("Recovery album contains incompatible content");
+  if (snapshots.some((snapshot) => JSON.stringify(snapshot.origin) !== JSON.stringify(first.origin))) throw new Error("Recovery album members have different semantic origins");
+};
+
 export type RecoveryService = ReturnType<typeof createRecoveryService>;
 
 export const createRecoveryService = (input: {
@@ -50,43 +59,65 @@ export const createRecoveryService = (input: {
   adminChatId: ChatId;
   clock: Clock;
   logger: Logger;
+  recovery?: RecoveryRepository;
+  bootId?: string;
   operationId?: () => string;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
+  const bootId = input.bootId ?? "manual-recovery";
+
+  const cleanupPreviews = async (operationId: string, previewIds: readonly MessageId[], itemId?: number): Promise<boolean> => {
+    if (previewIds.length === 0) {
+      input.recovery?.complete(operationId, input.clock.now());
+      return true;
+    }
+    try {
+      await input.gateway.deleteMessages(input.adminChatId, previewIds);
+      input.recovery?.complete(operationId, input.clock.now());
+      return true;
+    } catch (error) {
+      const description = error instanceof Error ? error.message : "preview cleanup failed";
+      input.recovery?.markPreviewCleanupPending(operationId, input.clock.now(), description);
+      input.logger.error("recovery_preview_cleanup_failed", { operationId, itemId, error: description });
+      return false;
+    }
+  };
 
   const recover = async (reference: string | readonly number[]): Promise<{ itemId: number; sourceIds: MessageId[] }> => {
     const operationId = newOperationId();
-    const sourceIds = (typeof reference === "string" ? parseRecoveryReference(reference, input.queueChannelId) : [...reference]).map(asMessageId);
-    if (sourceIds.length < 1 || sourceIds.length > 10) throw new Error("Recovery accepts 1–10 messages");
-    if (sourceIds.some((id, index) => index > 0 && id <= sourceIds[index - 1]!)) throw new Error("Recovery IDs must be strictly increasing");
+    const numericIds = typeof reference === "string" ? parseRecoveryReference(reference, input.queueChannelId) : [...reference];
+    if (numericIds.length < 1 || numericIds.length > 10) throw new Error("Recovery accepts 1–10 messages");
+    if (numericIds.some((id) => !Number.isSafeInteger(id) || id < 1) || numericIds.some((id, index) => index > 0 && id <= numericIds[index - 1]!)) throw new Error("Recovery IDs must be strictly increasing");
+    const sourceIds = numericIds.map(asMessageId);
     for (const sourceId of sourceIds) if (input.queue.findBySource(input.queueChannelId, sourceId)) throw new Error(`Queue message ${sourceId} is already known`);
+    const now = input.clock.now();
+    input.recovery?.createSession(operationId, sourceIds, bootId, now);
     const previews: MessageId[] = [];
-    const snapshots = [];
+    const snapshots: ReturnType<typeof snapshotFromMessage>[] = [];
+    let insertedItemId: number | undefined;
     try {
       for (const [ordinal, sourceId] of sourceIds.entries()) {
+        input.recovery?.addPreviewPending(operationId, sourceId, ordinal, input.clock.now());
+        input.recovery?.setPhase(operationId, "preview_pending", input.clock.now());
         const preview = await input.gateway.forwardMessage({ targetChatId: input.adminChatId, sourceChatId: input.queueChannelId, messageId: sourceId });
-        previews.push(preview.message_id as unknown as MessageId);
+        const previewId = preview.message_id as unknown as MessageId;
+        previews.push(previewId);
         const captured = snapshotFromMessage(preview);
         const origin = originForRecoveredMessage(captured.origin, input.queueChannelId);
-        const snapshot = { ...captured, chatId: input.queueChannelId, messageId: sourceId, ordinal, origin, ...(sourceIds.length > 1 ? { mediaGroupId: `recovery:${operationId}` } : {}) };
+        const snapshot = { ...captured, chatId: input.queueChannelId, messageId: sourceId, ordinal, origin };
         snapshots.push(snapshot);
-        input.policy.observeAuthor(origin, input.clock.now());
+        input.recovery?.recordPreview(operationId, sourceId, input.adminChatId, previewId, snapshot, input.clock.now());
       }
-      const now = input.clock.now();
-      const first = input.queue.observeQueueSnapshot(snapshots[0]!, now).item;
-      for (const snapshot of snapshots.slice(1)) input.queue.addAlbumMember(first.id, snapshot, now);
-      if (sourceIds.length > 1) input.queue.finalizeAlbums(now + 11_000);
-      try {
-        await input.gateway.deleteMessages(input.adminChatId, previews);
-      } catch (error) {
-        input.logger.warn("recovery_preview_cleanup_failed", { operationId, error: error instanceof Error ? error.message : "unknown" });
-      }
-      return { itemId: first.id, sourceIds };
+      assertCompatibleAlbum(snapshots);
+      const item = input.queue.insertRecoveredSnapshots(snapshots, input.clock.now());
+      insertedItemId = item.id;
+      input.recovery?.linkItem(operationId, item.id, input.clock.now());
+      for (const snapshot of snapshots) input.policy.observeAuthor(snapshot.origin, input.clock.now());
+      await cleanupPreviews(operationId, previews, insertedItemId);
+      return { itemId: item.id, sourceIds };
     } catch (error) {
-      if (previews.length > 0) {
-        try { await input.gateway.deleteMessages(input.adminChatId, previews); }
-        catch (cleanupError) { input.logger.error("recovery_failed_preview_cleanup", { operationId, error: cleanupError instanceof Error ? cleanupError.message : "unknown" }); }
-      }
+      if (previews.length > 0) await cleanupPreviews(operationId, previews, insertedItemId);
+      else input.recovery?.setPhase(operationId, "failed", input.clock.now(), error instanceof Error ? error.message : "recovery failed");
       throw error;
     }
   };

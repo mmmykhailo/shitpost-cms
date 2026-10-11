@@ -223,6 +223,21 @@ export const createQueueRepository = (database: AppDatabase) => {
     return updated;
   });
 
+  const insertRecoveredSnapshots = (snapshots: readonly StoredMessageSnapshot[], now: number): QueueItemRecord => database.transaction(() => {
+    if (snapshots.length < 1 || snapshots.length > 10) throw new Error("Recovered item must contain 1–10 snapshots");
+    const first = snapshots[0]!;
+    if (snapshots.some((snapshot, ordinal) => snapshot.chatId !== first.chatId || snapshot.ordinal !== ordinal || originKey(snapshot.origin) !== originKey(first.origin))) throw new Error("Recovered snapshots are not a compatible ordered album");
+    for (const snapshot of snapshots) if (findBySource(snapshot.chatId, snapshot.messageId)) throw new Error(`Queue message ${snapshot.messageId} is already known`);
+    const lastSequence = database.raw.query("SELECT COALESCE(MAX(logical_sequence), 0) AS value FROM queue_items").get() as { value: number };
+    const mediaGroupId = snapshots.length > 1 ? first.mediaGroupId ?? `recovery:${first.messageId}` : undefined;
+    const result = database.raw.query("INSERT INTO queue_items (logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)").run(lastSequence.value + 1, first.chatId, mediaGroupId ?? null, first.messageId, first.contentType, JSON.stringify(first.origin), now, first.telegramDate);
+    const itemId = Number(result.lastInsertRowid);
+    for (const snapshot of snapshots) insertSnapshot(itemId, 0, snapshot);
+    const item = findItemById(itemId);
+    if (!item) throw new Error("Recovered queue item disappeared after insert");
+    return item;
+  });
+
   const finalizeAlbums = (now: number): QueueItemRecord[] => database.transaction(() => {
     const rows = database.raw.query("SELECT * FROM queue_items WHERE status = 'collecting' AND (album_quiet_deadline <= ? OR album_max_deadline <= ?)").all(now, now) as QueueRow[];
     const finalized: QueueItemRecord[] = [];
@@ -250,7 +265,9 @@ export const createQueueRepository = (database: AppDatabase) => {
     if (item.status === "publishing" || item.status === "published_cleanup_pending") return item;
     const current = getMessages(item.id).find((message) => message.telegramMessageId === messageId);
     if (!current) return item;
+    if (current.editDate !== undefined && snapshot.editDate !== undefined && snapshot.editDate <= current.editDate) return item;
     const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
+    if (JSON.stringify(current.snapshot) === JSON.stringify(persistedSnapshot)) return item;
     database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);
     database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ? WHERE id = ?").run(persistedSnapshot.contentType, item.id);
     return findItemById(item.id);
@@ -596,6 +613,11 @@ export const createQueueRepository = (database: AppDatabase) => {
   const listRenewalAges = (now: number): Array<{ item: QueueItemRecord; ageMs: number; sourceIds: MessageId[] }> =>
     listActive(10_000).filter((item) => isSourceBearing(item.status) && item.status !== "collecting").map((item) => ({ item, ageMs: now - item.physicalCreatedAt, sourceIds: currentSourceIds(item.id) }));
 
+  const renewalCandidateOperation = (queueChatId: number): { operationId: string; itemId: number } | undefined => {
+    const row = database.raw.query("SELECT o.id AS operation_id, qi.id AS item_id FROM operations o JOIN queue_items qi ON qi.id = o.item_id WHERE o.type = 'renew' AND qi.queue_chat_id = ? AND qi.maintenance_status IN ('renewing','renewal_cleanup_pending','uncertain_renewal') AND o.phase NOT IN ('completed','failed') ORDER BY o.created_at LIMIT 1").get(queueChatId) as { operation_id: string; item_id: number } | null;
+    return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
+  };
+
   return {
     findItemById,
     findBySource,
@@ -605,6 +627,7 @@ export const createQueueRepository = (database: AppDatabase) => {
     observeQueueSnapshot,
     addAlbumMember,
     addLateAlbumMember,
+    insertRecoveredSnapshots,
     finalizeAlbums,
     updateSnapshot,
     listActive,
@@ -644,6 +667,7 @@ export const createQueueRepository = (database: AppDatabase) => {
     getCurrentSnapshotSet,
     cloneSnapshotsWithIds,
     listRenewalAges,
+    renewalCandidateOperation,
   };
 };
 
