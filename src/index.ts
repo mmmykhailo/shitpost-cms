@@ -11,7 +11,7 @@ import { createPendingUpdateRepository } from "./db/pending-update-repository";
 import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
 import { createRuntimeLease } from "./db/runtime";
-import { createTelegramGateway } from "./telegram";
+import { createTelegramGateway, type BotMembership } from "./telegram";
 import { createIngestionService } from "./services/ingestion";
 import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
@@ -69,6 +69,7 @@ const main = async (): Promise<void> => {
   let lastRightsCheckAt = 0;
   let lastSuccessfulRightsCheckAt: number | undefined;
   let lastSuccessfulBackupAt: number | undefined;
+  let currentRights: { queue: BotMembership; target: BotMembership } | undefined;
   let stopped = false;
   let shutdownPromise: Promise<void> | undefined;
 
@@ -113,6 +114,7 @@ const main = async (): Promise<void> => {
     if (!queueMembership.canPostMessages || !queueMembership.canDeleteMessages) throw new Error("Bot needs can_post_messages and can_delete_messages in the queue channel");
     if (!targetMembership.canPostMessages || !targetMembership.canEditMessages || !targetMembership.canDeleteMessages) throw new Error("Bot needs post, edit, and delete rights in the destination channel");
     lastSuccessfulRightsCheckAt = Date.now();
+    currentRights = { queue: queueMembership, target: targetMembership };
     logger.info("telegram_rights_validated", { botId: identity.id, queueChatId: config.queueChannelId, targetChatId: config.targetChannelId });
   } catch (error) {
     logger.error("startup_rights_check_failed", { error: safeErrorDescription(error) });
@@ -129,8 +131,14 @@ const main = async (): Promise<void> => {
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock: systemClock, logger, bootId, operationTracker });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
   if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);
-  const orphanCleanup = createOrphanCleanupService({ orphan: orphanRepository, gateway, clock: systemClock, logger });
-  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt });
+  const orphanCleanup = createOrphanCleanupService({
+    orphan: orphanRepository,
+    gateway,
+    clock: systemClock,
+    logger,
+    onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, systemClock.now()),
+  });
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
   const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: systemClock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(systemClock.now()));
@@ -186,6 +194,7 @@ const main = async (): Promise<void> => {
         if (validatedBotId !== undefined && now - lastRightsCheckAt >= 6 * 60 * 60_000) {
           lastRightsCheckAt = now;
           const [queueRights, targetRights] = await Promise.all([gateway.getBotMembership(config.queueChannelId, validatedBotId), gateway.getBotMembership(config.targetChannelId, validatedBotId)]);
+          currentRights = { queue: queueRights, target: targetRights };
           const rightsOkay = queueRights.canPostMessages && queueRights.canDeleteMessages && targetRights.canPostMessages && targetRights.canEditMessages && targetRights.canDeleteMessages;
           if (!rightsOkay) await alerts.raise(`permissions:${config.queueChannelId}`, "immediate", "Telegram permissions no longer satisfy queue/destination cleanup requirements.", now);
           else {

@@ -5,6 +5,7 @@ import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { QueueRepository, ScheduleRepository } from "../db/repositories";
 import { nextOccurrence } from "../domain/schedule";
 import { calculateRenewalCapacity, type RenewalCapacity } from "./capacity";
+import type { BotMembership } from "../telegram";
 
 export type HealthService = ReturnType<typeof createHealthService>;
 
@@ -20,6 +21,7 @@ export const createHealthService = (input: {
   bootStartedAt?: number;
   lastRightsCheckAt?: () => number | undefined;
   lastBackupAt?: () => number | undefined;
+  rights?: () => { queue: BotMembership; target: BotMembership } | undefined;
 }) => {
   const snapshot = () => {
     const now = input.now();
@@ -35,7 +37,8 @@ export const createHealthService = (input: {
     const oldestLogical = active.reduce<number | undefined>((oldest, item) => oldest === undefined ? now - item.enqueuedAt : Math.max(oldest, now - item.enqueuedAt), undefined);
     const oldestPhysical = physicalAges.reduce<number | undefined>((oldest, item) => oldest === undefined ? item.ageMs : Math.max(oldest, item.ageMs), undefined);
     const sources = physicalAges.map((entry) => ({ itemId: entry.item.id, physicalCreatedAt: entry.item.physicalCreatedAt, memberCount: entry.sourceIds.length }));
-    const capacity: RenewalCapacity = calculateRenewalCapacity({ now, sources });
+    const retry = input.database.raw.query("SELECT MAX(maintenance_retry_not_before) AS retry_at FROM queue_items WHERE maintenance_status = 'idle'").get() as { retry_at: number | null };
+    const capacity: RenewalCapacity = calculateRenewalCapacity({ now, sources, ...(retry.retry_at === null ? {} : { retryAfterUntil: retry.retry_at }) });
     const app = input.database.raw.query("SELECT current_boot_id, created_at, last_clean_shutdown_at, last_scheduler_scan_at, last_successful_update_at FROM app_state WHERE id = 1").get() as { current_boot_id: string | null; created_at: number; last_clean_shutdown_at: number | null; last_scheduler_scan_at: number | null; last_successful_update_at: number | null };
     const operations = input.database.raw.query("SELECT COUNT(*) AS active, SUM(CASE WHEN phase = 'uncertain' THEN 1 ELSE 0 END) AS uncertain FROM operations WHERE state NOT IN ('done','failed')").get() as { active: number | null; uncertain: number | null };
     const lastOperation = input.database.raw.query("SELECT type, phase, updated_at FROM operations WHERE state IN ('done','failed') ORDER BY updated_at DESC LIMIT 1").get() as { type: string; phase: string; updated_at: number } | null;
@@ -47,6 +50,7 @@ export const createHealthService = (input: {
       lastCleanShutdownAt: app.last_clean_shutdown_at,
       lastSuccessfulUpdateAt: app.last_successful_update_at,
       lastRightsCheckAt: input.lastRightsCheckAt?.(),
+      rights: input.rights?.(),
       lastBackupAt: input.lastBackupAt?.(),
       queueCounts: input.queue.statusCounts(),
       queueHead: input.queue.getHead()?.id,

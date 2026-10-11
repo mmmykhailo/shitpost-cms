@@ -102,4 +102,17 @@ describe("renewal service", () => {
     const orphan = database.raw.query("SELECT resolved_at, terminal_reason, next_attempt_at FROM orphaned_sources").get() as { resolved_at: number | null; terminal_reason: string | null; next_attempt_at: number | null };
     expect(orphan).toEqual({ resolved_at: null, terminal_reason: "telegram_age_limit", next_attempt_at: null });
   });
+
+  test("notifies the operator when orphan cleanup loses deletion rights", async () => {
+    const fake = gatewayWithDeleteFailure();
+    const { queue, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(53), telegramDate: 0 }), 1);
+    database.raw.query("INSERT INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (1, 0, -100, 903, 'permission_denied', 1, 1, NULL, 0, 1, NULL)").run();
+    const alerts: number[] = [];
+    const permissionGateway: TelegramGateway = { ...fake.gateway, deleteMessages: async () => { throw { kind: "permission_denied", description: "rights lost" }; } };
+    const orphanCleanup = createOrphanCleanupService({ orphan: createOrphanRepository(database), gateway: permissionGateway, clock: createFakeClock(100_000), logger: createLogger("error"), onPermissionAlert: async () => { alerts.push(1); } });
+    expect((await orphanCleanup.runOnce()).attempted).toBe(1);
+    expect(alerts).toHaveLength(1);
+    expect((database.raw.query("SELECT next_attempt_at FROM orphaned_sources WHERE telegram_message_id = 903").get() as { next_attempt_at: number }).next_attempt_at).toBeGreaterThan(100_000);
+  });
 });
