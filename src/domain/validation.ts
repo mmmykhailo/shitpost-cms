@@ -1,5 +1,5 @@
-import type { ContentType, MessageEntity, SemanticOrigin, StoredMessageSnapshot } from "../types";
-import { asChatId, asMessageId, asUserId } from "../types";
+import type { ContentType, MessageEntity, PublicationContract, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import { asChatId, asMessageId, asUserId, type MessageId } from "../types";
 
 export class StoredDataValidationError extends Error {
   constructor(message: string) {
@@ -53,7 +53,7 @@ const validateEntity = (value: unknown): MessageEntity => {
   return result;
 };
 
-const validateOrigin = (value: unknown): SemanticOrigin => {
+export const validateSemanticOrigin = (value: unknown): SemanticOrigin => {
   const candidate = record(value);
   if (typeof candidate.kind !== "string") throw new StoredDataValidationError("origin.kind is required");
   switch (candidate.kind) {
@@ -111,7 +111,7 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     messageId: asMessageId(integer(candidate.messageId, "messageId")),
     ordinal: integer(candidate.ordinal, "ordinal"),
     contentType: contentType as ContentType,
-    origin: validateOrigin(candidate.origin),
+    origin: validateSemanticOrigin(candidate.origin),
     telegramDate: integer(candidate.telegramDate, "telegramDate"),
     hasReplyMarkup: candidate.hasReplyMarkup === true,
   };
@@ -142,4 +142,41 @@ export const parseStoredMessageSnapshot = (value: string): StoredMessageSnapshot
     if (error instanceof StoredDataValidationError) throw error;
     throw new StoredDataValidationError("Invalid stored snapshot JSON");
   }
+};
+
+export const validateOrderedMessageIds = (value: unknown, field = "messageIds"): MessageId[] => {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) throw new StoredDataValidationError(`${field} must contain 1–100 IDs`);
+  const ids = value.map((candidate, index) => asMessageId(integer(candidate, `${field}[${index}]`)));
+  for (let index = 1; index < ids.length; index += 1) if (ids[index]! <= ids[index - 1]!) throw new StoredDataValidationError(`${field} must be strictly increasing`);
+  return ids;
+};
+
+export const validateJsonPayload = (value: unknown, field: string): Record<string, unknown> => {
+  const candidate = record(value);
+  for (const key of Object.keys(candidate)) if (key.length > 64) throw new StoredDataValidationError(`${field} contains an oversized key`);
+  return candidate;
+};
+
+export const validatePublicationContract = (value: unknown): PublicationContract => {
+  const candidate = record(value);
+  const sourceIds = validateOrderedMessageIds(candidate.sourceIds, "contract.sourceIds");
+  const capturedLogicalStatus = candidate.capturedLogicalStatus;
+  if (typeof capturedLogicalStatus !== "string") throw new StoredDataValidationError("contract.capturedLogicalStatus is required");
+  const policy = record(candidate.policy);
+  if (typeof policy.kind !== "string") throw new StoredDataValidationError("contract.policy.kind is required");
+  const result: PublicationContract = {
+    capturedLogicalStatus: capturedLogicalStatus as PublicationContract["capturedLogicalStatus"],
+    capturedContentVersion: integer(candidate.capturedContentVersion, "contract.capturedContentVersion"),
+    capturedSourceGeneration: integer(candidate.capturedSourceGeneration, "contract.capturedSourceGeneration"),
+    sourceIds,
+    policy: policy as unknown as PublicationContract["policy"],
+    expectedTransferredMessageCount: integer(candidate.expectedTransferredMessageCount, "contract.expectedTransferredMessageCount"),
+    expectedOutputMessageCount: integer(candidate.expectedOutputMessageCount, "contract.expectedOutputMessageCount"),
+    requiresInlineEdit: candidate.requiresInlineEdit === true,
+    requiresSeparateByline: candidate.requiresSeparateByline === true,
+  };
+  const bylineText = optionalString(candidate.bylineText, "contract.bylineText");
+  if (bylineText !== undefined) result.bylineText = bylineText;
+  if (result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length) throw new StoredDataValidationError("contract output counts are inconsistent");
+  return result;
 };

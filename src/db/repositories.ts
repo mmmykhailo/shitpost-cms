@@ -1,6 +1,8 @@
 import type { AppDatabase } from "./database";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
+import { validateOrderedMessageIds, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
+import { OperationConflictError } from "../errors";
 import type { MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
@@ -72,7 +74,7 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     queueChatId: row.queue_chat_id,
     firstMessageId: row.first_message_id as MessageId,
     contentType: row.content_type,
-    origin: JSON.parse(row.origin_json) as SemanticOrigin,
+    origin: validateSemanticOrigin(JSON.parse(row.origin_json) as unknown),
     status: row.status,
     maintenanceStatus: row.maintenance_status,
     contentVersion: row.content_version,
@@ -112,18 +114,27 @@ const messageRowToRecord = (row: QueueMessageRow): QueueMessageRecord => {
     telegramMessageId: row.telegram_message_id as MessageId,
     ordinal: row.ordinal,
     telegramDate: row.telegram_date,
-    snapshot: JSON.parse(row.snapshot_json) as StoredMessageSnapshot,
+    snapshot: validateStoredMessageSnapshot(JSON.parse(row.snapshot_json) as unknown),
   };
   if (row.edit_date !== null) result.editDate = row.edit_date;
   return result;
 };
 
-const originKey = (origin: SemanticOrigin): string => JSON.stringify(origin);
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+};
+
+const originKey = (origin: SemanticOrigin): string => stableJson(origin);
 
 export type QueueRepository = ReturnType<typeof createQueueRepository>;
 
 export const createQueueRepository = (database: AppDatabase, options: { bootId?: string } = {}) => {
   let currentBootId = options.bootId;
+  const conflict = (message: string): OperationConflictError => new OperationConflictError(message);
   const setBootId = (bootId: string): void => { currentBootId = bootId; };
   const findItemById = (id: number): QueueItemRecord | undefined => {
     const row = database.raw.query("SELECT * FROM queue_items WHERE id = ?").get(id) as QueueRow | null;
@@ -171,7 +182,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       const existing = findBySource(snapshot.chatId, snapshot.messageId);
       if (existing) {
         const currentSnapshot = getMessages(existing.id).find((message) => message.telegramMessageId === snapshot.messageId)?.snapshot;
-        if (currentSnapshot && JSON.stringify({ ...currentSnapshot, editDate: undefined }) !== JSON.stringify({ ...snapshot, editDate: undefined })) {
+        if (currentSnapshot && stableJson({ ...currentSnapshot, editDate: undefined }) !== stableJson({ ...snapshot, editDate: undefined })) {
           throw new Error(`Conflicting duplicate update for ${snapshot.chatId}:${snapshot.messageId}`);
         }
         return { item: existing, inserted: false };
@@ -269,7 +280,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     if (!current) return item;
     if (current.editDate !== undefined && snapshot.editDate !== undefined && snapshot.editDate <= current.editDate) return item;
     const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
-    if (JSON.stringify(current.snapshot) === JSON.stringify(persistedSnapshot)) return item;
+    if (stableJson(current.snapshot) === stableJson(persistedSnapshot)) return item;
     database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);
     database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ? WHERE id = ?").run(persistedSnapshot.contentType, item.id);
     return findItemById(item.id);
@@ -361,8 +372,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     if (!row?.source_ids_json) return [];
     try {
       const parsed = JSON.parse(row.source_ids_json) as unknown;
-      if (!Array.isArray(parsed) || parsed.some((value) => !Number.isInteger(value))) return [];
-      return parsed as MessageId[];
+      return validateOrderedMessageIds(parsed, "operation.sourceIds");
     } catch {
       return [];
     }
@@ -417,29 +427,30 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const persistPublicationContract = (operationId: string, contract: PublicationContract, now: number): void => database.transaction(() => {
+    const validated = validatePublicationContract(contract);
     const result = database.raw.query("UPDATE operations SET return_item_status = ?, expected_source_count = ?, expected_output_count = ?, source_ids_json = ?, plan_json = ?, phase = 'claimed', updated_at = ? WHERE id = ? AND item_id IN (SELECT id FROM queue_items WHERE claimed_operation_id = ? AND content_version = ? AND source_generation = ?)").run(
-      contract.capturedLogicalStatus,
-      contract.sourceIds.length,
-      contract.expectedOutputMessageCount,
-      JSON.stringify(contract.sourceIds),
-      JSON.stringify(contract),
+      validated.capturedLogicalStatus,
+      validated.sourceIds.length,
+      validated.expectedOutputMessageCount,
+      JSON.stringify(validated.sourceIds),
+      JSON.stringify(validated),
       now,
       operationId,
       operationId,
-      contract.capturedContentVersion,
-      contract.capturedSourceGeneration,
+      validated.capturedContentVersion,
+      validated.capturedSourceGeneration,
     );
-    if (Number(result.changes) !== 1) throw new Error("Publication contract guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Publication contract guard conflict");
   });
 
   const beginPublicationTransfer = (guard: OperationGuard, now: number): void => {
     const result = database.raw.query("UPDATE operations SET phase = 'transfer_pending', updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'claimed' AND EXISTS (SELECT 1 FROM queue_items WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?)").run(now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration, guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Publication transfer guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Publication transfer guard conflict");
   };
 
   const markPartialCleanupPending = (guard: OperationGuard, now: number, errorCode: string, errorText: string): void => {
     const result = database.raw.query("UPDATE operations SET state = 'cleanup_pending', phase = 'partial_cleanup_pending', error_code = ?, error_json = ?, updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase IN ('transfer_pending','attribution_pending')").run(errorCode, JSON.stringify({ message: errorText }), now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Partial cleanup phase guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Partial cleanup phase guard conflict");
   };
 
   const guardRow = (guard: OperationGuard): { phase: string; type: string; maintenanceStatus: MaintenanceStatus; status: QueueItemStatus } | undefined => {
@@ -450,33 +461,33 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
 
   const recordCompleteBaseOutputs = (guard: OperationGuard, outputs: readonly { chatId: number; messageId: number; ordinal: number }[], now: number): void => database.transaction(() => {
     const operation = guardRow(guard);
-    if (!operation || operation.type === "renew" || operation.phase !== "transfer_pending" || operation.status !== "publishing") throw new Error("Publication transfer guard conflict");
+    if (!operation || operation.type === "renew" || operation.phase !== "transfer_pending" || operation.status !== "publishing") throw conflict("Publication transfer guard conflict");
     for (const output of outputs) recordOutput(guard.operationId, "transferred", output.chatId, output.messageId, output.ordinal, now);
     const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
     if (!expected || expected.expected_source_count !== outputs.length) throw new Error("Publication output count does not match contract");
     const result = database.raw.query("UPDATE operations SET state = 'outputs_recorded', phase = 'base_outputs_recorded', updated_at = ? WHERE id = ? AND phase = 'transfer_pending'").run(now, guard.operationId);
-    if (Number(result.changes) !== 1) throw new Error("Publication phase changed before base outputs were recorded");
+    if (Number(result.changes) !== 1) throw conflict("Publication phase changed before base outputs were recorded");
   });
 
   const markAttributionPending = (guard: OperationGuard, now: number): void => {
     const result = database.raw.query("UPDATE operations SET phase = 'attribution_pending', updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'base_outputs_recorded'").run(now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Publication attribution guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Publication attribution guard conflict");
   };
 
   const markPublicationOutputComplete = (guard: OperationGuard, destinationIds: readonly number[], now: number): void => database.transaction(() => {
     const operation = guardRow(guard);
-    if (!operation || operation.type === "renew" || operation.status !== "publishing" || !["base_outputs_recorded", "attribution_pending"].includes(operation.phase)) throw new Error("Publication output completion guard conflict");
+    if (!operation || operation.type === "renew" || operation.status !== "publishing" || !["base_outputs_recorded", "attribution_pending"].includes(operation.phase)) throw conflict("Publication output completion guard conflict");
     const expected = database.raw.query("SELECT expected_output_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_output_count: number | null } | null;
     if (!expected || expected.expected_output_count !== destinationIds.length) throw new Error("Publication output count does not match contract");
     const result = database.raw.query("UPDATE queue_items SET destination_message_ids_json = ? WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?").run(JSON.stringify(destinationIds), guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Publication output completion item guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Publication output completion item guard conflict");
     setOperationState(guard.operationId, "outputs_recorded", now, undefined, undefined);
     setOperationPhase(guard.operationId, "output_complete", now);
   });
 
   const markSourceCleanupPending = (guard: OperationGuard, now: number): void => database.transaction(() => {
     const result = database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', claimed_at = ? WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?").run(now, guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Publication cleanup guard conflict");
+    if (Number(result.changes) !== 1) throw conflict("Publication cleanup guard conflict");
     setOperationState(guard.operationId, "cleanup_pending", now);
     setOperationPhase(guard.operationId, "source_cleanup_pending", now);
   });
@@ -494,7 +505,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
 
   const markReplacementOutputsRecorded = (guard: OperationGuard, now: number): void => database.transaction(() => {
     const operation = guardRow(guard);
-    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || operation.phase !== "replacement_pending") throw new Error("Renewal replacement guard conflict");
+    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || operation.phase !== "replacement_pending") throw conflict("Renewal replacement guard conflict");
     const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
     const actual = operationOutputIds(guard.operationId, "replacement").length;
     if (!expected || expected.expected_source_count !== actual) throw new Error("Renewal output count does not match contract");
@@ -513,13 +524,13 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const replacementSnapshots = (typeof guardOrItemId === "number" ? snapshotsOrNow : operationIdOrSnapshots) as readonly StoredMessageSnapshot[];
     const now = (typeof guardOrItemId === "number" ? maybeNow : snapshotsOrNow) as number;
     const operation = guardRow(guard);
-    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || !["replacement_outputs_recorded", "claimed"].includes(operation.phase)) throw new Error("Renewal generation guard conflict");
+    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || !["replacement_outputs_recorded", "claimed"].includes(operation.phase)) throw conflict("Renewal generation guard conflict");
     const item = findItemById(guard.itemId);
-    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw new Error("Renewal generation CAS conflict");
+    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Renewal generation CAS conflict");
     const nextGeneration = item.sourceGeneration + 1;
     for (const snapshot of replacementSnapshots) insertSnapshot(item.id, nextGeneration, snapshot);
     const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
-    if (Number(result.changes) !== 1) throw new Error("Renewal generation install lost its lease");
+    if (Number(result.changes) !== 1) throw conflict("Renewal generation install lost its lease");
     setOperationState(guard.operationId, "cleanup_pending", now);
     setOperationPhase(guard.operationId, "generation_installed", now);
     return nextGeneration;
@@ -633,13 +644,14 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   });
 
   const adoptConfirmedPublicationOutputs = (itemId: number, operationId: string, contentVersion: number, sourceGeneration: number, destinationChatId: number, destinationIds: readonly number[], now: number): void => database.transaction(() => {
+    const validatedDestinationIds = validateOrderedMessageIds(destinationIds, "destinationMessageIds");
     const operation = database.raw.query("SELECT expected_output_count FROM operations WHERE id = ? AND item_id = ? AND phase = 'uncertain' AND captured_content_version = ? AND captured_source_generation = ?").get(operationId, itemId, contentVersion, sourceGeneration) as { expected_output_count: number | null } | null;
-    if (!operation || operation.expected_output_count === null || operation.expected_output_count !== destinationIds.length) throw new Error("Confirmed destination output count does not match the captured contract");
+    if (!operation || operation.expected_output_count === null || operation.expected_output_count !== validatedDestinationIds.length) throw conflict("Confirmed destination output count does not match the captured contract");
     const item = findItemById(itemId);
-    if (!item || item.status !== "uncertain_publish" || item.contentVersion !== contentVersion || item.sourceGeneration !== sourceGeneration) throw new Error("Uncertain publication resolution is stale");
-    for (const [ordinal, messageId] of destinationIds.entries()) recordOutput(operationId, ordinal === destinationIds.length - 1 && destinationIds.length > inputExpectedTransferred(operationId) ? "separate_byline" : "transferred", destinationChatId, messageId, ordinal, now);
-    const itemResult = database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', destination_message_ids_json = ?, claimed_operation_id = ?, claimed_at = ? WHERE id = ? AND status = 'uncertain_publish' AND content_version = ? AND source_generation = ?").run(JSON.stringify(destinationIds), operationId, now, itemId, contentVersion, sourceGeneration);
-    if (Number(itemResult.changes) !== 1) throw new Error("Confirmed destination output adoption lost its item guard");
+    if (!item || item.status !== "uncertain_publish" || item.contentVersion !== contentVersion || item.sourceGeneration !== sourceGeneration) throw conflict("Uncertain publication resolution is stale");
+    for (const [ordinal, messageId] of validatedDestinationIds.entries()) recordOutput(operationId, ordinal === validatedDestinationIds.length - 1 && validatedDestinationIds.length > inputExpectedTransferred(operationId) ? "separate_byline" : "transferred", destinationChatId, messageId, ordinal, now);
+    const itemResult = database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', destination_message_ids_json = ?, claimed_operation_id = ?, claimed_at = ? WHERE id = ? AND status = 'uncertain_publish' AND content_version = ? AND source_generation = ?").run(JSON.stringify(validatedDestinationIds), operationId, now, itemId, contentVersion, sourceGeneration);
+    if (Number(itemResult.changes) !== 1) throw conflict("Confirmed destination output adoption lost its item guard");
     setOperationState(operationId, "cleanup_pending", now);
     setOperationPhase(operationId, "source_cleanup_pending", now);
     database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('uncertain_publication_destination_confirmed', 'admin', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ destinationIds }), now);

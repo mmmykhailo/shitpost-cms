@@ -1,5 +1,12 @@
 import type { NormalizedTelegramError, NormalizedTelegramErrorKind } from "./types";
 
+export class OperationConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OperationConflictError";
+  }
+}
+
 type TelegramLikeError = {
   error_code?: unknown;
   description?: unknown;

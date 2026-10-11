@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
 import type { AppDatabase } from "./database";
+import { StoredDataValidationError, validateJsonPayload } from "../domain/validation";
 
 export type AdminRepository = ReturnType<typeof createAdminRepository>;
 
 export const createAdminRepository = (database: AppDatabase) => {
   const setPrompt = (adminId: number, kind: string, state: unknown, replyToMessageId: number | undefined, now: number, ttlMs = 15 * 60_000): void => {
-    database.raw.query("INSERT INTO admin_prompts (admin_id, kind, state_json, expected_reply_to_message_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(admin_id) DO UPDATE SET kind = excluded.kind, state_json = excluded.state_json, expected_reply_to_message_id = excluded.expected_reply_to_message_id, created_at = excluded.created_at, expires_at = excluded.expires_at").run(adminId, kind, JSON.stringify(state), replyToMessageId ?? null, now, now + ttlMs);
+    const payload = validateJsonPayload(state, "admin prompt");
+    database.raw.query("INSERT INTO admin_prompts (admin_id, kind, state_json, expected_reply_to_message_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(admin_id) DO UPDATE SET kind = excluded.kind, state_json = excluded.state_json, expected_reply_to_message_id = excluded.expected_reply_to_message_id, created_at = excluded.created_at, expires_at = excluded.expires_at").run(adminId, kind, JSON.stringify(payload), replyToMessageId ?? null, now, now + ttlMs);
   };
 
   const getPrompt = (adminId: number, now: number): { kind: string; state: unknown; expectedReplyToMessageId?: number } | undefined => {
@@ -15,7 +17,15 @@ export const createAdminRepository = (database: AppDatabase) => {
       database.raw.query("DELETE FROM admin_prompts WHERE admin_id = ?").run(adminId);
       return undefined;
     }
-    const result: { kind: string; state: unknown; expectedReplyToMessageId?: number } = { kind: row.kind, state: JSON.parse(row.state_json) as unknown };
+    let state: Record<string, unknown>;
+    try {
+      state = validateJsonPayload(JSON.parse(row.state_json) as unknown, "admin prompt");
+    } catch (error) {
+      if (!(error instanceof StoredDataValidationError)) throw error;
+      database.raw.query("DELETE FROM admin_prompts WHERE admin_id = ?").run(adminId);
+      return undefined;
+    }
+    const result: { kind: string; state: unknown; expectedReplyToMessageId?: number } = { kind: row.kind, state };
     if (row.expected_reply_to_message_id !== null) result.expectedReplyToMessageId = row.expected_reply_to_message_id;
     return result;
   };
@@ -24,7 +34,8 @@ export const createAdminRepository = (database: AppDatabase) => {
 
   const createCallbackToken = (adminId: number, action: string, payload: unknown, now: number, itemVersion?: number, ttlMs = 10 * 60_000): string => {
     const token = randomBytes(12).toString("base64url");
-    database.raw.query("INSERT INTO callback_tokens (token, admin_id, action, payload_json, item_version, expires_at) VALUES (?, ?, ?, ?, ?, ?)").run(token, adminId, action, JSON.stringify(payload), itemVersion ?? null, now + ttlMs);
+    const validatedPayload = validateJsonPayload(payload, "callback token");
+    database.raw.query("INSERT INTO callback_tokens (token, admin_id, action, payload_json, item_version, expires_at) VALUES (?, ?, ?, ?, ?, ?)").run(token, adminId, action, JSON.stringify(validatedPayload), itemVersion ?? null, now + ttlMs);
     return token;
   };
 
@@ -32,7 +43,14 @@ export const createAdminRepository = (database: AppDatabase) => {
     const row = database.raw.query("SELECT action, payload_json, item_version, expires_at FROM callback_tokens WHERE token = ? AND admin_id = ? AND consumed_at IS NULL").get(token, adminId) as { action: string; payload_json: string; item_version: number | null; expires_at: number } | null;
     if (!row || row.expires_at <= now) return undefined;
     database.raw.query("UPDATE callback_tokens SET consumed_at = ? WHERE token = ? AND consumed_at IS NULL").run(now, token);
-    const result: { action: string; payload: unknown; itemVersion?: number } = { action: row.action, payload: JSON.parse(row.payload_json) as unknown };
+    let payload: Record<string, unknown>;
+    try {
+      payload = validateJsonPayload(JSON.parse(row.payload_json) as unknown, "callback token");
+    } catch (error) {
+      if (!(error instanceof StoredDataValidationError)) throw error;
+      return undefined;
+    }
+    const result: { action: string; payload: unknown; itemVersion?: number } = { action: row.action, payload };
     if (row.item_version !== null) result.itemVersion = row.item_version;
     return result;
   });
