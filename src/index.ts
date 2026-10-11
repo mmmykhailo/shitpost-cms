@@ -146,7 +146,7 @@ const main = async (): Promise<void> => {
     onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, systemClock.now()),
   });
   const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
-  const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });
+  const retention = createRetentionService({ queue, generated, pending, admin, alerts: alertRepository, clock: systemClock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: systemClock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(systemClock.now()));
   registerAdminHandlers(bot, {

@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createAlertRepository } from "../src/db/alert-repository";
+import { createAdminRepository } from "../src/db/admin-repository";
+import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
+import { createGeneratedMessageRepository, createQueueRepository } from "../src/db/repositories";
 import { createAlertService } from "../src/services/alerts";
 import { calculateRenewalCapacity } from "../src/services/capacity";
 import { createBackupService } from "../src/services/backup";
 import { createRestoreService } from "../src/services/restore";
+import { createRetentionService } from "../src/services/retention";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
+import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
@@ -76,5 +81,25 @@ describe("operations safety net", () => {
     expect(second.previousPath).toBeDefined();
     expect(Bun.file(destination).size).toBeGreaterThan(0);
     expect(Bun.file(second.previousPath!).size).toBeGreaterThan(0);
+  });
+
+  test("retention purges old terminal pending-update rows", () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-retention-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    resources.push({ directory, close: database.close });
+    const pending = createPendingUpdateRepository(database);
+    pending.upsert(snapshotFixture({ messageId: asMessageId(906) }), 1_000);
+    pending.markState(-100, 906, "ingested", 1_001);
+    const retention = createRetentionService({
+      queue: createQueueRepository(database),
+      generated: createGeneratedMessageRepository(database),
+      pending,
+      admin: createAdminRepository(database),
+      alerts: createAlertRepository(database),
+      clock: { now: () => 8 * 86_400_000, sleep: async () => {} },
+      logger: createLogger("error"),
+    });
+    retention.runOnce();
+    expect(pending.find(-100, 906)).toBeUndefined();
   });
 });
