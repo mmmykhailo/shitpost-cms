@@ -100,6 +100,16 @@ describe("queue repository", () => {
     expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
     expect((database.raw.query("SELECT phase FROM operations WHERE id = 'partial-op'").get() as { phase: string }).phase).toBe("uncertain");
   });
+
+  test("a new boot reconciles a prior live lease immediately", () => {
+    const { database } = open();
+    const oldQueue = createQueueRepository(database, { bootId: "old-boot" });
+    oldQueue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(25) }), 1_000);
+    oldQueue.claimPublication("old-op", "publish", 1_000);
+    const newQueue = createQueueRepository(database, { bootId: "new-boot" });
+    expect(newQueue.recoverExpiredOperations(2_000, "new-boot")).toEqual([1]);
+    expect(newQueue.findItemById(1)?.status).toBe("queued");
+  });
 });
 
 describe("policy repository", () => {

@@ -122,7 +122,9 @@ const originKey = (origin: SemanticOrigin): string => JSON.stringify(origin);
 
 export type QueueRepository = ReturnType<typeof createQueueRepository>;
 
-export const createQueueRepository = (database: AppDatabase) => {
+export const createQueueRepository = (database: AppDatabase, options: { bootId?: string } = {}) => {
+  let currentBootId = options.bootId;
+  const setBootId = (bootId: string): void => { currentBootId = bootId; };
   const findItemById = (id: number): QueueItemRecord | undefined => {
     const row = database.raw.query("SELECT * FROM queue_items WHERE id = ?").get(id) as QueueRow | null;
     return row ? rowToItem(row) : undefined;
@@ -283,25 +285,25 @@ export const createQueueRepository = (database: AppDatabase) => {
     return row ? rowToItem(row) : undefined;
   };
 
-  const claimPublication = (operationId: string, type: "publish" | "manual_publish", now: number, bootId = operationId): ClaimedItem | undefined => database.transaction(() => {
+  const claimPublication = (operationId: string, type: "publish" | "manual_publish", now: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
     const head = getHead();
     if (!head || head.status !== "queued" || head.maintenanceStatus !== "idle" || (head.retryNotBefore !== undefined && head.retryNotBefore > now)) return undefined;
     const changed = database.raw.query("UPDATE queue_items SET status = 'publishing', claimed_operation_id = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ? AND status = 'queued' AND maintenance_status = 'idle' AND content_version = ? AND source_generation = ?").run(operationId, now, head.id, head.contentVersion, head.sourceGeneration);
     if (Number(changed.changes) !== 1) return undefined;
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, type, head.id, bootId, head.status, head.contentVersion, head.sourceGeneration, operationId, now + 300_000, now, now);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, type, head.id, currentBootId ?? bootId ?? operationId, head.status, head.contentVersion, head.sourceGeneration, operationId, now + 300_000, now, now);
     const claimed = findItemById(head.id);
     if (!claimed) throw new Error("Queue item disappeared during claim");
     return { item: claimed, operationId, capturedContentVersion: head.contentVersion, capturedSourceGeneration: head.sourceGeneration };
   });
 
-  const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId = operationId): ClaimedItem | undefined => database.transaction(() => {
+  const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
     const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending') AND maintenance_status = 'idle' AND physical_created_at <= ? ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore) as QueueRow | null;
     if (!row) return undefined;
     const item = rowToItem(row);
     const changed = database.raw.query("UPDATE queue_items SET maintenance_status = 'renewing', maintenance_operation_id = ?, maintenance_retry_not_before = NULL, attempts = attempts + 1 WHERE id = ? AND status = ? AND maintenance_status = 'idle' AND source_generation = ? AND content_version = ?").run(operationId, item.id, item.status, item.sourceGeneration, item.contentVersion);
     if (Number(changed.changes) !== 1) return undefined;
     const sourceIds = currentSourceIds(item.id);
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, expected_source_count, captured_content_version, captured_source_generation, source_ids_json, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, 'renew', ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, item.id, bootId, item.status, sourceIds.length, item.contentVersion, item.sourceGeneration, JSON.stringify(sourceIds), operationId, now + 300_000, now, now);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, expected_source_count, captured_content_version, captured_source_generation, source_ids_json, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, 'renew', ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, item.id, currentBootId ?? bootId ?? operationId, item.status, sourceIds.length, item.contentVersion, item.sourceGeneration, JSON.stringify(sourceIds), operationId, now + 300_000, now, now);
     const claimed = findItemById(item.id);
     if (!claimed) throw new Error("Queue item disappeared during renewal claim");
     return { item: claimed, operationId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration };
@@ -366,8 +368,8 @@ export const createQueueRepository = (database: AppDatabase) => {
     }
   };
 
-  const recoverExpiredOperations = (now: number): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null }>;
+  const recoverExpiredOperations = (now: number, bootId?: string): number[] => database.transaction(() => {
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null }>;
     const recovered: number[] = [];
     for (const row of rows) {
       const item = findItemById(row.item_id);
@@ -746,6 +748,7 @@ export const createQueueRepository = (database: AppDatabase) => {
     cloneSnapshotsWithIds,
     listRenewalAges,
     renewalCandidateOperation,
+    setBootId,
   };
 };
 
@@ -890,10 +893,25 @@ export const createScheduleRepository = (database: AppDatabase) => {
     const result = database.raw.query("UPDATE schedule_runs SET status = 'running', operation_id = NULL, started_at = ? WHERE occurrence_at = ? AND status = 'pending'").run(now, occurrenceAt);
     return Number(result.changes) === 1;
   };
+  const recoverInterruptedRuns = (now: number): number => {
+    const rows = database.raw.query("SELECT sr.occurrence_at, sr.item_id, sr.operation_id, o.state, o.phase FROM schedule_runs sr LEFT JOIN operations o ON o.id = sr.operation_id WHERE sr.status = 'running'").all() as Array<{ occurrence_at: number; item_id: number | null; operation_id: string | null; state: string | null; phase: string | null }>;
+    for (const row of rows) {
+      if (row.operation_id !== null && row.state === "done" && row.phase === "completed") {
+        markRun(row.occurrence_at, "published", now, row.item_id ?? undefined, row.operation_id);
+      } else if (row.operation_id !== null && (row.phase === "output_complete" || row.phase === "source_cleanup_pending")) {
+        markRun(row.occurrence_at, "published", now, row.item_id ?? undefined, row.operation_id, "cleanup_pending");
+      } else if (row.operation_id !== null && row.phase === "uncertain") {
+        markRun(row.occurrence_at, "failed", now, row.item_id ?? undefined, row.operation_id, "uncertain_publish");
+      } else {
+        markRun(row.occurrence_at, "failed", now, row.item_id ?? undefined, row.operation_id ?? undefined, "startup_recovery");
+      }
+    }
+    return rows.length;
+  };
   const lastScan = (): number | undefined => {
     const row = database.raw.query("SELECT last_scheduler_scan_at FROM app_state WHERE id = 1").get() as { last_scheduler_scan_at: number | null };
     return row.last_scheduler_scan_at ?? undefined;
   };
   const setLastScan = (now: number): void => { database.raw.query("UPDATE app_state SET last_scheduler_scan_at = ? WHERE id = 1").run(now); };
-  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, markRunning, lastScan, setLastScan };
+  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, markRunning, recoverInterruptedRuns, lastScan, setLastScan };
 };

@@ -3,6 +3,7 @@ import type { ScheduleRepository } from "../db/repositories";
 import type { Logger } from "../logger";
 import type { Clock } from "../types";
 import type { PublicationOutcome } from "./publisher";
+import { abortableSleep } from "./task-supervisor";
 
 type Publisher = { publishNext(type?: "publish" | "manual_publish"): Promise<PublicationOutcome> };
 
@@ -76,14 +77,15 @@ export const createSchedulerService = (input: {
 
   const nextAt = (): number | undefined => input.schedule.enabled() ? nextOccurrence(input.clock.now(), input.schedule.slots()) : undefined;
 
-  const run = async (): Promise<void> => {
+  const run = async (signal?: AbortSignal): Promise<void> => {
     if (loopRunning) return;
     loopRunning = true;
+    const effectiveSignal = signal ?? new AbortController().signal;
     try {
-      while (loopRunning) {
+      while (loopRunning && !effectiveSignal.aborted) {
         await scanOnce();
         const next = nextAt();
-        await input.clock.sleep(next === undefined ? 60_000 : Math.max(1_000, next - input.clock.now()));
+        await abortableSleep(input.clock, next === undefined ? 60_000 : Math.max(1_000, next - input.clock.now()), effectiveSignal);
       }
     } finally {
       loopRunning = false;
