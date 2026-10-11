@@ -288,9 +288,9 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         if (typeof payload.chatId !== "number") return ctx.reply("Invalid channel.");
         return ctx.reply("Remove this numeric channel from the whitelist?", { reply_markup: keyboard([[await button(deps, "Confirm removal", "whitelist_remove_execute", { chatId: payload.chatId })], [await button(deps, "Cancel", "whitelist")]]) });
       }
-      case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId); return sendWhitelist(ctx);
+      case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId, deps.config.adminUserId, deps.now()); return sendWhitelist(ctx);
       case "alias_add": deps.admin.setPrompt(deps.config.adminUserId, "alias_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send `<user id or @observed_username> <alias>`.");
-      case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId); return sendAuthors(ctx);
+      case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId, deps.config.adminUserId, deps.now()); return sendAuthors(ctx);
       case "queue_retry": {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
         const item = deps.queue.findItemById(itemId);

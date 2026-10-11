@@ -890,11 +890,15 @@ export type PolicyRepository = ReturnType<typeof createPolicyRepository>;
 export const createPolicyRepository = (database: AppDatabase) => {
   const isChannelWhitelisted = (chatId: number): boolean => Boolean(database.raw.query("SELECT 1 AS value FROM channel_whitelist WHERE chat_id = ?").get(chatId));
 
-  const upsertChannel = (chatId: number, username: string | undefined, title: string | undefined, adminId: number, now: number): void => {
+  const upsertChannel = (chatId: number, username: string | undefined, title: string | undefined, adminId: number, now: number): void => database.transaction(() => {
     database.raw.query("INSERT INTO channel_whitelist (chat_id, username, title, added_at, added_by_admin_id, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET username = excluded.username, title = excluded.title, updated_at = excluded.updated_at").run(chatId, username ?? null, title ?? null, now, adminId, now);
-  };
+    database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('whitelist_channel_upserted', ?, ?, ?)").run(String(adminId), JSON.stringify({ chatId, username, title }), now);
+  });
 
-  const removeChannel = (chatId: number): void => { database.raw.query("DELETE FROM channel_whitelist WHERE chat_id = ?").run(chatId); };
+  const removeChannel = (chatId: number, adminId: number, now: number): void => database.transaction(() => {
+    const result = database.raw.query("DELETE FROM channel_whitelist WHERE chat_id = ?").run(chatId);
+    if (Number(result.changes) === 1) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('whitelist_channel_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ chatId }), now);
+  });
 
   const listChannels = (): Array<{ chatId: number; username?: string; title?: string }> => {
     const rows = database.raw.query("SELECT chat_id, username, title FROM channel_whitelist ORDER BY chat_id").all() as Array<{ chat_id: number; username: string | null; title: string | null }>;
@@ -934,16 +938,19 @@ export const createPolicyRepository = (database: AppDatabase) => {
     return byUsername?.nickname;
   };
 
-  const setAlias = (userIdOrUsername: number | string, nickname: string, adminId: number, now: number): void => {
+  const setAlias = (userIdOrUsername: number | string, nickname: string, adminId: number, now: number): void => database.transaction(() => {
     const userId = resolveAuthorId(userIdOrUsername);
     if (userId === undefined) throw new Error("Author must be observed before an alias can be set");
     database.raw.query("INSERT INTO author_aliases (user_id, nickname, updated_at, updated_by_admin_id) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET nickname = excluded.nickname, updated_at = excluded.updated_at, updated_by_admin_id = excluded.updated_by_admin_id").run(userId, nickname, now, adminId);
-  };
+    database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('author_alias_set', ?, ?, ?)").run(String(adminId), JSON.stringify({ userId, nickname }), now);
+  });
 
-  const removeAlias = (userIdOrUsername: number | string): void => {
+  const removeAlias = (userIdOrUsername: number | string, adminId: number, now: number): void => database.transaction(() => {
     const userId = resolveAuthorId(userIdOrUsername);
-    if (userId !== undefined) database.raw.query("DELETE FROM author_aliases WHERE user_id = ?").run(userId);
-  };
+    if (userId === undefined) return;
+    const result = database.raw.query("DELETE FROM author_aliases WHERE user_id = ?").run(userId);
+    if (Number(result.changes) === 1) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ userId }), now);
+  });
 
   const listAuthors = (): Array<{ userId: number; username?: string; displayName: string; alias?: string; lastSeenAt: number }> => {
     const rows = database.raw.query("SELECT ka.user_id, ka.username, ka.display_name, ka.last_seen_at, aa.nickname FROM known_authors ka LEFT JOIN author_aliases aa ON aa.user_id = ka.user_id ORDER BY ka.last_seen_at DESC").all() as Array<{ user_id: number; username: string | null; display_name: string; last_seen_at: number; nickname: string | null }>;

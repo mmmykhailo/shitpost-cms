@@ -169,7 +169,7 @@ describe("queue repository", () => {
 
 describe("policy repository", () => {
   test("uses numeric channel IDs and stable author IDs", () => {
-    const { policy } = open();
+    const { database, policy } = open();
     policy.upsertChannel(-1009, "old_handle", "Title", 1, 1);
     expect(policy.isChannelWhitelisted(-1009)).toBe(true);
     expect(policy.isChannelWhitelisted(-1010)).toBe(false);
@@ -178,6 +178,9 @@ describe("policy repository", () => {
     expect(policy.aliasForOrigin({ kind: "user", userId: asUserId(42), username: "ada", displayName: "Ada L" })).toBe("Analyst");
     policy.observeAuthor({ kind: "user", userId: asUserId(42), username: "new_ada", displayName: "Ada Lovelace" }, 3);
     expect(policy.aliasForOrigin({ kind: "user", userId: asUserId(42), username: "new_ada", displayName: "Ada Lovelace" })).toBe("Analyst");
+    policy.removeAlias(42, 1, 4);
+    policy.removeChannel(-1009, 1, 5);
+    expect((database.raw.query("SELECT event_type FROM audit_events WHERE actor = '1' ORDER BY id").all() as Array<{ event_type: string }>).map((row) => row.event_type)).toEqual(["whitelist_channel_upserted", "author_alias_set", "author_alias_removed", "whitelist_channel_removed"]);
   });
 });
 
