@@ -85,15 +85,22 @@ const main = async (): Promise<void> => {
       } catch (error) {
         logger.warn("bot_stop_failed", { error: safeErrorDescription(error) });
       }
-      const tasksDrained = await supervisor.stopAndDrain(SHUTDOWN_TIMEOUT_MS);
-      const operationsDrained = await operationTracker.waitForEmpty(SHUTDOWN_TIMEOUT_MS);
+      const shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+      const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - Date.now()));
+      const operationsDrained = await operationTracker.waitForEmpty(Math.max(0, shutdownDeadline - Date.now()));
       const clean = tasksDrained && operationsDrained;
+      let checkpointed = false;
       try {
         if (!clean) logger.error("shutdown_drain_timeout", { tasks: supervisor.names().join(","), operations: operationTracker.names().join(",") });
-        database.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
+        database.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        checkpointed = true;
         if (clean) database.raw.query("UPDATE app_state SET last_clean_shutdown_at = ? WHERE id = 1").run(Date.now());
         else database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('unclean_shutdown', 'runtime', ?, ?)").run(JSON.stringify({ signal, tasks: supervisor.names(), operations: operationTracker.names() }), Date.now());
+      } catch (error) {
+        logger.error("shutdown_checkpoint_failed", { error: safeErrorDescription(error) });
+        process.exitCode = 1;
       } finally {
+        if (!clean || !checkpointed) process.exitCode = 1;
         runtime.release();
         database.close();
       }
