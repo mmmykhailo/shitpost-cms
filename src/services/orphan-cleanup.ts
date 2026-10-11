@@ -45,7 +45,9 @@ export const createOrphanCleanupService = (input: {
             input.orphan.markTerminal(orphan, input.clock.now(), "telegram_age_limit");
             terminal += 1;
           } else {
-            input.orphan.markAttempt(orphan, input.clock.now(), nextAttempt(input.clock.now(), orphan.attemptCount));
+            const attemptNow = input.clock.now();
+            const retryAt = normalized.kind === "permission_denied" ? attemptNow + 6 * 60 * 60_000 : nextAttempt(attemptNow, orphan.attemptCount);
+            input.orphan.markAttempt(orphan, attemptNow, retryAt);
             if (normalized.kind === "permission_denied") {
               try { await input.onPermissionAlert?.(orphan); }
               catch (alertError) { input.logger.error("orphan_permission_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }

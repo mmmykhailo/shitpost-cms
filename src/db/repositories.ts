@@ -624,8 +624,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const item = findItemById(guard.itemId);
     if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration + 1) throw new Error("Renewal completion CAS conflict");
     const terminal = reason === "telegram_age_limit";
+    const nextAttemptAt = reason === "permission_denied" ? now + 6 * 60 * 60_000 : now;
     const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, null, terminal ? 1 : 0, terminal ? null : now, terminal ? reason : null);
+    for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, null, terminal ? 1 : 0, terminal ? null : nextAttemptAt, terminal ? reason : null);
     const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewal_cleanup_pending' AND content_version = ? AND source_generation = ?").run(item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration + 1);
     if (Number(result.changes) !== 1) throw new Error("Renewal maintenance cleanup guard conflict");
     setOperationState(guard.operationId, "done", now, orphanIds.length > 0 ? reason : undefined);

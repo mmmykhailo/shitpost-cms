@@ -15,7 +15,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "telegram_age_limit" = "transient_network") => {
+const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "permission_denied" | "telegram_age_limit" = "transient_network") => {
   let nextId = 900;
   let fail = true;
   const calls: string[] = [];
@@ -101,6 +101,15 @@ describe("renewal service", () => {
     expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
     const orphan = database.raw.query("SELECT resolved_at, terminal_reason, next_attempt_at FROM orphaned_sources").get() as { resolved_at: number | null; terminal_reason: string | null; next_attempt_at: number | null };
     expect(orphan).toEqual({ resolved_at: null, terminal_reason: "telegram_age_limit", next_attempt_at: null });
+  });
+
+  test("backs off permission-denied orphan cleanup for six hours", async () => {
+    const fake = gatewayWithDeleteFailure("permission_denied");
+    const { queue, renewal, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(54), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
+    const orphan = database.raw.query("SELECT next_attempt_at FROM orphaned_sources").get() as { next_attempt_at: number };
+    expect(orphan.next_attempt_at).toBe(100_000 + 6 * 60 * 60_000);
   });
 
   test("notifies the operator when orphan cleanup loses deletion rights", async () => {
