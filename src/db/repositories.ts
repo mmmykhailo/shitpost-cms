@@ -475,7 +475,11 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   const recordOutput = (operationId: string, role: OperationOutputRole | "destination" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
     const kind = role === "replacement" ? "replacement" : role === "temporary_preview" ? "temporary_preview" : "destination";
     const normalizedRole = role === "destination" ? "transferred" : role;
-    database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);
+    const result = database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);
+    if (Number(result.changes) === 1) return;
+    const existing = database.raw.query("SELECT operation_id, kind, role, ordinal FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(chatId, messageId) as { operation_id: string; kind: string; role: string; ordinal: number } | null;
+    if (existing?.operation_id === operationId && existing.kind === kind && existing.role === normalizedRole && existing.ordinal === ordinal) return;
+    throw conflict(`Telegram output ${chatId}/${messageId} already belongs to another operation`);
   };
 
   const recordReplacementOutput = (operationId: string, chatId: number, messageId: number, ordinal: number, now: number): void => database.transaction(() => {

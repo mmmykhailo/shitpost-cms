@@ -145,6 +145,16 @@ describe("queue repository", () => {
     expect((database.raw.query("SELECT phase FROM operations WHERE id = 'partial-op'").get() as { phase: string }).phase).toBe("uncertain");
   });
 
+  test("does not let one operation claim another operation's Telegram output", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(30) }), 1_000);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(31) }), 1_001);
+    const first = queue.claimPublication("output-owner", "publish", 1_002)!;
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, created_at, updated_at) VALUES ('output-rival', 'publish', 2, 'running', 1, 0, 1000, 1000)").run();
+    queue.recordOutput(first.operationId, "transferred", -200, 904, 0, 1_003);
+    expect(() => queue.recordOutput("output-rival", "transferred", -200, 904, 0, 1_004)).toThrow(/already belongs/);
+  });
+
   test("a new boot reconciles a prior live lease immediately", () => {
     const { database } = open();
     const oldQueue = createQueueRepository(database, { bootId: "old-boot" });
