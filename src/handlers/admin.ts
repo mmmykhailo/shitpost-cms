@@ -100,7 +100,9 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
 
   const sendAuthors = async (ctx: Context): Promise<void> => {
     const authors = deps.policy.listAuthors();
-    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set alias", "alias_add")], [await button(deps, "Back", "dashboard")]];
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set alias", "alias_add")]];
+    for (const author of authors.filter((entry) => entry.alias).slice(0, 20)) rows.push([await button(deps, `Remove alias ${author.userId}`, "alias_remove", { userId: author.userId })]);
+    rows.push([await button(deps, "Back", "dashboard")]);
     const text = ["Observed authors", ...authors.slice(0, 20).map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)].join("\n");
     await ctx.reply(text, { reply_markup: keyboard(rows) });
   };
@@ -200,8 +202,13 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         deps.policy.upsertChannel(payload.chatId, typeof payload.username === "string" ? payload.username : undefined, typeof payload.title === "string" ? payload.title : undefined, deps.config.adminUserId, deps.now());
         return sendWhitelist(ctx);
       }
-      case "whitelist_remove": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId); return sendWhitelist(ctx);
+      case "whitelist_remove": {
+        if (typeof payload.chatId !== "number") return ctx.reply("Invalid channel.");
+        return ctx.reply("Remove this numeric channel from the whitelist?", { reply_markup: keyboard([[await button(deps, "Confirm removal", "whitelist_remove_execute", { chatId: payload.chatId })], [await button(deps, "Cancel", "whitelist")]]) });
+      }
+      case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId); return sendWhitelist(ctx);
       case "alias_add": deps.admin.setPrompt(deps.config.adminUserId, "alias_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send `<user id or @observed_username> <alias>`.");
+      case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId); return sendAuthors(ctx);
       case "queue_retry": if (itemId !== undefined) deps.queue.retryItem(itemId, deps.now()); return sendQueue(ctx);
       case "queue_move_end": if (itemId !== undefined) deps.queue.moveToEnd(itemId, deps.now()); return sendQueue(ctx);
       case "queue_delete": {
@@ -238,7 +245,20 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     });
   };
 
-  command("start", sendDashboard);
+  command("start", async (ctx) => {
+    await ctx.api.setMyCommands([
+      { command: "start", description: "Open queue manager" },
+      { command: "manage", description: "Open queue manager" },
+      { command: "queue", description: "Browse FIFO queue" },
+      { command: "schedule", description: "Manage UTC slots" },
+      { command: "whitelist", description: "Manage channel whitelist" },
+      { command: "authors", description: "Manage author aliases" },
+      { command: "health", description: "Show health" },
+      { command: "recover", description: "Recover an explicit queue message" },
+      { command: "cancel", description: "Cancel the current prompt" },
+    ], { scope: { type: "chat", chat_id: deps.config.adminUserId } });
+    await sendDashboard(ctx);
+  });
   command("manage", sendDashboard);
   command("queue", sendQueue);
   command("schedule", sendSchedule);

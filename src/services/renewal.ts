@@ -86,6 +86,7 @@ export const createRenewalService = (input: {
       const replacementIds = claimed.item.origin.kind === "absent"
         ? await input.gateway.copyMessages(inputTransfer)
         : await input.gateway.forwardMessages(inputTransfer);
+      for (const [ordinal, messageId] of replacementIds.entries()) input.queue.recordOutput(claimed.operationId, "replacement", input.queueChannelId, messageId, ordinal, now);
       if (replacementIds.length !== oldSourceIds.length) {
         try { await input.gateway.deleteMessages(input.queueChannelId, replacementIds); }
         catch (cleanupError) { input.logger.error("partial_renewal_cleanup_failed", { itemId: claimed.item.id, error: classifyTelegramError(cleanupError).kind }); }
