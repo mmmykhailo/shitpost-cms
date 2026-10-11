@@ -1,4 +1,4 @@
-import type { MessageId, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { MaintenanceStatus, MessageId, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 export type QueueItemRecord = {
   id: number;
@@ -9,6 +9,9 @@ export type QueueItemRecord = {
   contentType: StoredMessageSnapshot["contentType"];
   origin: SemanticOrigin;
   status: QueueItemStatus;
+  maintenanceStatus: MaintenanceStatus;
+  maintenanceOperationId?: string;
+  maintenanceRetryNotBefore?: number;
   contentVersion: number;
   sourceGeneration: number;
   attempts: number;
@@ -32,13 +35,10 @@ export const sourceBearingStatuses = new Set<QueueItemStatus>([
   "queued",
   "publishing",
   "published_cleanup_pending",
-  "renewing",
-  "renewed_cleanup_pending",
   "blocked",
   "needs_edit",
   "needs_review",
   "uncertain_publish",
-  "uncertain_renewal",
   "delete_blocked",
 ]);
 
@@ -46,22 +46,20 @@ export const isSourceBearing = (status: QueueItemStatus): boolean => sourceBeari
 
 export const isBlockingHead = (item: QueueItemRecord, now: number): boolean => {
   if (!isSourceBearing(item.status)) return false;
-  if (["blocked", "needs_edit", "needs_review", "uncertain_publish", "uncertain_renewal", "collecting"].includes(item.status)) return true;
+  if (item.maintenanceStatus !== "idle") return true;
+  if (["blocked", "needs_edit", "needs_review", "uncertain_publish", "collecting"].includes(item.status)) return true;
   return item.retryNotBefore !== undefined && item.retryNotBefore > now;
 };
 
 const validTransitions: Record<QueueItemStatus, readonly QueueItemStatus[]> = {
   collecting: ["queued", "needs_review", "deleted_external", "deleted"],
-  queued: ["publishing", "renewing", "blocked", "needs_edit", "needs_review", "deleted", "deleted_external", "collecting"],
+  queued: ["publishing", "blocked", "needs_edit", "needs_review", "deleted", "deleted_external", "collecting"],
   publishing: ["queued", "published_cleanup_pending", "uncertain_publish", "blocked", "needs_edit", "deleted_external", "deleted"],
   published_cleanup_pending: ["done", "uncertain_publish", "deleted_external"],
-  renewing: ["queued", "blocked", "needs_review", "renewed_cleanup_pending", "uncertain_renewal", "deleted_external", "deleted"],
-  renewed_cleanup_pending: ["queued", "blocked", "uncertain_renewal", "deleted_external"],
-  blocked: ["queued", "publishing", "renewing", "needs_review", "deleted", "deleted_external"],
-  needs_edit: ["queued", "publishing", "renewing", "deleted", "deleted_external"],
-  needs_review: ["queued", "publishing", "renewing", "deleted", "deleted_external"],
+  blocked: ["queued", "publishing", "needs_review", "deleted", "deleted_external"],
+  needs_edit: ["queued", "publishing", "deleted", "deleted_external"],
+  needs_review: ["queued", "publishing", "deleted", "deleted_external"],
   uncertain_publish: ["published_cleanup_pending", "queued", "deleted", "deleted_external"],
-  uncertain_renewal: ["renewed_cleanup_pending", "renewing", "queued", "deleted", "deleted_external"],
   delete_blocked: ["deleted", "deleted_external", "queued"],
   done: [],
   deleted: [],

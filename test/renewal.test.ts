@@ -71,12 +71,12 @@ describe("renewal service", () => {
     const { queue, renewal } = open(fake.gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(50), telegramDate: 0, origin: { kind: "absent" } }), 1);
     const result = await renewal.renewNext(36_000);
-    expect(result.kind).toBe("cleanup_pending");
+    expect(result.kind).toBe("renewed");
     expect(queue.findItemById(1)?.sourceGeneration).toBe(1);
     expect(queue.currentSourceIds(1)).toEqual([asMessageId(900)]);
     expect(fake.calls).toEqual(["copy", "delete"]);
-    expect((await renewal.cleanupPending(1)).kind).toBe("renewed");
     expect(queue.findItemById(1)?.status).toBe("queued");
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("idle");
   });
 
   test("re-forwards semantic channel origins", async () => {
@@ -84,7 +84,7 @@ describe("renewal service", () => {
     const { queue, renewal } = open(fake.gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(51), telegramDate: 0, origin: { kind: "channel", chatId: asChatId(-300) } }), 1);
     const result = await renewal.renewNext(36_000);
-    expect(result.kind).toBe("cleanup_pending");
+    expect(result.kind).toBe("renewed");
     expect(fake.calls[0]).toBe("forward");
   });
 });

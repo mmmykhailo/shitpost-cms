@@ -87,17 +87,98 @@ export type QueueItemStatus =
   | "queued"
   | "publishing"
   | "published_cleanup_pending"
-  | "renewing"
-  | "renewed_cleanup_pending"
   | "blocked"
   | "needs_edit"
   | "needs_review"
   | "uncertain_publish"
-  | "uncertain_renewal"
   | "delete_blocked"
   | "done"
   | "deleted"
   | "deleted_external";
+
+/** Status values that were used by schema versions before maintenance was orthogonal. */
+export type LegacyQueueItemStatus = "renewing" | "renewed_cleanup_pending" | "uncertain_renewal";
+
+export type MaintenanceStatus =
+  | "idle"
+  | "renewing"
+  | "renewal_cleanup_pending"
+  | "uncertain_renewal";
+
+export type OperationType = "publish" | "manual_publish" | "renew" | "delete" | "recover";
+export type OperationState = "running" | "outputs_recorded" | "cleanup_pending" | "uncertain" | "done" | "failed";
+
+export type PublicationPhase =
+  | "claimed"
+  | "transfer_pending"
+  | "base_outputs_recorded"
+  | "attribution_pending"
+  | "output_complete"
+  | "source_cleanup_pending"
+  | "partial_cleanup_pending"
+  | "uncertain"
+  | "completed"
+  | "failed";
+
+export type RenewalPhase =
+  | "claimed"
+  | "replacement_pending"
+  | "replacement_outputs_recorded"
+  | "generation_installed"
+  | "old_source_cleanup_pending"
+  | "partial_cleanup_pending"
+  | "uncertain"
+  | "completed"
+  | "failed";
+
+export type OperationPhase = PublicationPhase | RenewalPhase | "legacy";
+export type RecoveryPhase = "claimed" | "preview_pending" | "previews_recorded" | "item_inserted" | "preview_cleanup_pending" | "completed" | "failed";
+
+export type OperationOutputRole = "transferred" | "separate_byline" | "replacement" | "temporary_preview" | "legacy";
+
+export type OperationGuard = {
+  operationId: string;
+  itemId: number;
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+};
+
+export type PublicationContract = {
+  capturedLogicalStatus: QueueItemStatus;
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+  sourceIds: readonly MessageId[];
+  policy: PublicationPlan;
+  expectedTransferredMessageCount: number;
+  expectedOutputMessageCount: number;
+  requiresInlineEdit: boolean;
+  requiresSeparateByline: boolean;
+  bylineText?: string;
+};
+
+export type RenewalContract = {
+  capturedLogicalStatus: QueueItemStatus;
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+  sourceIds: readonly MessageId[];
+  expectedReplacementCount: number;
+};
+
+export type PendingQueueUpdateState =
+  | "pending"
+  | "quarantined_renewal_candidate"
+  | "consumed_generated"
+  | "ingested"
+  | "discarded";
+
+export type AdminResolution =
+  | { kind: "publication_destination_complete"; destinationMessageIds: readonly MessageId[] }
+  | { kind: "publication_delete_known_and_retry" }
+  | { kind: "publication_nothing_published_retry" }
+  | { kind: "renewal_adopt_replacements"; replacementMessageIds: readonly MessageId[] }
+  | { kind: "renewal_delete_replacements_and_retry" }
+  | { kind: "renewal_no_replacement" }
+  | { kind: "renewal_manual_cleanup"; orphanMessageIds: readonly MessageId[] };
 
 export type PublicationPlan =
   | { kind: "forward"; reason: "whitelisted_channel" }

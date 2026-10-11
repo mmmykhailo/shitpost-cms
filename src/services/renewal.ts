@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { classifyTelegramError } from "../errors";
 import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } from "../db/repositories";
 import type { Logger } from "../logger";
-import type { ChatId, Clock, MessageId, NormalizedTelegramError, StoredMessageSnapshot } from "../types";
+import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, StoredMessageSnapshot } from "../types";
 import type { TelegramGateway } from "../telegram";
 
 export type RenewalOutcome =
@@ -36,6 +36,13 @@ export const createRenewalService = (input: {
     });
   };
 
+  const guardFor = (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): OperationGuard => ({
+    operationId: claimed.operationId,
+    itemId: claimed.item.id,
+    capturedContentVersion: claimed.capturedContentVersion,
+    capturedSourceGeneration: claimed.capturedSourceGeneration,
+  });
+
   const handleError = (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>, error: NormalizedTelegramError): RenewalOutcome => {
     const now = input.clock.now();
     if (error.kind === "source_missing") {
@@ -48,58 +55,88 @@ export const createRenewalService = (input: {
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt };
     }
     if (error.kind === "ambiguous_send_result" || error.kind === "transient_network" || error.kind === "transient_server") {
-      input.queue.transition(claimed.item.id, "renewing", "uncertain_renewal", now, error.kind, error.description);
-      input.queue.setOperationState(claimed.operationId, "uncertain", now, error.kind, JSON.stringify({ description: error.description }));
+      input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, now, error.kind, error.description);
       return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
     }
-    input.queue.transition(claimed.item.id, "renewing", "blocked", now, error.kind, error.description);
-    input.queue.setOperationState(claimed.operationId, "failed", now, error.kind, error.description);
+    // Renewal is physical maintenance. A definite rejection must not alter the
+    // logical publication status captured at claim time.
+    input.queue.failRenewal(claimed.item.id, claimed.operationId, now, error.kind, error.description);
     return { kind: "blocked", itemId: claimed.item.id, reason: error.kind };
   };
 
-  const cleanupOldGeneration = async (itemId: number, operationId: string, oldSourceIds: readonly MessageId[]): Promise<RenewalOutcome> => {
+  const cleanupOldGeneration = async (
+    claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>,
+    oldSourceIds: readonly MessageId[],
+    generation: number,
+  ): Promise<RenewalOutcome> => {
+    const guard = guardFor(claimed);
+    input.queue.setOperationPhase(claimed.operationId, "old_source_cleanup_pending", input.clock.now());
     try {
       await input.gateway.deleteMessages(input.queueChannelId, oldSourceIds);
-      input.queue.markRenewedCleanupComplete(itemId, operationId, input.clock.now());
-      return { kind: "renewed", itemId, generation: input.queue.findItemById(itemId)?.sourceGeneration ?? 0 };
+      input.queue.completeRenewalWithOrphans(guard, [], input.clock.now());
+      return { kind: "renewed", itemId: claimed.item.id, generation };
     } catch (error) {
       const normalized = classifyTelegramError(error);
       if (normalized.kind === "source_missing") {
-        input.queue.markRenewedCleanupComplete(itemId, operationId, input.clock.now());
-        return { kind: "renewed", itemId, generation: input.queue.findItemById(itemId)?.sourceGeneration ?? 0 };
+        input.queue.completeRenewalWithOrphans(guard, [], input.clock.now());
+        return { kind: "renewed", itemId: claimed.item.id, generation };
       }
-      input.queue.setOperationState(operationId, "cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
-      return { kind: "cleanup_pending", itemId, operationId };
+      // The replacement generation is already durable. Keep it current and
+      // make each old ID independently retryable instead of wedging the item.
+      input.queue.completeRenewalWithOrphans(guard, oldSourceIds, input.clock.now(), normalized.kind === "permission_denied" ? "permission_denied" : normalized.kind);
+      input.logger.warn("old_renewal_generation_orphaned", { itemId: claimed.item.id, generation: claimed.capturedSourceGeneration, count: oldSourceIds.length, error: normalized.kind });
+      return { kind: "renewed", itemId: claimed.item.id, generation };
     }
   };
 
   const renewClaimed = async (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): Promise<RenewalOutcome> => {
+    const guard = guardFor(claimed);
     const now = input.clock.now();
-    const oldSourceIds = input.queue.currentSourceIds(claimed.item.id);
+    const oldSourceIds = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).map((message) => message.telegramMessageId);
     if (oldSourceIds.length === 0) {
       input.queue.markMissing(claimed.item.id, claimed.operationId, now);
       return { kind: "deleted_external", itemId: claimed.item.id };
     }
-    const snapshots = input.queue.getCurrentSnapshotSet(claimed.item.id);
+    const snapshots = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).map((message) => message.snapshot);
+    input.queue.setOperationPhase(claimed.operationId, "replacement_pending", now);
     try {
-      const inputTransfer = { targetChatId: input.queueChannelId, sourceChatId: input.queueChannelId, messageIds: oldSourceIds, disableNotification: true };
+      const transferInput = { targetChatId: input.queueChannelId, sourceChatId: input.queueChannelId, messageIds: oldSourceIds, disableNotification: true };
       const replacementIds = claimed.item.origin.kind === "absent"
-        ? await input.gateway.copyMessages(inputTransfer)
-        : await input.gateway.forwardMessages(inputTransfer);
-      for (const [ordinal, messageId] of replacementIds.entries()) input.queue.recordOutput(claimed.operationId, "replacement", input.queueChannelId, messageId, ordinal, now);
-      if (replacementIds.length !== oldSourceIds.length) {
-        try { await input.gateway.deleteMessages(input.queueChannelId, replacementIds); }
-        catch (cleanupError) { input.logger.error("partial_renewal_cleanup_failed", { itemId: claimed.item.id, error: classifyTelegramError(cleanupError).kind }); }
-        input.queue.transition(claimed.item.id, "renewing", "needs_review", input.clock.now(), "partial_result", "Telegram returned fewer renewal messages than source messages");
-        input.queue.setOperationState(claimed.operationId, "failed", input.clock.now(), "partial_result");
-        return { kind: "blocked", itemId: claimed.item.id, reason: "partial_result" };
+        ? await input.gateway.copyMessages(transferInput)
+        : await input.gateway.forwardMessages(transferInput);
+
+      // Persist every known result before doing any state transition. The
+      // ingestion layer also treats these IDs as candidates if Telegram emits
+      // the channel update before this process sees the response.
+      for (const [ordinal, messageId] of replacementIds.entries()) {
+        input.queue.recordOutput(claimed.operationId, "replacement", input.queueChannelId, messageId, ordinal, input.clock.now());
+        input.generated.register(input.queueChannelId, [messageId], claimed.operationId, "renewal", input.clock.now());
       }
-      input.generated.register(input.queueChannelId, replacementIds, claimed.operationId, "renewal", now);
-      const nextSnapshots = replacementSnapshots(snapshots, replacementIds, now);
-      const generation = input.queue.installRenewedGeneration(claimed.item.id, claimed.operationId, nextSnapshots, now);
-      const cleanupResult = await cleanupOldGeneration(claimed.item.id, claimed.operationId, oldSourceIds);
-      if (cleanupResult.kind === "renewed") return { kind: "renewed", itemId: claimed.item.id, generation };
-      return cleanupResult;
+
+      if (replacementIds.length !== oldSourceIds.length) {
+        try {
+          await input.gateway.deleteMessages(input.queueChannelId, replacementIds);
+          // A confirmed short result means at least one source member did not
+          // receive a replacement. Remove the remaining old members best effort
+          // and classify the logical item as externally deleted.
+          const missingOldIds = oldSourceIds.slice(replacementIds.length);
+          if (missingOldIds.length > 0) {
+            try { await input.gateway.deleteMessages(input.queueChannelId, missingOldIds); }
+            catch (cleanupError) { input.logger.warn("missing_renewal_members_cleanup_failed", { itemId: claimed.item.id, error: classifyTelegramError(cleanupError).kind }); }
+          }
+          input.queue.markMissing(claimed.item.id, claimed.operationId, input.clock.now());
+          return { kind: "deleted_external", itemId: claimed.item.id };
+        } catch (cleanupError) {
+          const normalized = classifyTelegramError(cleanupError);
+          input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "partial_cleanup", normalized.description);
+          return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
+        }
+      }
+
+      input.queue.markReplacementOutputsRecorded(guard, input.clock.now());
+      const nextSnapshots = replacementSnapshots(snapshots, replacementIds, input.clock.now());
+      const generation = input.queue.installRenewedGeneration(guard, nextSnapshots, input.clock.now());
+      return cleanupOldGeneration(claimed, oldSourceIds, generation);
     } catch (error) {
       return handleError(claimed, classifyTelegramError(error));
     }
@@ -115,9 +152,14 @@ export const createRenewalService = (input: {
   const cleanupPending = async (itemId: number): Promise<RenewalOutcome> => {
     const item = input.queue.findItemById(itemId);
     const operation = input.queue.operationForItem(itemId);
-    if (!item || !operation || item.status !== "renewed_cleanup_pending" || item.sourceGeneration < 1) return { kind: "blocked", itemId, reason: "renewal_cleanup_not_pending" };
-    const oldSourceIds = input.queue.getMessages(itemId, item.sourceGeneration - 1).map((message) => message.telegramMessageId);
-    return cleanupOldGeneration(itemId, operation.id, oldSourceIds);
+    if (!item || !operation || item.maintenanceStatus !== "renewal_cleanup_pending" || item.sourceGeneration < 1) return { kind: "blocked", itemId, reason: "renewal_cleanup_not_pending" };
+    const oldSourceIds = input.queue.getMessages(itemId, operation.capturedSourceGeneration).map((message) => message.telegramMessageId);
+    return cleanupOldGeneration({
+      item: { ...item, maintenanceStatus: "renewing" },
+      operationId: operation.id,
+      capturedContentVersion: operation.capturedContentVersion,
+      capturedSourceGeneration: operation.capturedSourceGeneration,
+    }, oldSourceIds, item.sourceGeneration);
   };
 
   return { renewNext, renewClaimed, cleanupPending };

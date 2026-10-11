@@ -58,13 +58,23 @@ describe("queue repository", () => {
     expect(queue.getCurrentSnapshotSet(1)[0]?.origin).toEqual(origin);
   });
 
-  test("startup recovery makes an output-less expired publication explicit", () => {
+  test("startup recovery releases a claimed publication that never began transfer", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(22) }), 1_000);
     expect(queue.claimPublication("expired-op", "publish", 1_000)?.item.status).toBe("publishing");
     expect(queue.recoverExpiredOperations(302_000)).toEqual([1]);
-    expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
-    expect((database.raw.query("SELECT state FROM operations WHERE id = 'expired-op'").get() as { state: string }).state).toBe("uncertain");
+    expect(queue.findItemById(1)?.status).toBe("queued");
+    expect((database.raw.query("SELECT state, phase FROM operations WHERE id = 'expired-op'").get() as { state: string; phase: string })).toEqual({ state: "failed", phase: "failed" });
+  });
+
+  test("renewal maintenance never changes the logical publication state", () => {
+    const { queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(23), telegramDate: 0 }), 1_000);
+    queue.transition(1, "queued", "blocked", 2_000, "manual_block", "needs review");
+    const claimed = queue.claimRenewal("renew-preserve", 100_000, 36_000);
+    expect(claimed?.item.status).toBe("blocked");
+    expect(claimed?.item.maintenanceStatus).toBe("renewing");
+    expect(queue.findItemById(1)?.status).toBe("blocked");
   });
 });
 
@@ -86,11 +96,12 @@ describe("schedule repository", () => {
   test("materializes each UTC occurrence once", () => {
     const { schedule } = open();
     schedule.addSlot(60, 1, 1);
-    expect(schedule.materialize(1000)).toBe(true);
-    expect(schedule.materialize(1000)).toBe(false);
-    expect(schedule.run(1000)?.status).toBe("pending");
-    schedule.markRun(1000, "empty", 2000);
-    expect(schedule.run(1000)?.status).toBe("empty");
+    const occurrence = Date.parse("2026-10-05T01:00:00Z");
+    expect(schedule.materialize(occurrence)).toBe(true);
+    expect(schedule.materialize(occurrence)).toBe(false);
+    expect(schedule.run(occurrence)?.status).toBe("pending");
+    schedule.markRun(occurrence, "empty", occurrence + 1_000);
+    expect(schedule.run(occurrence)?.status).toBe("empty");
     expect(schedule.slots()).toEqual([60]);
   });
 });

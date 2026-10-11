@@ -1,6 +1,7 @@
 import type { AppDatabase } from "./database";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
-import type { MessageId, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import { validateSlotCount } from "../domain/schedule";
+import type { MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -11,6 +12,9 @@ type QueueRow = {
   content_type: StoredMessageSnapshot["contentType"];
   origin_json: string;
   status: QueueItemStatus;
+  maintenance_status: MaintenanceStatus;
+  maintenance_operation_id: string | null;
+  maintenance_retry_not_before: number | null;
   content_version: number;
   source_generation: number;
   attempts: number;
@@ -70,6 +74,7 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     contentType: row.content_type,
     origin: JSON.parse(row.origin_json) as SemanticOrigin,
     status: row.status,
+    maintenanceStatus: row.maintenance_status,
     contentVersion: row.content_version,
     sourceGeneration: row.source_generation,
     attempts: row.attempts,
@@ -86,6 +91,7 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     ["albumMaxDeadline", optionalNumber(row.album_max_deadline)],
     ["publishedAt", optionalNumber(row.published_at)],
     ["completedAt", optionalNumber(row.completed_at)],
+    ["maintenanceRetryNotBefore", optionalNumber(row.maintenance_retry_not_before)],
   ] as const) if (value !== undefined) item[key as keyof QueueItemRecord] = value as never;
   const stringFields = [
     ["lastErrorCode", optionalString(row.last_error_code)],
@@ -93,6 +99,8 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     ["claimedOperationId", optionalString(row.claimed_operation_id)],
   ] as const;
   for (const [key, value] of stringFields) if (value !== undefined) item[key as keyof QueueItemRecord] = value as never;
+  const maintenanceOperationId = optionalString(row.maintenance_operation_id);
+  if (maintenanceOperationId !== undefined) item.maintenanceOperationId = maintenanceOperationId;
   return item;
 };
 
@@ -254,22 +262,25 @@ export const createQueueRepository = (database: AppDatabase) => {
     return row ? rowToItem(row) : undefined;
   };
 
-  const claimPublication = (operationId: string, type: "publish" | "manual_publish", now: number): ClaimedItem | undefined => database.transaction(() => {
+  const claimPublication = (operationId: string, type: "publish" | "manual_publish", now: number, bootId = operationId): ClaimedItem | undefined => database.transaction(() => {
     const head = getHead();
-    if (!head || head.status !== "queued" || (head.retryNotBefore !== undefined && head.retryNotBefore > now)) return undefined;
-    database.raw.query("UPDATE queue_items SET status = 'publishing', claimed_operation_id = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ? AND status = 'queued'").run(operationId, now, head.id);
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)").run(operationId, type, head.id, head.contentVersion, head.sourceGeneration, operationId, now + 300_000, now, now);
+    if (!head || head.status !== "queued" || head.maintenanceStatus !== "idle" || (head.retryNotBefore !== undefined && head.retryNotBefore > now)) return undefined;
+    const changed = database.raw.query("UPDATE queue_items SET status = 'publishing', claimed_operation_id = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ? AND status = 'queued' AND maintenance_status = 'idle' AND content_version = ? AND source_generation = ?").run(operationId, now, head.id, head.contentVersion, head.sourceGeneration);
+    if (Number(changed.changes) !== 1) return undefined;
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, type, head.id, bootId, head.status, head.contentVersion, head.sourceGeneration, operationId, now + 300_000, now, now);
     const claimed = findItemById(head.id);
     if (!claimed) throw new Error("Queue item disappeared during claim");
     return { item: claimed, operationId, capturedContentVersion: head.contentVersion, capturedSourceGeneration: head.sourceGeneration };
   });
 
-  const claimRenewal = (operationId: string, now: number, eligibleBefore: number): ClaimedItem | undefined => database.transaction(() => {
-    const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','renewing','published_cleanup_pending','renewed_cleanup_pending') AND physical_created_at <= ? ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore) as QueueRow | null;
+  const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId = operationId): ClaimedItem | undefined => database.transaction(() => {
+    const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending') AND maintenance_status = 'idle' AND physical_created_at <= ? ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore) as QueueRow | null;
     if (!row) return undefined;
     const item = rowToItem(row);
-    database.raw.query("UPDATE queue_items SET status = 'renewing', claimed_operation_id = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ? AND status = ? AND source_generation = ?").run(operationId, now, item.id, item.status, item.sourceGeneration);
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, 'renew', ?, 'running', ?, ?, ?, ?, ?, ?)").run(operationId, item.id, item.contentVersion, item.sourceGeneration, operationId, now + 300_000, now, now);
+    const changed = database.raw.query("UPDATE queue_items SET maintenance_status = 'renewing', maintenance_operation_id = ?, maintenance_retry_not_before = NULL, attempts = attempts + 1 WHERE id = ? AND status = ? AND maintenance_status = 'idle' AND source_generation = ? AND content_version = ?").run(operationId, item.id, item.status, item.sourceGeneration, item.contentVersion);
+    if (Number(changed.changes) !== 1) return undefined;
+    const sourceIds = currentSourceIds(item.id);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, expected_source_count, captured_content_version, captured_source_generation, source_ids_json, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, 'renew', ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, item.id, bootId, item.status, sourceIds.length, item.contentVersion, item.sourceGeneration, JSON.stringify(sourceIds), operationId, now + 300_000, now, now);
     const claimed = findItemById(item.id);
     if (!claimed) throw new Error("Queue item disappeared during renewal claim");
     return { item: claimed, operationId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration };
@@ -285,88 +296,242 @@ export const createQueueRepository = (database: AppDatabase) => {
     return updated;
   });
 
-  const setOperationState = (operationId: string, state: string, now: number, errorCode?: string, errorJson?: string): void => {
+  const setOperationState = (operationId: string, state: OperationState | string, now: number, errorCode?: string, errorJson?: string): void => {
     database.raw.query("UPDATE operations SET state = ?, error_code = ?, error_json = ?, updated_at = ? WHERE id = ?").run(state, errorCode ?? null, errorJson ?? null, now, operationId);
   };
 
-  const operationForItem = (itemId: number): { id: string; state: string; type: string } | undefined => {
-    const row = database.raw.query("SELECT id, state, type FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; state: string; type: string } | null;
-    return row ?? undefined;
+  const setOperationPhase = (operationId: string, phase: OperationPhase, now: number, errorCode?: string, errorJson?: string): void => {
+    database.raw.query("UPDATE operations SET phase = ?, error_code = ?, error_json = ?, updated_at = ? WHERE id = ?").run(phase, errorCode ?? null, errorJson ?? null, now, operationId);
   };
 
-  const operationOutputIds = (operationId: string, kind: "destination" | "replacement" | "temporary_preview"): MessageId[] =>
-    (database.raw.query("SELECT telegram_message_id FROM operation_outputs WHERE operation_id = ? AND kind = ? ORDER BY ordinal, telegram_message_id").all(operationId, kind) as Array<{ telegram_message_id: number }>).map((row) => row.telegram_message_id as MessageId);
+  const setRenewalUncertain = (itemId: number, operationId: string, now: number, errorCode: string, errorText: string): void => database.transaction(() => {
+    const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing'").run(errorCode, errorText, itemId, operationId);
+    if (Number(result.changes) !== 1) throw new Error("Renewal uncertainty guard conflict");
+    setOperationState(operationId, "uncertain", now, errorCode, JSON.stringify({ message: errorText }));
+    setOperationPhase(operationId, "uncertain", now, errorCode, JSON.stringify({ message: errorText }));
+  });
+
+  const failRenewal = (itemId: number, operationId: string, now: number, errorCode: string, errorText: string): void => database.transaction(() => {
+    const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing'").run(errorCode, errorText, itemId, operationId);
+    if (Number(result.changes) !== 1) throw new Error("Renewal failure guard conflict");
+    setOperationState(operationId, "failed", now, errorCode, JSON.stringify({ message: errorText }));
+    setOperationPhase(operationId, "failed", now, errorCode, JSON.stringify({ message: errorText }));
+  });
+
+  const operationForItem = (itemId: number): { id: string; state: string; type: string; phase: string; returnItemStatus?: QueueItemStatus; capturedContentVersion: number; capturedSourceGeneration: number } | undefined => {
+    const row = database.raw.query("SELECT id, state, type, phase, return_item_status, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; state: string; type: string; phase: string; return_item_status: QueueItemStatus | null; captured_content_version: number; captured_source_generation: number } | null;
+    if (!row) return undefined;
+    const result: { id: string; state: string; type: string; phase: string; returnItemStatus?: QueueItemStatus; capturedContentVersion: number; capturedSourceGeneration: number } = { id: row.id, state: row.state, type: row.type, phase: row.phase, capturedContentVersion: row.captured_content_version, capturedSourceGeneration: row.captured_source_generation };
+    if (row.return_item_status !== null) result.returnItemStatus = row.return_item_status;
+    return result;
+  };
+
+  const operationOutputIds = (operationId: string, role: "destination" | "replacement" | "temporary_preview" | OperationOutputRole): MessageId[] => {
+    const useKind = role === "destination" || role === "temporary_preview";
+    const column = useKind ? "kind" : "role";
+    const value = role === "destination" ? "destination" : role;
+    return (database.raw.query(`SELECT telegram_message_id FROM operation_outputs WHERE operation_id = ? AND ${column} = ? ORDER BY ordinal, telegram_message_id`).all(operationId, value) as Array<{ telegram_message_id: number }>).map((row) => row.telegram_message_id as MessageId);
+  };
 
   const recoverExpiredOperations = (now: number): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, state FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now) as Array<{ id: string; item_id: number; state: string }>;
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null }>;
     const recovered: number[] = [];
     for (const row of rows) {
       const item = findItemById(row.item_id);
       if (!item) continue;
-      if (item.status === "publishing") {
-        const destinationIds = operationOutputIds(row.id, "destination");
-        if (destinationIds.length > 0) {
-          database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', destination_message_ids_json = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(JSON.stringify(destinationIds), item.id);
+      if (row.type === "renew") {
+        if (row.phase === "claimed") {
+          database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
+          setOperationPhase(row.id, "failed", now, "startup_recovery");
+          setOperationState(row.id, "failed", now, "startup_recovery");
+        } else if (row.phase === "generation_installed" || row.phase === "old_source_cleanup_pending") {
+          database.raw.query("UPDATE queue_items SET maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
+          setOperationPhase(row.id, "old_source_cleanup_pending", now, "startup_recovery");
           setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
         } else {
-          database.raw.query("UPDATE queue_items SET status = 'uncertain_publish', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ?").run(item.id);
+          database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
+          setOperationPhase(row.id, "uncertain", now, "startup_recovery");
           setOperationState(row.id, "uncertain", now, "startup_recovery");
         }
         recovered.push(item.id);
-      } else if (item.status === "renewing") {
-        const replacementIds = operationOutputIds(row.id, "replacement");
-        if (item.sourceGeneration > 0 && replacementIds.length > 0) {
-          database.raw.query("UPDATE queue_items SET status = 'renewed_cleanup_pending', claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(item.id);
-          setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
-        } else {
-          database.raw.query("UPDATE queue_items SET status = 'uncertain_renewal', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ?").run(item.id);
-          setOperationState(row.id, "uncertain", now, "startup_recovery");
-        }
-        recovered.push(item.id);
+        continue;
       }
+      if (item.status !== "publishing" && item.status !== "published_cleanup_pending") continue;
+      if (row.phase === "claimed") {
+        database.raw.query("UPDATE queue_items SET status = 'queued', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
+        setOperationPhase(row.id, "failed", now, "startup_recovery");
+        setOperationState(row.id, "failed", now, "startup_recovery");
+      } else if (row.phase === "source_cleanup_pending" || item.status === "published_cleanup_pending") {
+        database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', claimed_at = NULL WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
+        setOperationPhase(row.id, "source_cleanup_pending", now, "startup_recovery");
+        setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+      } else {
+        database.raw.query("UPDATE queue_items SET status = 'uncertain_publish', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery', last_error = 'Publication output is not durably complete' WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
+        setOperationPhase(row.id, "uncertain", now, "startup_recovery");
+        setOperationState(row.id, "uncertain", now, "startup_recovery");
+      }
+      recovered.push(item.id);
     }
     return recovered;
   });
 
-  const recordOutput = (operationId: string, kind: "destination" | "replacement" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
-    database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?)").run(operationId, kind, chatId, messageId, ordinal, now);
+  const recordOutput = (operationId: string, role: OperationOutputRole | "destination" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
+    const kind = role === "replacement" ? "replacement" : role === "temporary_preview" ? "temporary_preview" : "destination";
+    const normalizedRole = role === "destination" ? "transferred" : role;
+    database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);
   };
+
+  const persistPublicationContract = (operationId: string, contract: PublicationContract, now: number): void => database.transaction(() => {
+    const result = database.raw.query("UPDATE operations SET return_item_status = ?, expected_source_count = ?, expected_output_count = ?, source_ids_json = ?, plan_json = ?, phase = 'claimed', updated_at = ? WHERE id = ? AND item_id IN (SELECT id FROM queue_items WHERE claimed_operation_id = ? AND content_version = ? AND source_generation = ?)").run(
+      contract.capturedLogicalStatus,
+      contract.sourceIds.length,
+      contract.expectedOutputMessageCount,
+      JSON.stringify(contract.sourceIds),
+      JSON.stringify(contract),
+      now,
+      operationId,
+      operationId,
+      contract.capturedContentVersion,
+      contract.capturedSourceGeneration,
+    );
+    if (Number(result.changes) !== 1) throw new Error("Publication contract guard conflict");
+  });
+
+  const guardRow = (guard: OperationGuard): { phase: string; type: string; maintenanceStatus: MaintenanceStatus; status: QueueItemStatus } | undefined => {
+    const row = database.raw.query("SELECT o.phase, o.type, qi.status, qi.maintenance_status FROM operations o JOIN queue_items qi ON qi.id = o.item_id WHERE o.id = ? AND o.item_id = ? AND o.captured_content_version = ? AND o.captured_source_generation = ?").get(guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration) as { phase: string; type: string; status: QueueItemStatus; maintenance_status: MaintenanceStatus } | null;
+    if (!row) return undefined;
+    return { phase: row.phase, type: row.type, status: row.status, maintenanceStatus: row.maintenance_status };
+  };
+
+  const recordCompleteBaseOutputs = (guard: OperationGuard, outputs: readonly { chatId: number; messageId: number; ordinal: number }[], now: number): void => database.transaction(() => {
+    const operation = guardRow(guard);
+    if (!operation || operation.type === "renew" || operation.phase !== "transfer_pending" || operation.status !== "publishing") throw new Error("Publication transfer guard conflict");
+    for (const output of outputs) recordOutput(guard.operationId, "transferred", output.chatId, output.messageId, output.ordinal, now);
+    const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
+    if (!expected || expected.expected_source_count !== outputs.length) throw new Error("Publication output count does not match contract");
+    const result = database.raw.query("UPDATE operations SET state = 'outputs_recorded', phase = 'base_outputs_recorded', updated_at = ? WHERE id = ? AND phase = 'transfer_pending'").run(now, guard.operationId);
+    if (Number(result.changes) !== 1) throw new Error("Publication phase changed before base outputs were recorded");
+  });
+
+  const markAttributionPending = (guard: OperationGuard, now: number): void => {
+    const result = database.raw.query("UPDATE operations SET phase = 'attribution_pending', updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'base_outputs_recorded'").run(now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Publication attribution guard conflict");
+  };
+
+  const markPublicationOutputComplete = (guard: OperationGuard, destinationIds: readonly number[], now: number): void => database.transaction(() => {
+    const operation = guardRow(guard);
+    if (!operation || operation.type === "renew" || operation.status !== "publishing" || !["base_outputs_recorded", "attribution_pending"].includes(operation.phase)) throw new Error("Publication output completion guard conflict");
+    const expected = database.raw.query("SELECT expected_output_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_output_count: number | null } | null;
+    if (!expected || expected.expected_output_count !== destinationIds.length) throw new Error("Publication output count does not match contract");
+    const result = database.raw.query("UPDATE queue_items SET destination_message_ids_json = ? WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?").run(JSON.stringify(destinationIds), guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Publication output completion item guard conflict");
+    setOperationState(guard.operationId, "outputs_recorded", now, undefined, undefined);
+    setOperationPhase(guard.operationId, "output_complete", now);
+  });
+
+  const markSourceCleanupPending = (guard: OperationGuard, now: number): void => database.transaction(() => {
+    const result = database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', claimed_at = ? WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?").run(now, guard.itemId, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Publication cleanup guard conflict");
+    setOperationState(guard.operationId, "cleanup_pending", now);
+    setOperationPhase(guard.operationId, "source_cleanup_pending", now);
+  });
 
   const setDestinationMessageIds = (itemId: number, operationId: string, messageIds: readonly number[], now: number): void => database.transaction(() => {
     const item = findItemById(itemId);
     if (!item || item.claimedOperationId !== operationId) throw new Error("Publication operation lease is no longer owned");
-    database.raw.query("UPDATE queue_items SET destination_message_ids_json = ?, status = 'published_cleanup_pending', claimed_at = ? WHERE id = ? AND claimed_operation_id = ?").run(JSON.stringify(messageIds), now, itemId, operationId);
+    database.raw.query("UPDATE queue_items SET destination_message_ids_json = ? WHERE id = ? AND claimed_operation_id = ? AND content_version = ? AND source_generation = ?").run(JSON.stringify(messageIds), itemId, operationId, item.contentVersion, item.sourceGeneration);
     setOperationState(operationId, "outputs_recorded", now);
+    setOperationPhase(operationId, "output_complete", now);
+    database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending' WHERE id = ? AND claimed_operation_id = ?").run(itemId, operationId);
+    setOperationState(operationId, "cleanup_pending", now);
+    setOperationPhase(operationId, "source_cleanup_pending", now);
   });
 
-  const installRenewedGeneration = (itemId: number, operationId: string, replacementSnapshots: readonly StoredMessageSnapshot[], now: number): number => database.transaction(() => {
-    const item = findItemById(itemId);
-    if (!item || item.claimedOperationId !== operationId || item.status !== "renewing") throw new Error("Renewal operation lease is no longer owned");
+  const markReplacementOutputsRecorded = (guard: OperationGuard, now: number): void => database.transaction(() => {
+    const operation = guardRow(guard);
+    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || operation.phase !== "replacement_pending") throw new Error("Renewal replacement guard conflict");
+    const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
+    const actual = operationOutputIds(guard.operationId, "replacement").length;
+    if (!expected || expected.expected_source_count !== actual) throw new Error("Renewal output count does not match contract");
+    setOperationState(guard.operationId, "outputs_recorded", now);
+    setOperationPhase(guard.operationId, "replacement_outputs_recorded", now);
+  });
+
+  const installRenewedGeneration = (guardOrItemId: OperationGuard | number, operationIdOrSnapshots: string | readonly StoredMessageSnapshot[], snapshotsOrNow: readonly StoredMessageSnapshot[] | number, maybeNow?: number): number => database.transaction(() => {
+    const guard: OperationGuard = typeof guardOrItemId === "number"
+      ? (() => {
+        const item = findItemById(guardOrItemId);
+        if (!item || typeof operationIdOrSnapshots !== "string") throw new Error("Renewal operation lease is no longer owned");
+        return { operationId: operationIdOrSnapshots, itemId: guardOrItemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration };
+      })()
+      : guardOrItemId;
+    const replacementSnapshots = (typeof guardOrItemId === "number" ? snapshotsOrNow : operationIdOrSnapshots) as readonly StoredMessageSnapshot[];
+    const now = (typeof guardOrItemId === "number" ? maybeNow : snapshotsOrNow) as number;
+    const operation = guardRow(guard);
+    if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || !["replacement_outputs_recorded", "claimed"].includes(operation.phase)) throw new Error("Renewal generation guard conflict");
+    const item = findItemById(guard.itemId);
+    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw new Error("Renewal generation CAS conflict");
     const nextGeneration = item.sourceGeneration + 1;
-    for (const snapshot of replacementSnapshots) insertSnapshot(itemId, nextGeneration, snapshot);
-    database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, status = 'renewed_cleanup_pending' WHERE id = ? AND claimed_operation_id = ? AND source_generation = ?").run(nextGeneration, now, now, itemId, operationId, item.sourceGeneration);
-    setOperationState(operationId, "outputs_recorded", now);
+    for (const snapshot of replacementSnapshots) insertSnapshot(item.id, nextGeneration, snapshot);
+    const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw new Error("Renewal generation install lost its lease");
+    setOperationState(guard.operationId, "cleanup_pending", now);
+    setOperationPhase(guard.operationId, "generation_installed", now);
     return nextGeneration;
   });
 
   const setRetry = (itemId: number, operationId: string, now: number, retryNotBefore: number, errorCode: string, errorText: string): void => database.transaction(() => {
-    database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = ?, last_error_code = ?, last_error = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND claimed_operation_id = ?").run(retryNotBefore, errorCode, errorText, itemId, operationId);
+    const operation = database.raw.query("SELECT type, return_item_status FROM operations WHERE id = ? AND item_id = ?").get(operationId, itemId) as { type: string; return_item_status: QueueItemStatus | null } | null;
+    if (!operation) throw new Error("Operation not found for retry");
+    if (operation.type === "renew") {
+      const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = ?, last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing'").run(retryNotBefore, errorCode, errorText, itemId, operationId);
+      if (Number(result.changes) !== 1) throw new Error("Renewal retry guard conflict");
+    } else {
+      const result = database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = ?, last_error_code = ?, last_error = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND claimed_operation_id = ? AND status = 'publishing'").run(retryNotBefore, errorCode, errorText, itemId, operationId);
+      if (Number(result.changes) !== 1) throw new Error("Publication retry guard conflict");
+    }
+    setOperationPhase(operationId, "failed", now, errorCode, JSON.stringify({ message: errorText }));
     setOperationState(operationId, "failed", now, errorCode, JSON.stringify({ message: errorText }));
   });
 
   const markCompleted = (itemId: number, operationId: string, now: number): void => database.transaction(() => {
-    database.raw.query("UPDATE queue_items SET status = 'done', published_at = COALESCE(published_at, ?), completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND claimed_operation_id = ? AND status = 'published_cleanup_pending'").run(now, now, itemId, operationId);
+    const result = database.raw.query("UPDATE queue_items SET status = 'done', published_at = COALESCE(published_at, ?), completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND claimed_operation_id = ? AND status = 'published_cleanup_pending'").run(now, now, itemId, operationId);
+    if (Number(result.changes) !== 1) throw new Error("Publication completion guard conflict");
     setOperationState(operationId, "done", now);
+    setOperationPhase(operationId, "completed", now);
   });
 
-  const markRenewedCleanupComplete = (itemId: number, operationId: string, now: number): void => database.transaction(() => {
-    database.raw.query("UPDATE queue_items SET status = 'queued', claimed_operation_id = NULL, claimed_at = NULL, retry_not_before = NULL WHERE id = ? AND claimed_operation_id = ? AND status = 'renewed_cleanup_pending'").run(itemId, operationId);
-    setOperationState(operationId, "done", now);
+  const completeRenewalWithOrphans = (guard: OperationGuard, orphanIds: readonly number[], now: number, reason = "old_generation_cleanup_failed"): void => database.transaction(() => {
+    const operation = guardRow(guard);
+    if (!operation || operation.type !== "renew" || !["generation_installed", "old_source_cleanup_pending"].includes(operation.phase)) throw new Error("Renewal cleanup guard conflict");
+    const item = findItemById(guard.itemId);
+    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration + 1) throw new Error("Renewal completion CAS conflict");
+    const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL)");
+    for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, now);
+    const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewal_cleanup_pending' AND content_version = ? AND source_generation = ?").run(item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration + 1);
+    if (Number(result.changes) !== 1) throw new Error("Renewal maintenance cleanup guard conflict");
+    setOperationState(guard.operationId, "done", now, orphanIds.length > 0 ? reason : undefined);
+    setOperationPhase(guard.operationId, "completed", now, orphanIds.length > 0 ? reason : undefined);
   });
+
+  const markRenewedCleanupComplete = (itemId: number, operationId: string, now: number): void => {
+    const item = findItemById(itemId);
+    if (!item) throw new Error("Queue item not found for renewal cleanup");
+    completeRenewalWithOrphans({ operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration - 1 }, [], now);
+  };
 
   const markMissing = (itemId: number, operationId: string | undefined, now: number): void => database.transaction(() => {
-    database.raw.query("UPDATE queue_items SET status = 'deleted_external', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(now, itemId);
-    if (operationId) setOperationState(operationId, "done", now, "source_missing");
+    const operation = operationId ? database.raw.query("SELECT type, phase FROM operations WHERE id = ? AND item_id = ?").get(operationId, itemId) as { type: string; phase: string } | null : null;
+    const publishedOutputWasComplete = operation !== null && (operation.phase === "source_cleanup_pending" || operation.phase === "completed");
+    if (publishedOutputWasComplete) {
+      database.raw.query("UPDATE queue_items SET status = 'done', published_at = COALESCE(published_at, ?), completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(now, now, itemId);
+    } else {
+      database.raw.query("UPDATE queue_items SET status = 'deleted_external', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL, maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ?").run(now, itemId);
+    }
+    if (operationId) {
+      setOperationState(operationId, "done", now, "source_missing");
+      setOperationPhase(operationId, "completed", now, "source_missing");
+    }
   });
 
   const markAdminDeleted = (itemId: number, now: number): void => {
@@ -374,7 +539,7 @@ export const createQueueRepository = (database: AppDatabase) => {
   };
 
   const retryItem = (itemId: number, now: number): void => {
-    database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND status IN ('blocked','needs_edit','needs_review','uncertain_publish','uncertain_renewal','delete_blocked')").run(itemId);
+    database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND maintenance_status = 'idle' AND status IN ('blocked','needs_edit','needs_review','delete_blocked')").run(itemId);
   };
 
   const moveToEnd = (itemId: number, now: number): void => database.transaction(() => {
@@ -422,14 +587,24 @@ export const createQueueRepository = (database: AppDatabase) => {
     claimRenewal,
     transition,
     setOperationState,
+    setOperationPhase,
+    setRenewalUncertain,
+    failRenewal,
     operationForItem,
     operationOutputIds,
     recoverExpiredOperations,
     recordOutput,
+    persistPublicationContract,
+    recordCompleteBaseOutputs,
+    markAttributionPending,
+    markPublicationOutputComplete,
+    markSourceCleanupPending,
+    markReplacementOutputsRecorded,
     setDestinationMessageIds,
     installRenewedGeneration,
     setRetry,
     markCompleted,
+    completeRenewalWithOrphans,
     markRenewedCleanupComplete,
     markMissing,
     markAdminDeleted,
@@ -541,14 +716,31 @@ export const createScheduleRepository = (database: AppDatabase) => {
     const row = database.raw.query("SELECT value_json FROM settings WHERE key = 'schedule_enabled'").get() as { value_json: string } | null;
     return row ? JSON.parse(row.value_json) === true : false;
   };
-  const setEnabled = (value: boolean, adminId: number, now: number): void => {
+  const setEnabled = (value: boolean, adminId: number, now: number): void => database.transaction(() => {
+    validateSlotCount(slots(), value);
     database.raw.query("INSERT INTO settings (key, value_json, updated_at, updated_by_admin_id) VALUES ('schedule_enabled', ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at, updated_by_admin_id = excluded.updated_by_admin_id").run(JSON.stringify(value), now, adminId);
-  };
-  const addSlot = (minuteOfDay: number, adminId: number, now: number): void => {
-    database.raw.query("INSERT OR IGNORE INTO schedule_slots (minute_of_day, created_at, created_by_admin_id) VALUES (?, ?, ?)").run(minuteOfDay, now, adminId);
-  };
-  const removeSlot = (minuteOfDay: number): void => { database.raw.query("DELETE FROM schedule_slots WHERE minute_of_day = ?").run(minuteOfDay); };
+    // Pausing and resuming establish a new scheduler cursor. This prevents a
+    // pause or a just-created slot from manufacturing an old missed run.
+    database.raw.query("UPDATE app_state SET last_scheduler_scan_at = ? WHERE id = 1").run(now);
+  });
+  const addSlot = (minuteOfDay: number, adminId: number, now: number): void => database.transaction(() => {
+    validateSlotCount([...slots(), minuteOfDay], enabled());
+    if (!Number.isInteger(minuteOfDay) || minuteOfDay < 0 || minuteOfDay >= 1440) throw new Error("Publication slot is out of range");
+    const result = database.raw.query("INSERT OR IGNORE INTO schedule_slots (minute_of_day, created_at, created_by_admin_id, effective_at) VALUES (?, ?, ?, ?)").run(minuteOfDay, now, adminId, now);
+    if (Number(result.changes) === 1) database.raw.query("INSERT INTO schedule_slot_history (minute_of_day, effective_from, effective_until, actor_admin_id) VALUES (?, ?, NULL, ?)").run(minuteOfDay, now, adminId);
+  });
+  const removeSlot = (minuteOfDay: number, adminId = 0, now = Date.now()): void => database.transaction(() => {
+    const result = database.raw.query("DELETE FROM schedule_slots WHERE minute_of_day = ?").run(minuteOfDay);
+    if (Number(result.changes) === 1) {
+      database.raw.query("UPDATE schedule_slot_history SET effective_until = ? WHERE minute_of_day = ? AND effective_until IS NULL").run(now, minuteOfDay);
+      database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('schedule_slot_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ minuteOfDay }), now);
+    }
+  });
   const materialize = (occurrenceAt: number): boolean => {
+    const date = new Date(occurrenceAt);
+    const minuteOfDay = date.getUTCHours() * 60 + date.getUTCMinutes();
+    const slot = database.raw.query("SELECT effective_at FROM schedule_slots WHERE minute_of_day = ? AND effective_at < ?").get(minuteOfDay, occurrenceAt) as { effective_at: number } | null;
+    if (!slot) return false;
     const result = database.raw.query("INSERT OR IGNORE INTO schedule_runs (occurrence_at, status) VALUES (?, 'pending')").run(occurrenceAt);
     return Number(result.changes) > 0;
   };

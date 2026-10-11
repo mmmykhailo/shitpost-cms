@@ -39,7 +39,7 @@ afterEach(() => {
 describe("scheduler service", () => {
   test("publishes at most the newest missed UTC occurrence", async () => {
     const { schedule, scheduler, clock } = open({ kind: "empty" });
-    schedule.addSlot(60, 1, clock.now());
+    schedule.addSlot(60, 1, clock.now() - 3 * 86_400_000);
     schedule.setEnabled(true, 1, clock.now());
     schedule.setLastScan(clock.now() - 3 * 86_400_000);
     const result = await scheduler.scanOnce();
