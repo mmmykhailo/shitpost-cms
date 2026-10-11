@@ -79,6 +79,10 @@ export const createRecoveryService = (input: {
       input.recovery?.complete(operationId, input.clock.now());
       return true;
     } catch (error) {
+      if (classifyTelegramError(error).kind === "source_missing") {
+        input.recovery?.complete(operationId, input.clock.now());
+        return true;
+      }
       const description = error instanceof Error ? error.message : "preview cleanup failed";
       input.recovery?.markPreviewCleanupPending(operationId, input.clock.now(), description);
       input.logger.error("recovery_preview_cleanup_failed", { operationId, itemId, error: description });

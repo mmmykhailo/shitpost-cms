@@ -200,8 +200,7 @@ const main = async (): Promise<void> => {
           if (item.status === "uncertain_publish") await alerts.raise(`uncertain_publish:${item.id}`, "immediate", `Publication for queue item #${item.id} is uncertain and requires admin resolution.`, now);
           if (item.maintenanceStatus === "uncertain_renewal") await alerts.raise(`uncertain_renewal:${item.id}`, "immediate", `Renewal for queue item #${item.id} is uncertain and requires admin resolution.`, now);
         }
-        const orphanCounts = orphanRepository.counts();
-        if (orphanCounts.terminal > 0) await alerts.raise("orphan_manual", "immediate", `${orphanCounts.terminal} orphaned queue source(s) require manual cleanup.`, now);
+        for (const orphan of orphanRepository.terminal()) await alerts.raise(`orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`, "immediate", `Orphaned source ${orphan.messageId} for queue item #${orphan.itemId} is past Telegram's deletion age limit and requires manual cleanup.`, now);
         const capacity = health.snapshot().renewalCapacity;
         if (!capacity.safe) await alerts.raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`, now);
       } catch (error) {

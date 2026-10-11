@@ -45,5 +45,15 @@ export const createOrphanRepository = (database: AppDatabase) => {
     return result;
   };
 
-  return { due, markAttempt, resolve, markTerminal, counts };
+  const terminal = (limit = 500): OrphanSource[] => {
+    const rows = database.raw.query("SELECT item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, attempt_count, next_attempt_at, terminal_reason FROM orphaned_sources WHERE resolved_at IS NULL AND terminal_reason IS NOT NULL ORDER BY first_attempt_at LIMIT ?").all(limit) as Array<{ item_id: number; source_generation: number; chat_id: number; telegram_message_id: number; reason: string; first_attempt_at: number; last_attempt_at: number; attempt_count: number; next_attempt_at: number | null; terminal_reason: string | null }>;
+    return rows.map((row) => {
+      const result: OrphanSource = { itemId: row.item_id, sourceGeneration: row.source_generation, chatId: row.chat_id, messageId: row.telegram_message_id, reason: row.reason, firstAttemptAt: row.first_attempt_at, lastAttemptAt: row.last_attempt_at, attemptCount: row.attempt_count };
+      if (row.next_attempt_at !== null) result.nextAttemptAt = row.next_attempt_at;
+      if (row.terminal_reason !== null) result.terminalReason = row.terminal_reason;
+      return result;
+    });
+  };
+
+  return { due, markAttempt, resolve, markTerminal, counts, terminal };
 };

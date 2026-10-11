@@ -15,7 +15,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const gatewayWithDeleteFailure = () => {
+const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "telegram_age_limit" = "transient_network") => {
   let nextId = 900;
   let fail = true;
   const calls: string[] = [];
@@ -31,7 +31,7 @@ const gatewayWithDeleteFailure = () => {
     sendText: async () => asMessageId(nextId++),
     deleteMessages: async () => {
       calls.push("delete");
-      if (fail) { fail = false; throw { kind: "transient_network", description: "old source temporarily unavailable" }; }
+      if (fail) { fail = false; throw { kind: deleteFailureKind, description: deleteFailureKind === "telegram_age_limit" ? "message can't be deleted for everyone" : "old source temporarily unavailable" }; }
     },
     sendAdminMessage: async () => asMessageId(nextId++),
     editAdminMessage: async () => {},
@@ -92,5 +92,14 @@ describe("renewal service", () => {
     const result = await renewal.renewNext(36_000);
     expect(result.kind).toBe("renewed");
     expect(fake.calls[0]).toBe("forward");
+  });
+
+  test("turns an old-generation age-limit failure into a terminal orphan", async () => {
+    const fake = gatewayWithDeleteFailure("telegram_age_limit");
+    const { queue, renewal, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(52), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
+    const orphan = database.raw.query("SELECT resolved_at, terminal_reason, next_attempt_at FROM orphaned_sources").get() as { resolved_at: number | null; terminal_reason: string | null; next_attempt_at: number | null };
+    expect(orphan).toEqual({ resolved_at: null, terminal_reason: "telegram_age_limit", next_attempt_at: null });
   });
 });

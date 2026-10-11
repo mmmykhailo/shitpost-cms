@@ -194,26 +194,30 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       return true;
     }
-    if (prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup") {
+    if (prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup" || prompt.kind === "uncertain_publish_adopt") {
       const state = prompt.state && typeof prompt.state === "object" ? prompt.state as Record<string, unknown> : {};
       const itemId = typeof state.itemId === "number" ? state.itemId : undefined;
       const operationId = typeof state.operationId === "string" ? state.operationId : undefined;
       const sourceGeneration = typeof state.sourceGeneration === "number" ? state.sourceGeneration : undefined;
       const expectedCount = typeof state.expectedCount === "number" ? state.expectedCount : undefined;
+      const phase = typeof state.phase === "string" ? state.phase : undefined;
       const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
       const evidence = itemId === undefined ? undefined : deps.queue.operationEvidence(itemId);
-      if (itemId === undefined || !item || !evidence || operationId === undefined || sourceGeneration === undefined || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== operationId || evidence.capturedSourceGeneration !== sourceGeneration) {
+      const renewalPrompt = prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup";
+      const validItem = renewalPrompt ? item?.maintenanceStatus === "uncertain_renewal" : item?.status === "uncertain_publish";
+      if (itemId === undefined || !item || !evidence || operationId === undefined || sourceGeneration === undefined || phase === undefined || !validItem || evidence.operationId !== operationId || evidence.phase !== phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== sourceGeneration) {
         deps.admin.clearPrompt(deps.config.adminUserId);
         await ctx.reply("This renewal resolution is stale; reopen the queue.");
         return true;
       }
       try {
-        if (prompt.kind === "renewal_adopt") {
-          if (expectedCount === undefined) throw new Error("This renewal has no captured replacement count; use manual cleanup.");
+        if (prompt.kind === "renewal_adopt" || prompt.kind === "uncertain_publish_adopt") {
+          if (expectedCount === undefined) throw new Error(prompt.kind === "renewal_adopt" ? "This renewal has no captured replacement count; use manual cleanup." : "This publication has no captured output count; use another resolution.");
           const ids = parseMessageIds(text.trim(), expectedCount);
-          deps.queue.adoptUncertainRenewalGeneration({ operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: sourceGeneration }, ids, deps.now());
+          if (prompt.kind === "renewal_adopt") deps.queue.adoptUncertainRenewalGeneration({ operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: sourceGeneration }, ids, deps.now());
+          else deps.queue.adoptConfirmedPublicationOutputs(itemId, operationId, item.contentVersion, sourceGeneration, deps.config.targetChannelId, ids, deps.now());
           deps.admin.clearPrompt(deps.config.adminUserId);
-          await ctx.reply(`Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.`);
+          await ctx.reply(prompt.kind === "renewal_adopt" ? `Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.` : `Adopted the exact destination IDs for queue item #${itemId}; source cleanup remains durable and retryable.`);
         } else {
           const ids = parseMessageIds(text.trim());
           try {
@@ -315,26 +319,28 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
         if (!item || item.status !== "uncertain_publish" || !evidence) return ctx.reply("This publication is no longer awaiting uncertainty resolution.");
-        const retry = await button(deps, "I confirm nothing was published — retry", "uncertain_publish_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion);
+        const retry = await button(deps, "I confirm nothing was published — retry", "uncertain_publish_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion);
         const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[retry]];
-        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Destination is complete", "uncertain_publish_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Destination is complete", "uncertain_publish_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+        if (evidence.expectedOutputCount !== undefined) rows.push([await button(deps, "Enter exact destination IDs", "uncertain_publish_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedOutputCount, phase: evidence.phase }, item.contentVersion)]);
+        if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount === evidence.sourceIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Delete known outputs and retry", "uncertain_publish_delete_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
         rows.push([await button(deps, "Delete queue item", "queue_delete", { itemId }, item.contentVersion)], [await button(deps, "Back", "queue")]);
         return ctx.reply([`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"), { reply_markup: keyboard(rows) });
       }
       case "uncertain_publish_retry": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
         deps.queue.requeueUncertainPublication(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), "admin_confirmed_nothing_published");
         deps.admin.audit("uncertain_publication_retry", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { duplicateRiskConfirmed: true });
         return sendQueue(ctx);
       }
       case "uncertain_publish_adopt_known": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
         try {
           deps.queue.adoptConfirmedPublicationOutputs(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.config.targetChannelId, evidence.knownDestinationIds, deps.now());
           deps.admin.audit("uncertain_publication_destination_adopted", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { destinationIds: evidence.knownDestinationIds });
@@ -343,25 +349,44 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           return ctx.reply(error instanceof Error ? error.message : "Could not adopt those destination IDs.");
         }
       }
+      case "uncertain_publish_adopt_prompt":
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        deps.admin.setPrompt(deps.config.adminUserId, "uncertain_publish_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
+        return ctx.reply(`Reply with exactly ${payload.expectedCount} destination message IDs in Telegram order, separated by spaces or commas.`);
+      case "uncertain_publish_delete_retry": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.queue.operationEvidence(itemId);
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedOutputCount === undefined || evidence.expectedOutputCount !== evidence.knownDestinationIds.length || evidence.expectedOutputCount !== evidence.sourceIds.length) return ctx.reply("This cleanup resolution is stale or output evidence is incomplete.");
+        try {
+          try { await deps.gateway.deleteMessages(deps.config.targetChannelId, evidence.knownDestinationIds); }
+          catch (error) { if (classifyTelegramError(error).kind !== "source_missing") throw error; }
+          deps.queue.requeueUncertainPublication(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), "admin_deleted_known_outputs");
+          deps.admin.audit("uncertain_publication_outputs_deleted_retry", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { destinationIds: evidence.knownDestinationIds });
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Known output cleanup failed; the item remains uncertain.");
+        }
+      }
       case "renewal_uncertain": {
         if (itemId === undefined) return ctx.reply("Invalid renewal item.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
         if (!item || item.maintenanceStatus !== "uncertain_renewal" || !evidence) return ctx.reply("This renewal is no longer awaiting resolution.");
         const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
-        if (evidence.expectedSourceCount !== undefined && evidence.knownReplacementIds.length === evidence.expectedSourceCount) rows.push([await button(deps, "Adopt known replacements", "renewal_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
-        if (evidence.expectedSourceCount !== undefined) rows.push([await button(deps, "Enter exact replacements", "renewal_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedSourceCount }, item.contentVersion)]);
-        if (evidence.knownReplacementIds.length === 0) rows.push([await button(deps, "Confirm no replacement exists", "renewal_no_replacement", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
-        else rows.push([await button(deps, "Delete known replacements", "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
-        rows.push([await button(deps, "Enter manual cleanup IDs", "renewal_cleanup_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration }, item.contentVersion)]);
+        if (evidence.expectedSourceCount !== undefined && evidence.knownReplacementIds.length === evidence.expectedSourceCount) rows.push([await button(deps, "Adopt known replacements", "renewal_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+        if (evidence.expectedSourceCount !== undefined) rows.push([await button(deps, "Enter exact replacements", "renewal_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedSourceCount, phase: evidence.phase }, item.contentVersion)]);
+        if (evidence.knownReplacementIds.length === 0) rows.push([await button(deps, "Confirm no replacement exists", "renewal_no_replacement", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+        else rows.push([await button(deps, "Delete known replacements", "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
+        rows.push([await button(deps, "Enter manual cleanup IDs", "renewal_cleanup_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
         rows.push([await button(deps, "Back", "queue")]);
         return ctx.reply([`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs: ${evidence.knownReplacementIds.join(", ") || "none"}`, `Expected replacement count: ${evidence.expectedSourceCount ?? "unknown"}`, "The logical publication status remains unchanged until a physical resolution is confirmed."].join("\n"), { reply_markup: keyboard(rows) });
       }
       case "renewal_adopt_known": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedSourceCount !== evidence.knownReplacementIds.length) return ctx.reply("This renewal evidence is incomplete or stale; enter the exact replacement IDs instead.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedSourceCount !== evidence.knownReplacementIds.length) return ctx.reply("This renewal evidence is incomplete or stale; enter the exact replacement IDs instead.");
         try {
           deps.queue.adoptUncertainRenewalGeneration({ operationId: evidence.operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration }, evidence.knownReplacementIds, deps.now());
           return sendQueue(ctx);
@@ -370,26 +395,26 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         }
       }
       case "renewal_adopt_prompt":
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number") return ctx.reply("Invalid renewal resolution.");
-        deps.admin.setPrompt(deps.config.adminUserId, "renewal_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount }, ctx.callbackQuery?.message?.message_id, deps.now());
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        deps.admin.setPrompt(deps.config.adminUserId, "renewal_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
         return ctx.reply(`Reply with exactly ${payload.expectedCount} replacement message IDs in Telegram order, separated by spaces or commas.`);
       case "renewal_cleanup_prompt":
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
-        deps.admin.setPrompt(deps.config.adminUserId, "renewal_manual_cleanup", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration }, ctx.callbackQuery?.message?.message_id, deps.now());
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        deps.admin.setPrompt(deps.config.adminUserId, "renewal_manual_cleanup", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
         return ctx.reply("Reply with the exact replacement message IDs to delete or retry, in Telegram order. The item remains blocked until this explicit cleanup decision is recorded.");
       case "renewal_no_replacement": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.knownReplacementIds.length > 0) return ctx.reply("This renewal resolution is stale or replacements are known.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.knownReplacementIds.length > 0) return ctx.reply("This renewal resolution is stale or replacements are known.");
         deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "no_replacement");
         return sendQueue(ctx);
       }
       case "renewal_delete_replacements": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This renewal resolution is stale.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This renewal resolution is stale.");
         try {
           try {
             await deps.gateway.deleteMessages(deps.config.queueChannelId, evidence.knownReplacementIds);
