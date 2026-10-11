@@ -798,6 +798,11 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   const listRenewalAges = (now: number): Array<{ item: QueueItemRecord; ageMs: number; sourceIds: MessageId[] }> =>
     listActive(10_000).filter((item) => isSourceBearing(item.status) && item.status !== "collecting").map((item) => ({ item, ageMs: now - item.physicalCreatedAt, sourceIds: currentSourceIds(item.id) }));
 
+  const listRecentlyDeletedExternal = (since: number, limit = 500): QueueItemRecord[] => {
+    const rows = database.raw.query("SELECT * FROM queue_items WHERE status = 'deleted_external' AND completed_at >= ? ORDER BY completed_at DESC LIMIT ?").all(since, limit) as QueueRow[];
+    return rows.map(rowToItem);
+  };
+
   const renewalCandidateOperation = (queueChatId: number): { operationId: string; itemId: number } | undefined => {
     const row = database.raw.query("SELECT o.id AS operation_id, qi.id AS item_id FROM operations o JOIN queue_items qi ON qi.id = o.item_id WHERE o.type = 'renew' AND qi.queue_chat_id = ? AND qi.maintenance_status IN ('renewing','renewal_cleanup_pending','uncertain_renewal') AND o.phase NOT IN ('completed','failed') ORDER BY o.created_at LIMIT 1").get(queueChatId) as { operation_id: string; item_id: number } | null;
     return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
@@ -879,6 +884,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     getCurrentSnapshotSet,
     cloneSnapshotsWithIds,
     listRenewalAges,
+    listRecentlyDeletedExternal,
     renewalCandidateOperation,
     setBootId,
     redactCompletedBefore,

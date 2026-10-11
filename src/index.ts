@@ -191,29 +191,46 @@ const main = async (): Promise<void> => {
     while (!signal.aborted && !stopped) {
       try {
         const now = systemClock.now();
+        const activeConditions = new Set<string>();
+        const raise = async (key: string, severity: "normal" | "immediate" | "critical", text: string): Promise<void> => {
+          activeConditions.add(key);
+          await alerts.raise(key, severity, text, now);
+        };
         if (validatedBotId !== undefined && now - lastRightsCheckAt >= 6 * 60 * 60_000) {
           lastRightsCheckAt = now;
           const [queueRights, targetRights] = await Promise.all([gateway.getBotMembership(config.queueChannelId, validatedBotId), gateway.getBotMembership(config.targetChannelId, validatedBotId)]);
           currentRights = { queue: queueRights, target: targetRights };
           const rightsOkay = queueRights.canPostMessages && queueRights.canDeleteMessages && targetRights.canPostMessages && targetRights.canEditMessages && targetRights.canDeleteMessages;
-          if (!rightsOkay) await alerts.raise(`permissions:${config.queueChannelId}`, "immediate", "Telegram permissions no longer satisfy queue/destination cleanup requirements.", now);
-          else {
+          if (rightsOkay) {
             lastSuccessfulRightsCheckAt = now;
             await alerts.resolve(`permissions:${config.queueChannelId}`, "Telegram permissions restored.", now);
           }
         }
+        if (currentRights !== undefined) {
+          const rightsOkay = currentRights.queue.canPostMessages && currentRights.queue.canDeleteMessages && currentRights.target.canPostMessages && currentRights.target.canEditMessages && currentRights.target.canDeleteMessages;
+          if (!rightsOkay) await raise(`permissions:${config.queueChannelId}`, "immediate", "Telegram permissions no longer satisfy queue/destination cleanup requirements.");
+        }
         for (const entry of queue.listRenewalAges(now)) {
-          if (entry.ageMs >= 47 * 60 * 60_000) await alerts.raise(`renewal_critical:${entry.item.id}`, "critical", `Physical queue source for item #${entry.item.id} is at least 47 hours old. IDs: ${entry.sourceIds.join(", ")}`, now);
-          else if (entry.ageMs >= 46 * 60 * 60_000) await alerts.raise(`renewal_warning:${entry.item.id}`, "immediate", `Physical queue source for item #${entry.item.id} is at least 46 hours old.`, now);
-          else if (entry.ageMs >= 42 * 60 * 60_000) await alerts.raise(`renewal_warning:${entry.item.id}`, "normal", `Physical queue source for item #${entry.item.id} is at least 42 hours old.`, now);
+          if (entry.ageMs >= 47 * 60 * 60_000) await raise(`renewal_critical:${entry.item.id}`, "critical", `Physical queue source for item #${entry.item.id} is at least 47 hours old. IDs: ${entry.sourceIds.join(", ")}`);
+          else if (entry.ageMs >= 46 * 60 * 60_000) await raise(`renewal_warning:${entry.item.id}`, "immediate", `Physical queue source for item #${entry.item.id} is at least 46 hours old.`);
+          else if (entry.ageMs >= 42 * 60 * 60_000) await raise(`renewal_warning:${entry.item.id}`, "normal", `Physical queue source for item #${entry.item.id} is at least 42 hours old.`);
         }
+        const head = queue.getHead();
+        if (head?.status === "blocked") await raise(`blocked_head:${head.id}`, "normal", `Queue head #${head.id} is blocked and needs admin review.`);
+        if (head?.status === "needs_edit") await raise(`needs_edit:${head.id}`, "normal", `Queue head #${head.id} needs an edit before publication.`);
+        if (head?.status === "needs_review") await raise(`needs_review:${head.id}`, "normal", `Queue head #${head.id} needs admin review.`);
         for (const item of queue.listActive(10_000)) {
-          if (item.status === "uncertain_publish") await alerts.raise(`uncertain_publish:${item.id}`, "immediate", `Publication for queue item #${item.id} is uncertain and requires admin resolution.`, now);
-          if (item.maintenanceStatus === "uncertain_renewal") await alerts.raise(`uncertain_renewal:${item.id}`, "immediate", `Renewal for queue item #${item.id} is uncertain and requires admin resolution.`, now);
+          if (item.status === "uncertain_publish") await raise(`uncertain_publish:${item.id}`, "immediate", `Publication for queue item #${item.id} is uncertain and requires admin resolution.`);
+          if (item.maintenanceStatus === "uncertain_renewal") await raise(`uncertain_renewal:${item.id}`, "immediate", `Renewal for queue item #${item.id} is uncertain and requires admin resolution.`);
         }
-        for (const orphan of orphanRepository.terminal()) await alerts.raise(`orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`, "immediate", `Orphaned source ${orphan.messageId} for queue item #${orphan.itemId} is past Telegram's deletion age limit and requires manual cleanup.`, now);
+        for (const item of queue.listRecentlyDeletedExternal(now - 24 * 60 * 60_000)) await raise(`deleted_external:${item.id}`, "normal", `Queue source for item #${item.id} disappeared from Telegram before publication.`);
+        for (const orphan of orphanRepository.terminal()) await raise(`orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`, "immediate", `Orphaned source ${orphan.messageId} for queue item #${orphan.itemId} is past Telegram's deletion age limit and requires manual cleanup.`);
         const capacity = health.snapshot().renewalCapacity;
-        if (!capacity.safe) await alerts.raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`, now);
+        if (!capacity.safe) await raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`);
+        for (const existing of alertRepository.active()) {
+          const dynamic = /^(?:renewal_warning|renewal_critical|blocked_head|needs_edit|needs_review|uncertain_publish|uncertain_renewal|deleted_external|orphan_manual|renewal_capacity|permissions):/.test(existing.dedupeKey) || existing.dedupeKey === "renewal_capacity";
+          if (dynamic && !activeConditions.has(existing.dedupeKey)) await alerts.resolve(existing.dedupeKey, "Condition cleared.", now);
+        }
       } catch (error) {
         logger.error("alert_worker_failed", { error: safeErrorDescription(error) });
       }
