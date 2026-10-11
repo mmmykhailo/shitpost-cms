@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Logger } from "../src/logger";
-import { main, waitForShutdownStage } from "../src/application";
+import { main as applicationMain, waitForShutdownStage } from "../src/application";
+import { main, runEntrypoint } from "../src/index";
 
 const loggerSpy = (): { logger: Logger; events: string[] } => {
   const events: string[] = [];
@@ -16,6 +17,8 @@ const loggerSpy = (): { logger: Logger; events: string[] } => {
 describe("application composition", () => {
   test("exports an import-safe runner without starting polling", () => {
     expect(main).toBeFunction();
+    expect(applicationMain).toBe(main);
+    expect(runEntrypoint).toBeFunction();
     expect(process.listenerCount("SIGINT")).toBe(0);
     expect(process.listenerCount("SIGTERM")).toBe(0);
   });
