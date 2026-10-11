@@ -65,5 +65,7 @@ export const createAdminRepository = (database: AppDatabase) => {
     return { tokens, prompts };
   });
 
-  return { setPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit, purgeExpiredTokensAndPrompts };
+  const purgeAuditEvents = (before: number): number => Number(database.raw.query("DELETE FROM audit_events WHERE created_at < ?").run(before).changes);
+
+  return { setPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit, purgeExpiredTokensAndPrompts, purgeAuditEvents };
 };

@@ -17,6 +17,9 @@ export const createHealthService = (input: {
   alerts: AlertRepository;
   now: () => number;
   ownsLease?: () => boolean;
+  bootStartedAt?: number;
+  lastRightsCheckAt?: () => number | undefined;
+  lastBackupAt?: () => number | undefined;
 }) => {
   const snapshot = () => {
     const now = input.now();
@@ -38,11 +41,13 @@ export const createHealthService = (input: {
     const lastOperation = input.database.raw.query("SELECT type, phase, updated_at FROM operations WHERE state IN ('done','failed') ORDER BY updated_at DESC LIMIT 1").get() as { type: string; phase: string; updated_at: number } | null;
     return {
       bootId: app.current_boot_id,
-      uptimeMs: Math.max(0, now - app.created_at),
+      uptimeMs: Math.max(0, now - (input.bootStartedAt ?? app.created_at)),
       leaseOwned: input.ownsLease?.() ?? false,
       databaseOk,
       lastCleanShutdownAt: app.last_clean_shutdown_at,
       lastSuccessfulUpdateAt: app.last_successful_update_at,
+      lastRightsCheckAt: input.lastRightsCheckAt?.(),
+      lastBackupAt: input.lastBackupAt?.(),
       queueCounts: input.queue.statusCounts(),
       queueHead: input.queue.getHead()?.id,
       oldestLogicalAgeMs: oldestLogical,

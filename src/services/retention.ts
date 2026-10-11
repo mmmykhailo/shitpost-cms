@@ -20,6 +20,7 @@ export const createRetentionService = (input: {
     input.generated.purge(now - 7 * 86_400_000);
     input.admin.purgeExpiredTokensAndPrompts(now);
     input.alerts.purgeResolved(now - 90 * 86_400_000);
+    input.admin.purgeAuditEvents(now - 90 * 86_400_000);
     input.logger.info("retention_completed", { redactedItems: result.items, redactedMessages: result.messages });
     return { redactedItems: result.items, redactedMessages: result.messages };
   };

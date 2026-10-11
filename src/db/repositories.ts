@@ -778,7 +778,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const redactCompletedBefore = (before: number, now: number): { items: number; messages: number } => database.transaction(() => {
-    const rows = database.raw.query("SELECT id FROM queue_items WHERE status IN ('done','deleted','deleted_external') AND completed_at IS NOT NULL AND completed_at < ? AND NOT EXISTS (SELECT 1 FROM orphaned_sources os WHERE os.item_id = queue_items.id AND os.resolved_at IS NULL) AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state NOT IN ('done','failed'))").all(before) as Array<{ id: number }>;
+    const rows = database.raw.query("SELECT id FROM queue_items WHERE status IN ('done','deleted','deleted_external') AND completed_at IS NOT NULL AND completed_at < ? AND NOT EXISTS (SELECT 1 FROM orphaned_sources os WHERE os.item_id = queue_items.id AND os.resolved_at IS NULL) AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state NOT IN ('done','failed')) AND NOT EXISTS (SELECT 1 FROM admin_alerts aa WHERE aa.resolved_at IS NULL AND (aa.dedupe_key = 'uncertain_publish:' || queue_items.id OR aa.dedupe_key = 'uncertain_renewal:' || queue_items.id OR aa.dedupe_key = 'renewal_warning:' || queue_items.id OR aa.dedupe_key = 'renewal_critical:' || queue_items.id))").all(before) as Array<{ id: number }>;
     let messages = 0;
     for (const row of rows) {
       const snapshots = database.raw.query("SELECT source_generation, telegram_message_id, snapshot_json FROM queue_messages WHERE item_id = ?").all(row.id) as Array<{ source_generation: number; telegram_message_id: number; snapshot_json: string }>;

@@ -36,6 +36,7 @@ const main = async (): Promise<void> => {
   const logger = createLogger(config.logLevel);
   const database = createDatabase(config.databasePath);
   const bootId = randomUUID();
+  const bootStartedAt = Date.now();
   const queue = createQueueRepository(database, { bootId });
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
@@ -66,6 +67,8 @@ const main = async (): Promise<void> => {
   const alerts = createAlertService({ alert: alertRepository, gateway, adminChatId, logger });
   let validatedBotId: UserId | undefined;
   let lastRightsCheckAt = 0;
+  let lastSuccessfulRightsCheckAt: number | undefined;
+  let lastSuccessfulBackupAt: number | undefined;
   let stopped = false;
   let shutdownPromise: Promise<void> | undefined;
 
@@ -109,6 +112,7 @@ const main = async (): Promise<void> => {
     const [queueMembership, targetMembership] = await Promise.all([gateway.getBotMembership(config.queueChannelId, identity.id), gateway.getBotMembership(config.targetChannelId, identity.id)]);
     if (!queueMembership.canPostMessages || !queueMembership.canDeleteMessages) throw new Error("Bot needs can_post_messages and can_delete_messages in the queue channel");
     if (!targetMembership.canPostMessages || !targetMembership.canEditMessages || !targetMembership.canDeleteMessages) throw new Error("Bot needs post, edit, and delete rights in the destination channel");
+    lastSuccessfulRightsCheckAt = Date.now();
     logger.info("telegram_rights_validated", { botId: identity.id, queueChatId: config.queueChannelId, targetChatId: config.targetChannelId });
   } catch (error) {
     logger.error("startup_rights_check_failed", { error: safeErrorDescription(error) });
@@ -126,10 +130,10 @@ const main = async (): Promise<void> => {
   const recoveredSessions = await recovery.reconcileExpiredSessions();
   if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);
   const orphanCleanup = createOrphanCleanupService({ orphan: orphanRepository, gateway, clock: systemClock, logger });
-  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns });
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: systemClock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt });
   const retention = createRetentionService({ queue, generated, admin, alerts: alertRepository, clock: systemClock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: systemClock.now });
-  registerQueueChannelHandlers(bot, ingestion);
+  registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(systemClock.now()));
   registerAdminHandlers(bot, {
     config,
     queue,
@@ -182,12 +186,15 @@ const main = async (): Promise<void> => {
           const [queueRights, targetRights] = await Promise.all([gateway.getBotMembership(config.queueChannelId, validatedBotId), gateway.getBotMembership(config.targetChannelId, validatedBotId)]);
           const rightsOkay = queueRights.canPostMessages && queueRights.canDeleteMessages && targetRights.canPostMessages && targetRights.canEditMessages && targetRights.canDeleteMessages;
           if (!rightsOkay) await alerts.raise(`permissions:${config.queueChannelId}`, "immediate", "Telegram permissions no longer satisfy queue/destination cleanup requirements.", now);
-          else await alerts.resolve(`permissions:${config.queueChannelId}`, "Telegram permissions restored.", now);
+          else {
+            lastSuccessfulRightsCheckAt = now;
+            await alerts.resolve(`permissions:${config.queueChannelId}`, "Telegram permissions restored.", now);
+          }
         }
         for (const entry of queue.listRenewalAges(now)) {
           if (entry.ageMs >= 47 * 60 * 60_000) await alerts.raise(`renewal_critical:${entry.item.id}`, "critical", `Physical queue source for item #${entry.item.id} is at least 47 hours old. IDs: ${entry.sourceIds.join(", ")}`, now);
           else if (entry.ageMs >= 46 * 60 * 60_000) await alerts.raise(`renewal_warning:${entry.item.id}`, "immediate", `Physical queue source for item #${entry.item.id} is at least 46 hours old.`, now);
-          else if (entry.ageMs >= 42 * 60 * 60_000) await alerts.raise(`renewal_notice:${entry.item.id}`, "normal", `Physical queue source for item #${entry.item.id} is at least 42 hours old.`, now);
+          else if (entry.ageMs >= 42 * 60 * 60_000) await alerts.raise(`renewal_warning:${entry.item.id}`, "normal", `Physical queue source for item #${entry.item.id} is at least 42 hours old.`, now);
         }
         for (const item of queue.listActive(10_000)) {
           if (item.status === "uncertain_publish") await alerts.raise(`uncertain_publish:${item.id}`, "immediate", `Publication for queue item #${item.id} is uncertain and requires admin resolution.`, now);
@@ -212,7 +219,7 @@ const main = async (): Promise<void> => {
   });
   supervisor.start("backup", async (signal) => {
     while (!signal.aborted && !stopped) {
-      try { backup.runOnce(); }
+      try { backup.runOnce(); lastSuccessfulBackupAt = systemClock.now(); }
       catch (error) { logger.error("backup_worker_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
     }
