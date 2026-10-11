@@ -68,6 +68,74 @@ afterEach(() => {
 });
 
 describe("renewal service", () => {
+  test("returns nothing when no source is old enough and blocks invalid cleanup requests", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, renewal } = open(fake.gateway);
+    expect(await renewal.renewNext(36_000)).toEqual({ kind: "nothing_due" });
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(49), telegramDate: 0 }), 1);
+    expect(await renewal.cleanupPending(1)).toEqual({ kind: "blocked", itemId: 1, reason: "renewal_cleanup_not_pending" });
+    expect(await renewal.cleanupPending(99)).toEqual({ kind: "blocked", itemId: 99, reason: "renewal_cleanup_not_pending" });
+  });
+
+  test.each([
+    [{ kind: "source_missing", description: "source is gone" }, "deleted_external"],
+    [{ kind: "rate_limited", description: "slow down", retryAfterSeconds: 3 }, "retry_scheduled"],
+    [{ kind: "transient_network", description: "connection lost" }, "uncertain"],
+    [{ kind: "permission_denied", description: "rights lost" }, "blocked"],
+  ] as const)("classifies copy failures as %s", async (failure, expectedKind) => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async () => { throw failure; },
+    };
+    const { queue, renewal } = open(gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(48), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    const result = await renewal.renewNext(36_000);
+    expect(result.kind).toBe(expectedKind);
+    if (expectedKind === "deleted_external") expect(queue.findItemById(1)?.status).toBe("deleted_external");
+    if (expectedKind === "uncertain") expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
+    if (expectedKind === "blocked") expect(queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    if (expectedKind === "retry_scheduled") expect(result.kind === "retry_scheduled" && result.retryAt).toBeGreaterThan(100_000);
+  });
+
+  test("quarantines malformed replacement IDs as an ambiguous result", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async () => [0 as never],
+    };
+    const { queue, renewal } = open(gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(47), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    expect((await renewal.renewNext(36_000)).kind).toBe("uncertain");
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
+  });
+
+  test("quarantines a partial replacement when known output cleanup is ambiguous", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", true);
+    const { queue, database } = open(fake.gateway);
+    const first = snapshotFixture({ messageId: asMessageId(45), mediaGroupId: "renewal-album", telegramDate: 0, origin: { kind: "absent" } });
+    const second = snapshotFixture({ messageId: asMessageId(46), mediaGroupId: "renewal-album", telegramDate: 0, origin: { kind: "absent" } });
+    const album = queue.observeQueueSnapshot(first, 1).item;
+    queue.addAlbumMember(album.id, second, 1);
+    queue.finalizeAlbums(100_000);
+    const partialGateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async () => [asMessageId(910)],
+    };
+    const partialRenewal = createRenewalService({
+      queue,
+      policy: createPolicyRepository(database),
+      generated: createGeneratedMessageRepository(database),
+      gateway: partialGateway,
+      queueChannelId: asChatId(-100),
+      clock: createFakeClock(100_000),
+      logger: createLogger("error"),
+      operationId: () => "renew-partial",
+    });
+    expect((await partialRenewal.renewNext(36_000)).kind).toBe("uncertain");
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
+  });
+
   test("copies originless queue posts into a new generation and cleans the old source", async () => {
     const fake = gatewayWithDeleteFailure();
     const { queue, renewal, database } = open(fake.gateway);
