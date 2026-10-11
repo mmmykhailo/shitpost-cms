@@ -1,0 +1,39 @@
+[Unit]
+Description=Telegram channel queue bot
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=shitpost-cms
+Group=shitpost-cms
+WorkingDirectory=/srv/shitpost-cms
+EnvironmentFile=/srv/shitpost-cms/bot.env
+Environment=HOME=/srv/shitpost-cms/cache
+RuntimeDirectory=shitpost-cms
+RuntimeDirectoryMode=0755
+UMask=0077
+
+ExecStartPre=/srv/shitpost-cms/current/deploy/prestart-backup.sh
+ExecStart=/usr/local/bin/bun /srv/shitpost-cms/current/src/index.ts
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/srv/shitpost-cms/data /srv/shitpost-cms/cache /run/shitpost-cms
+
+[Install]
+WantedBy=multi-user.target
