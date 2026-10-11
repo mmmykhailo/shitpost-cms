@@ -6,6 +6,8 @@ import { formatUtcSlot, parseUtcSlot } from "../domain/schedule";
 import { validateOrderedMessageIds } from "../domain/validation";
 import type { PolicyRepository, QueueRepository, ScheduleRepository } from "../db/repositories";
 import type { AdminRepository } from "../db/admin-repository";
+import type { OrphanRepository } from "../db/orphan-repository";
+import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { AppConfig } from "../config";
 import type { Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
@@ -22,6 +24,8 @@ type AdminDeps = {
   policy: PolicyRepository;
   schedule: ScheduleRepository;
   admin: AdminRepository;
+  pending: PendingUpdateRepository;
+  orphan: OrphanRepository;
   gateway: TelegramGateway;
   publisher: PublicationService;
   scheduler: SchedulerService;
@@ -78,16 +82,19 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     [await button(deps, "Queue", "queue"), await button(deps, "Publish next now", "publish")],
     [await button(deps, "Schedule", "schedule"), await button(deps, "Whitelist", "whitelist")],
     [await button(deps, "Author names", "authors"), await button(deps, "Health", "health")],
+    [await button(deps, "Safety review", "safety")],
   ]);
 
   const sendDashboard = async (ctx: Context): Promise<void> => {
     await ctx.reply(dashboardText(deps), { reply_markup: await dashboardKeyboard() });
   };
 
-  const sendQueue = async (ctx: Context): Promise<void> => {
-    const items = deps.queue.listActive(10, 0);
+  const sendQueue = async (ctx: Context, offset = 0): Promise<void> => {
+    const pageSize = 10;
+    const page = deps.queue.listActive(pageSize + 1, Math.max(0, offset));
+    const items = page.slice(0, pageSize);
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
-    const lines = ["Queue (FIFO)", ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
+    const lines = [`Queue (FIFO) · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`, ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
     for (const item of items) {
       const actions: Array<Awaited<ReturnType<typeof button>>> = [await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion)];
       if (item.status === "uncertain_publish") actions.push(await button(deps, `Resolve #${item.id}`, "queue_uncertain", { itemId: item.id }, item.contentVersion));
@@ -96,6 +103,31 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       actions.push(await button(deps, `Move #${item.id}`, "queue_move_end", { itemId: item.id }, item.contentVersion));
       rows.push(actions);
     }
+    const navigation: Array<Awaited<ReturnType<typeof button>>> = [];
+    if (offset > 0) navigation.push(await button(deps, "Previous", "queue", { offset: Math.max(0, offset - pageSize) }));
+    if (page.length > pageSize) navigation.push(await button(deps, "Next", "queue", { offset: offset + pageSize }));
+    if (navigation.length > 0) rows.push(navigation);
+    rows.push([await button(deps, "Back", "dashboard")]);
+    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+  };
+
+  const sendSafety = async (ctx: Context, offset = 0): Promise<void> => {
+    const pageSize = 10;
+    const quarantined = deps.pending.listByState("quarantined_renewal_candidate", pageSize + 1, Math.max(0, offset));
+    const terminalOrphans = deps.orphan.terminal(pageSize + 1);
+    const counts = deps.pending.countByState();
+    const lines = [
+      `Safety review · quarantined ${counts.quarantined_renewal_candidate ?? 0} · pending ${counts.pending ?? 0}`,
+      `Manual-cleanup orphans: ${deps.orphan.counts().terminal}`,
+      ...quarantined.slice(0, pageSize).map((entry) => `Quarantine · ${entry.queueChatId}/${entry.telegramMessageId} · operation ${entry.candidateOperationId ?? "unknown"}`),
+      ...terminalOrphans.slice(0, pageSize).map((entry) => `Manual cleanup · #${entry.itemId} generation ${entry.sourceGeneration} · ${entry.chatId}/${entry.messageId} · ${entry.terminalReason ?? entry.reason}`),
+    ];
+    if (quarantined.length === 0 && terminalOrphans.length === 0) lines.push("No quarantined updates or terminal orphans.");
+    const navigation: Array<Awaited<ReturnType<typeof button>>> = [];
+    if (offset > 0) navigation.push(await button(deps, "Previous", "safety", { offset: Math.max(0, offset - pageSize) }));
+    if (quarantined.length > pageSize) navigation.push(await button(deps, "Next", "safety", { offset: offset + pageSize }));
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
+    if (navigation.length > 0) rows.push(navigation);
     rows.push([await button(deps, "Back", "dashboard")]);
     await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
@@ -188,6 +220,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       try {
         const recovered = await deps.recovery.recover(text);
         deps.admin.clearPrompt(deps.config.adminUserId);
+        deps.admin.audit("recovery_completed", String(deps.config.adminUserId), deps.now(), recovered.itemId, undefined, { sourceIds: recovered.sourceIds });
         await ctx.reply(`Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}. Telegram history remains explicit; verify the supplied IDs covered the intended post.`);
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Recovery failed; no queue item was confirmed.");
@@ -255,11 +288,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (itemId !== undefined && resolved.itemVersion !== undefined && deps.queue.findItemById(itemId)?.contentVersion !== resolved.itemVersion) return ctx.reply("This queue item changed. Open the queue again.");
     switch (resolved.action) {
       case "dashboard": return sendDashboard(ctx);
-      case "queue": return sendQueue(ctx);
+      case "queue": return sendQueue(ctx, typeof payload.offset === "number" ? payload.offset : 0);
       case "schedule": return sendSchedule(ctx);
       case "whitelist": return sendWhitelist(ctx);
       case "authors": return sendAuthors(ctx);
       case "health": return sendHealth(ctx);
+      case "safety": return sendSafety(ctx, typeof payload.offset === "number" ? payload.offset : 0);
       case "publish": {
         const head = deps.queue.getHead();
         if (!head) return ctx.reply("The queue is empty.");

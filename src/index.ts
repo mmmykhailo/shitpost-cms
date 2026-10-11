@@ -140,6 +140,8 @@ const main = async (): Promise<void> => {
     policy,
     schedule,
     admin,
+    pending,
+    orphan: orphanRepository,
     gateway,
     publisher,
     scheduler,

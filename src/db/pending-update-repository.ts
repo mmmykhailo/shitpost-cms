@@ -83,9 +83,14 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
     return result;
   };
 
+  const listByState = (state: PendingQueueUpdateState, limit = 50, offset = 0): PendingQueueUpdateRecord[] => {
+    const rows = database.raw.query("SELECT * FROM pending_queue_updates WHERE state = ? ORDER BY received_at, telegram_message_id LIMIT ? OFFSET ?").all(state, limit, offset) as PendingRow[];
+    return rows.map(rowToRecord);
+  };
+
   const purge = (before: number): void => {
     database.raw.query("DELETE FROM pending_queue_updates WHERE state IN ('consumed_generated','ingested','discarded') AND received_at < ?").run(before);
   };
 
-  return { find, upsert, due, markState, countByState, purge };
+  return { find, upsert, due, markState, countByState, listByState, purge };
 };
