@@ -118,6 +118,23 @@ describe("application composition", () => {
     expect(process.listenerCount("SIGTERM")).toBe(0);
   });
 
+  test("converts a startup exception into the executable entrypoint exit status", async () => {
+    const previousToken = process.env.BOT_TOKEN;
+    const previousError = console.error;
+    process.env.BOT_TOKEN = "";
+    process.exitCode = 0;
+    console.error = () => {};
+    try {
+      await runEntrypoint();
+      expect(process.exitCode).toBe(1);
+    } finally {
+      if (previousToken === undefined) delete process.env.BOT_TOKEN;
+      else process.env.BOT_TOKEN = previousToken;
+      process.exitCode = 0;
+      console.error = previousError;
+    }
+  });
+
   test("waits for a successful shutdown stage", async () => {
     const { logger, events } = loggerSpy();
     expect(await waitForShutdownStage("complete", async () => "done", 100, logger)).toBe(true);
