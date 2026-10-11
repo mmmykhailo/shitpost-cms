@@ -7,6 +7,7 @@ import { createAlertRepository } from "../src/db/alert-repository";
 import { createAlertService } from "../src/services/alerts";
 import { calculateRenewalCapacity } from "../src/services/capacity";
 import { createBackupService } from "../src/services/backup";
+import { createRestoreService } from "../src/services/restore";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
@@ -58,5 +59,22 @@ describe("operations safety net", () => {
     const path = backup.runOnce();
     expect(path.endsWith(".sqlite")).toBe(true);
     expect(Bun.file(path).size).toBeGreaterThan(0);
+  });
+
+  test("verifies and atomically restores a standalone backup", () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-restore-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    resources.push({ directory, close: database.close });
+    const backup = createBackupService({ database, directory: join(directory, "backups"), logger: createLogger("error"), now: () => 2_000 });
+    const source = backup.runOnce();
+    const destination = join(directory, "restored.sqlite");
+    const service = createRestoreService();
+    expect(service.inspectBackup(source).integrity).toBe("ok");
+    const first = service.restoreBackup(source, destination);
+    expect(first.previousPath).toBeUndefined();
+    const second = service.restoreBackup(source, destination);
+    expect(second.previousPath).toBeDefined();
+    expect(Bun.file(destination).size).toBeGreaterThan(0);
+    expect(Bun.file(second.previousPath!).size).toBeGreaterThan(0);
   });
 });
