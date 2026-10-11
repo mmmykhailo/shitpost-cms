@@ -398,6 +398,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       setOperationPhase(operationId, "uncertain", now, "startup_recovery");
       setOperationState(operationId, "uncertain", now, "startup_recovery");
     };
+    const markLegacyPublicationUncertain = (itemId: number, operationId: string): void => {
+      database.raw.query("UPDATE queue_items SET status = CASE WHEN status IN ('done','deleted','deleted_external') THEN status ELSE 'needs_review' END, claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery', last_error = 'Legacy publication operation requires explicit review' WHERE id = ?").run(itemId);
+      database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('legacy_operation_quarantined', 'startup_recovery', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ reason: "nonterminal_legacy_publication" }), now);
+      setOperationPhase(operationId, "uncertain", now, "startup_recovery");
+      setOperationState(operationId, "uncertain", now, "startup_recovery");
+    };
     for (const row of rows) {
       const item = findItemById(row.item_id);
       if (!item) continue;
@@ -441,11 +447,17 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         recovered.push(item.id);
         continue;
       }
-      if (item.status !== "publishing" && item.status !== "published_cleanup_pending") continue;
-      if (row.phase === "claimed") {
+      if (row.phase === "claimed" && item.status === "publishing") {
         database.raw.query("UPDATE queue_items SET status = 'queued', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
         setOperationPhase(row.id, "failed", now, "startup_recovery");
         setOperationState(row.id, "failed", now, "startup_recovery");
+      } else if (item.status !== "publishing" && item.status !== "published_cleanup_pending") {
+        if (item.status === "done" || item.status === "deleted" || item.status === "deleted_external") {
+          setOperationPhase(row.id, "failed", now, "startup_recovery");
+          setOperationState(row.id, "failed", now, "startup_recovery");
+        } else {
+          markLegacyPublicationUncertain(item.id, row.id);
+        }
       } else if (row.phase === "output_complete" || row.phase === "source_cleanup_pending" || item.status === "published_cleanup_pending") {
         database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', claimed_at = NULL WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
         setOperationPhase(row.id, "source_cleanup_pending", now, "startup_recovery");

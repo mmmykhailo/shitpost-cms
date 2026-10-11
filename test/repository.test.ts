@@ -154,6 +154,17 @@ describe("queue repository", () => {
     expect(newQueue.recoverExpiredOperations(2_000, "new-boot")).toEqual([1]);
     expect(newQueue.findItemById(1)?.status).toBe("queued");
   });
+
+  test("quarantines a legacy nonterminal publication attached to a non-publishing item", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(29) }), 1_000);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at, boot_id, phase) VALUES ('legacy-publish', 'publish', 1, 'running', 1, 0, 'old', 1, 1, 1, 'old-boot', 'legacy')").run();
+
+    expect(queue.recoverExpiredOperations(2, "new-boot")).toEqual([1]);
+    expect(queue.findItemById(1)?.status).toBe("needs_review");
+    expect((database.raw.query("SELECT state, phase FROM operations WHERE id = 'legacy-publish'").get() as { state: string; phase: string })).toEqual({ state: "uncertain", phase: "uncertain" });
+    expect((database.raw.query("SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'legacy_operation_quarantined'").get() as { count: number }).count).toBe(1);
+  });
 });
 
 describe("policy repository", () => {
