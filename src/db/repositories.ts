@@ -275,7 +275,10 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     // Once destination transfer has begun, the captured contract owns the
     // operation. An edit update must not change the version that a cleanup
     // CAS will later compare against.
-    if (item.status === "publishing" || item.status === "published_cleanup_pending") return item;
+    if (item.status === "publishing" || item.status === "published_cleanup_pending") {
+      database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('source_edit_ignored_after_publication_transfer', 'system', ?, ?, ?, ?)").run(item.id, item.claimedOperationId ?? null, JSON.stringify({ chatId, messageId, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration }), Date.now());
+      return item;
+    }
     const current = getMessages(item.id).find((message) => message.telegramMessageId === messageId);
     if (!current) return item;
     if (current.editDate !== undefined && snapshot.editDate !== undefined && snapshot.editDate <= current.editDate) return item;
@@ -494,7 +497,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     for (const output of outputs) recordOutput(guard.operationId, "transferred", output.chatId, output.messageId, output.ordinal, now);
     const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
     if (!expected || expected.expected_source_count !== outputs.length) throw new Error("Publication output count does not match contract");
-    const result = database.raw.query("UPDATE operations SET state = 'outputs_recorded', phase = 'base_outputs_recorded', updated_at = ? WHERE id = ? AND phase = 'transfer_pending'").run(now, guard.operationId);
+    const result = database.raw.query("UPDATE operations SET state = 'outputs_recorded', phase = 'base_outputs_recorded', updated_at = ? WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'transfer_pending'").run(now, guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration);
     if (Number(result.changes) !== 1) throw conflict("Publication phase changed before base outputs were recorded");
   });
 
@@ -611,6 +614,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const publishedOutputWasComplete = operation !== null && (operation.phase === "source_cleanup_pending" || operation.phase === "completed");
     if (publishedOutputWasComplete) {
       database.raw.query("UPDATE queue_items SET status = 'done', published_at = COALESCE(published_at, ?), completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(now, now, itemId);
+      if (operationId) database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('source_already_absent_after_publication', 'system', ?, ?, ?, ?)").run(itemId, operationId, JSON.stringify({ sourceCleanup: "confirmed_absent" }), now);
     } else {
       database.raw.query("UPDATE queue_items SET status = 'deleted_external', completed_at = ?, claimed_operation_id = NULL, claimed_at = NULL, maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ?").run(now, itemId);
     }

@@ -13,7 +13,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const fakeGateway = (options: { failDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean } = {}) => {
+const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean } = {}) => {
   let nextMessageId = 1000;
   let deleteAttempts = 0;
   const calls: string[] = [];
@@ -30,6 +30,7 @@ const fakeGateway = (options: { failDelete?: boolean; ambiguousEdit?: boolean; a
     deleteMessages: async (_chatId, messageIds) => {
       calls.push(`delete:${messageIds.join(",")}`);
       deleteAttempts += 1;
+      if (options.sourceMissingOnDelete) throw { kind: "source_missing", description: "message to delete not found" };
       if (options.failDelete && deleteAttempts === 1) throw { kind: "transient_network", description: "temporary delete failure" };
     },
     sendAdminMessage: async () => asMessageId(nextMessageId++),
@@ -47,7 +48,7 @@ const open = (gateway: TelegramGateway) => {
   const clock = createFakeClock(10_000);
   const service = createPublicationService({ queue, policy, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
   resources.push({ directory, close: database.close });
-  return { queue, policy, service, clock };
+  return { database, queue, policy, service, clock };
 };
 
 afterEach(() => {
@@ -68,6 +69,15 @@ describe("publication service", () => {
     expect(fake.calls[0]).toBe("copy");
     expect(fake.calls.some((call) => call.startsWith("delete:"))).toBe(true);
     expect(queue.findItemById(1)?.status).toBe("done");
+  });
+
+  test("treats a missing source after complete output as successful cleanup", async () => {
+    const fake = fakeGateway({ sourceMissingOnDelete: true });
+    const { database, queue, service } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(10) }), 1_000);
+    expect((await service.publishNext()).kind).toBe("published");
+    expect(queue.findItemById(1)?.status).toBe("done");
+    expect((database.raw.query("SELECT event_type FROM audit_events WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as { event_type: string }).event_type).toBe("source_already_absent_after_publication");
   });
 
   test("forwards whitelisted channels and appends a user alias", async () => {
