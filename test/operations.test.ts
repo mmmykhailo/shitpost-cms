@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { createDatabase } from "../src/db/database";
 import { createAlertRepository } from "../src/db/alert-repository";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
@@ -17,22 +15,26 @@ import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
 import { snapshotFixture } from "./fixtures";
+import { createLoggerSpy, createTestDatabase } from "./support";
 
-const resources: Array<{ directory: string; close(): void }> = [];
+const resources: Array<{ close(): void }> = [];
+
+const openDatabase = (prefix: string) => {
+  const resource = createTestDatabase(prefix);
+  resources.push(resource);
+  return resource.database;
+};
 
 afterEach(() => {
   while (resources.length) {
     const resource = resources.pop()!;
     resource.close();
-    rmSync(resource.directory, { recursive: true, force: true });
   }
 });
 
 describe("operations safety net", () => {
   test("deduplicates alerts, repeats by policy, and sends a resolution", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-alert-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const database = openDatabase("queuebot-alert");
     const messages: string[] = [];
     const gateway = {
       getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
@@ -49,9 +51,7 @@ describe("operations safety net", () => {
   });
 
   test("labels alert resolutions with the exact publication item", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-alert-labels-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const database = openDatabase("queuebot-alert-labels");
     const messages: string[] = [];
     const gateway = {
       getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
@@ -83,19 +83,21 @@ describe("operations safety net", () => {
   });
 
   test("creates an integrity-checked rolling backup", () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-backup-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
-    const backup = createBackupService({ database, directory: join(directory, "backups"), logger: createLogger("error"), now: () => 1_000 });
+    const resource = createTestDatabase("queuebot-backup");
+    resources.push(resource);
+    const { database, directory } = resource;
+    const log = createLoggerSpy();
+    const backup = createBackupService({ database, directory: join(directory, "backups"), logger: log.logger, now: () => 1_000 });
     const path = backup.runOnce();
     expect(path.endsWith(".sqlite")).toBe(true);
     expect(Bun.file(path).size).toBeGreaterThan(0);
+    expect(log.entries.map((entry) => entry.event)).toContain("backup_completed");
   });
 
   test("verifies and atomically restores a standalone backup", () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-restore-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const resource = createTestDatabase("queuebot-restore");
+    resources.push(resource);
+    const { database, directory } = resource;
     const backup = createBackupService({ database, directory: join(directory, "backups"), logger: createLogger("error"), now: () => 2_000 });
     const source = backup.runOnce();
     const destination = join(directory, "restored.sqlite");
@@ -110,9 +112,9 @@ describe("operations safety net", () => {
   });
 
   test("rejects non-standalone and schema-less restore sources", () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-restore-invalid-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const resource = createTestDatabase("queuebot-restore-invalid");
+    resources.push(resource);
+    const { database, directory } = resource;
     const backup = createBackupService({ database, directory: join(directory, "backups"), logger: createLogger("error"), now: () => 3_000 });
     const source = backup.runOnce();
     const service = createRestoreService();
@@ -130,9 +132,7 @@ describe("operations safety net", () => {
   });
 
   test("expires, validates, consumes, and purges admin state", () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-admin-state-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const database = openDatabase("queuebot-admin-state");
     const admin = createAdminRepository(database);
 
     expect(admin.getPrompt(7, 100)).toBeUndefined();
@@ -169,9 +169,7 @@ describe("operations safety net", () => {
   });
 
   test("retention purges old terminal pending-update rows", () => {
-    const directory = mkdtempSync(join(tmpdir(), "queuebot-retention-"));
-    const database = createDatabase(join(directory, "bot.sqlite"));
-    resources.push({ directory, close: database.close });
+    const database = openDatabase("queuebot-retention");
     const pending = createPendingUpdateRepository(database);
     pending.upsert(snapshotFixture({ messageId: asMessageId(906) }), 1_000);
     pending.markState(-100, 906, "ingested", 1_001);
