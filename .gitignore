@@ -6,6 +6,10 @@ data/*.sqlite
 data/*.sqlite-wal
 data/*.sqlite-shm
 data/backups/
+data/backups/.*.tmp.*
 coverage/
 logs/
+runtime-status/
+runtime-status.json
+runtime-status.json.tmp.*
 .DS_Store

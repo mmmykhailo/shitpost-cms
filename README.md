@@ -32,7 +32,7 @@ The recovery flow accepts a private queue-channel link, an explicit message ID, 
 
 ## Operations
 
-Use `bun run check` for the typecheck and unit suite. `bun run test:coverage` is the coverage gate for CI. Do not commit `.env`, the SQLite database, WAL/SHM files, backups, or logs.
+Use `bun run check` for the typecheck and unit suite. `bun run test:coverage` writes the LCOV report and `bun run coverage:gate` enforces the 90% deployment safety-scope target. `bun run test:deploy` exercises activation and rollback in a fake root. Do not commit `.env`, the SQLite database, WAL/SHM files, backups, or logs.
 
 For a backup, stop the bot or use SQLite's backup/VACUUM mechanism after a WAL checkpoint; do not copy only the main database file while WAL is active. Keep seven daily backups by default. To restore, stop the bot, preserve the current data directory, run an integrity check on the restored database, start the bot paused, inspect uncertain operations and physical source ages, then resume workers.
 
@@ -40,6 +40,8 @@ Before production, complete [`docs/telegram-compatibility.md`](docs/telegram-com
 
 ## Deployment
 
-Use one supervised long-running process with a persistent volume for `data/`. Keep the host clock synchronized and allow at least 30 seconds of shutdown grace. A stateless/serverless deployment is not supported because long polling, SQLite, physical renewal, and in-process scheduling are part of the design.
+The VPS deployment uses one systemd-supervised process, a persistent `data/` directory, immutable SHA-named releases, an atomic `current` symlink, pinned SSH host keys, and no inbound application port. Keep the host clock synchronized and allow at least 30 seconds of shutdown grace. A stateless/serverless deployment is not supported because long polling, SQLite, physical renewal, and in-process scheduling are part of the design.
+
+The complete operator runbook is [`docs/deployment.md`](docs/deployment.md). Automatic production enablement remains gated on the remediation findings in [`IMPLEMENTATION_REVIEW.md`](IMPLEMENTATION_REVIEW.md), the 90% coverage gate, and the real-Telegram checklist in [`docs/telegram-compatibility.md`](docs/telegram-compatibility.md).
 
 See `IMPLEMENTATION_PLAN.md` for the full state machine, failure matrix, and Bot API constraints.
