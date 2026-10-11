@@ -188,6 +188,16 @@ const main = async (): Promise<void> => {
       await abortableSleep(systemClock, 1_000, signal);
     }
   });
+  supervisor.start("publication_cleanup", async (signal) => {
+    while (!signal.aborted && !stopped) {
+      try {
+        for (const item of queue.listActive(10_000).filter((entry) => entry.status === "published_cleanup_pending")) await publisher.cleanupPending(item.id);
+      } catch (error) {
+        logger.error("publication_cleanup_worker_failed", { error: safeErrorDescription(error) });
+      }
+      await abortableSleep(systemClock, 60_000, signal);
+    }
+  });
   supervisor.start("orphan_cleanup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { await orphanCleanup.runOnce(); }
