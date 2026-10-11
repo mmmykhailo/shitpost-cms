@@ -294,9 +294,10 @@ const migrations: readonly Migration[] = [
   },
 ];
 
-export const applyMigrations = (db: Database): void => {
+export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`);
   for (const migration of migrations) {
+    if (migration.version > throughVersion) break;
     const applied = db.query("SELECT version FROM schema_migrations WHERE version = ?").get(migration.version) as { version: number } | null;
     if (applied) continue;
     db.exec("BEGIN IMMEDIATE");
