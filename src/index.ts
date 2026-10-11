@@ -198,6 +198,19 @@ const main = async (): Promise<void> => {
       await abortableSleep(systemClock, 60_000, signal);
     }
   });
+  supervisor.start("operation_recovery", async (signal) => {
+    while (!signal.aborted && !stopped) {
+      try {
+        const now = systemClock.now();
+        queue.heartbeatOperations(now, bootId);
+        const recovered = queue.recoverExpiredOperations(now, bootId);
+        if (recovered.length > 0) logger.warn("expired_operations_recovered", { count: recovered.length });
+      } catch (error) {
+        logger.error("operation_recovery_worker_failed", { error: safeErrorDescription(error) });
+      }
+      await abortableSleep(systemClock, 60_000, signal);
+    }
+  });
   supervisor.start("orphan_cleanup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { await orphanCleanup.runOnce(); }

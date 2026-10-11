@@ -136,6 +136,10 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   let currentBootId = options.bootId;
   const conflict = (message: string): OperationConflictError => new OperationConflictError(message);
   const setBootId = (bootId: string): void => { currentBootId = bootId; };
+  const heartbeatOperations = (now: number, bootId = currentBootId): number => {
+    if (bootId === undefined) return 0;
+    return Number(database.raw.query("UPDATE operations SET lease_expires_at = ?, updated_at = ? WHERE boot_id = ? AND state IN ('running','outputs_recorded','cleanup_pending')").run(now + 300_000, now, bootId).changes);
+  };
   const findItemById = (id: number): QueueItemRecord | undefined => {
     const row = database.raw.query("SELECT * FROM queue_items WHERE id = ?").get(id) as QueueRow | null;
     return row ? rowToItem(row) : undefined;
@@ -892,6 +896,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     listRecentlyDeletedExternal,
     renewalCandidateOperation,
     setBootId,
+    heartbeatOperations,
     redactCompletedBefore,
   };
 };

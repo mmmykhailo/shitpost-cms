@@ -165,6 +165,16 @@ describe("queue repository", () => {
     expect(newQueue.findItemById(1)?.status).toBe("queued");
   });
 
+  test("heartbeats only nonterminal operations owned by the current boot", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(32) }), 1_000);
+    queue.claimPublication("heartbeat-op", "publish", 1_000);
+    expect(queue.heartbeatOperations(2_000, "heartbeat-op")).toBe(1);
+    const lease = database.raw.query("SELECT lease_expires_at FROM operations WHERE id = 'heartbeat-op'").get() as { lease_expires_at: number };
+    expect(lease.lease_expires_at).toBe(302_000);
+    expect(queue.heartbeatOperations(3_000, "other-boot")).toBe(0);
+  });
+
   test("quarantines a legacy nonterminal publication attached to a non-publishing item", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(29) }), 1_000);
