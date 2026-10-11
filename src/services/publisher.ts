@@ -96,6 +96,19 @@ export const createPublicationService = (input: {
     await input.gateway.editCaption(editInput);
   };
 
+  const preflightInlineByline = (snapshots: readonly StoredMessageSnapshot[], name: string): void => {
+    if (snapshots.length === 0) throw new Error("No source snapshots are available for byline editing");
+    const captionMembers = snapshots.filter((snapshot) => snapshot.caption !== undefined && snapshot.caption.length > 0);
+    if (snapshots.length > 1 && captionMembers.length > 1) throw new Error("Album has multiple caption-bearing members");
+    if (snapshots.length === 1 && snapshots[0]?.contentType === "text") {
+      const snapshot = snapshots[0]!;
+      appendInlineByline(snapshot.text, name, TEXT_LIMIT, snapshot.entities);
+      return;
+    }
+    const snapshot = captionMembers[0] ?? snapshots[0]!;
+    appendInlineByline(snapshot.caption, name, CAPTION_LIMIT, snapshot.captionEntities);
+  };
+
   const publishClaimed = async (claimed: NonNullable<ReturnType<QueueRepository["claimPublication"]>>): Promise<PublicationOutcome> => {
     const now = input.clock.now();
     const snapshots = input.queue.getCurrentSnapshotSet(claimed.item.id);
@@ -116,6 +129,19 @@ export const createPublicationService = (input: {
       input.queue.transition(claimed.item.id, "publishing", "blocked", now, "unsupported_content", "Unsupported content type");
       input.queue.setOperationState(claimed.operationId, "failed", now, "unsupported_content");
       return { kind: "blocked", itemId: claimed.item.id, status: "blocked", reason: "unsupported_content" };
+    }
+    if (plan.kind === "copy_with_inline_byline") {
+      try {
+        preflightInlineByline(snapshots, plan.name);
+      } catch (error) {
+        const description = error instanceof Error ? error.message : "Album caption requires review";
+        if (description.includes("multiple caption")) {
+          input.queue.transition(claimed.item.id, "publishing", "needs_review", now, "multiple_album_captions", description);
+          input.queue.setOperationState(claimed.operationId, "failed", now, "multiple_album_captions", description);
+          return { kind: "blocked", itemId: claimed.item.id, status: "needs_review", reason: "multiple_album_captions" };
+        }
+        return failClaim(claimed, classifyTelegramError(error));
+      }
     }
     const sourceIds = input.queue.currentSourceIds(claimed.item.id);
     let destinationIds: MessageId[] = [];

@@ -98,7 +98,7 @@ describe("publication service", () => {
     expect(queue.findItemById(1)?.status).toBe("done");
   });
 
-  test("blocks an overlong user byline and cleans the destination copy", async () => {
+  test("blocks an overlong user byline before copying", async () => {
     const fake = fakeGateway();
     const { queue, service } = open(fake.gateway);
     const user = { kind: "user" as const, userId: 45 as never, displayName: "A" };
@@ -106,6 +106,6 @@ describe("publication service", () => {
     const result = await service.publishNext();
     expect(result).toMatchObject({ kind: "failed", status: "needs_edit" });
     expect(queue.findItemById(1)?.status).toBe("needs_edit");
-    expect(fake.calls.filter((call) => call === "copy")).toHaveLength(1);
+    expect(fake.calls.filter((call) => call === "copy")).toHaveLength(0);
   });
 });
