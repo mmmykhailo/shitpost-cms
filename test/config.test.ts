@@ -21,4 +21,20 @@ describe("configuration", () => {
     expect(() => parseConfig({ ...base, ADMIN_USER_ID: "not-an-id" })).toThrow(/ADMIN_USER_ID/);
     expect(() => parseConfig({ ...base, LOG_LEVEL: "verbose" })).toThrow(/LOG_LEVEL/);
   });
+
+  test("keeps deployment status configuration optional for local development", () => {
+    const config = parseConfig(base, "/tmp/project");
+    expect(config.releaseSha).toBe("development");
+    expect(config.runtimeStatusPath).toBeUndefined();
+    const deployed = parseConfig({ ...base, RELEASE_SHA: "a".repeat(40), RUNTIME_STATUS_PATH: "/run/shitpost-cms/ready.json" }, "/tmp/project");
+    expect(deployed.releaseSha).toBe("a".repeat(40));
+    expect(deployed.runtimeStatusPath).toBe("/run/shitpost-cms/ready.json");
+  });
+
+  test("rejects incomplete or unsafe deployment status configuration", () => {
+    expect(() => parseConfig({ ...base, RELEASE_SHA: "a".repeat(40) }, "/tmp/project")).toThrow(/RUNTIME_STATUS_PATH/);
+    expect(() => parseConfig({ ...base, RUNTIME_STATUS_PATH: "/run/status" }, "/tmp/project")).toThrow(/RELEASE_SHA/);
+    expect(() => parseConfig({ ...base, RELEASE_SHA: "A".repeat(40), RUNTIME_STATUS_PATH: "/run/status" }, "/tmp/project")).toThrow(/RELEASE_SHA/);
+    expect(() => parseConfig({ ...base, RELEASE_SHA: "development", RUNTIME_STATUS_PATH: "relative/status" }, "/tmp/project")).toThrow(/absolute/);
+  });
 });
