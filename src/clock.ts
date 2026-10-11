@@ -1,18 +1,12 @@
 import type { Clock } from "./types";
 
-export class FakeClock implements Clock {
-  constructor(private current: number) {}
+export type FakeClock = Clock & { advance(milliseconds: number): void };
 
-  now(): number {
-    return this.current;
-  }
-
-  advance(milliseconds: number): void {
-    this.current += milliseconds;
-  }
-
-  sleep(milliseconds: number): Promise<void> {
-    this.advance(milliseconds);
-    return Promise.resolve();
-  }
-}
+export const createFakeClock = (initialTime: number): FakeClock => {
+  let current = initialTime;
+  return {
+    now: () => current,
+    advance: (milliseconds) => { current += milliseconds; },
+    sleep: async (milliseconds) => { current += milliseconds; },
+  };
+};

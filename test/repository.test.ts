@@ -1,0 +1,78 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDatabase } from "../src/db/database";
+import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
+import { asChatId, asMessageId, asUserId } from "../src/types";
+import { snapshotFixture } from "./domain.test";
+
+const resources: Array<{ close(): void; path: string }> = [];
+
+const open = () => {
+  const directory = mkdtempSync(join(tmpdir(), "queuebot-test-"));
+  const database = createDatabase(join(directory, "bot.sqlite"));
+  resources.push({ close: database.close, path: directory });
+  return { database, queue: createQueueRepository(database), policy: createPolicyRepository(database), schedule: createScheduleRepository(database) };
+};
+
+afterEach(() => {
+  while (resources.length) {
+    const resource = resources.pop()!;
+    resource.close();
+    rmSync(resource.path, { recursive: true, force: true });
+  }
+});
+
+describe("queue repository", () => {
+  test("ingestion is idempotent and album finalization preserves FIFO", () => {
+    const { queue } = open();
+    const first = snapshotFixture({ messageId: asMessageId(10), mediaGroupId: "album" });
+    const second = snapshotFixture({ messageId: asMessageId(12), mediaGroupId: "album", ordinal: 2 });
+    expect(queue.observeQueueSnapshot(first, 1_000).inserted).toBe(true);
+    expect(queue.observeQueueSnapshot(first, 1_000).inserted).toBe(false);
+    expect(queue.addAlbumMember(1, second, 1_500).status).toBe("collecting");
+    expect(queue.finalizeAlbums(12_000)[0]?.status).toBe("queued");
+    expect(queue.getMessages(1).map((message) => message.telegramMessageId)).toEqual([asMessageId(10), asMessageId(12)]);
+    expect(queue.getHead()?.logicalSequence).toBe(1);
+  });
+
+  test("edits update snapshots and stale rows cannot be claimed", () => {
+    const { queue } = open();
+    const first = snapshotFixture({ messageId: asMessageId(20) });
+    queue.observeQueueSnapshot(first, 1_000);
+    const edited = snapshotFixture({ messageId: asMessageId(20), text: "edited", editDate: 2_000 });
+    expect(queue.updateSnapshot(-100, 20, edited)?.contentVersion).toBe(2);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.text).toBe("edited");
+    const claimed = queue.claimPublication("op-1", "publish", 2_000);
+    expect(claimed?.item.status).toBe("publishing");
+    expect(queue.getHead()?.status).toBe("publishing");
+  });
+});
+
+describe("policy repository", () => {
+  test("uses numeric channel IDs and stable author IDs", () => {
+    const { policy } = open();
+    policy.upsertChannel(-1009, "old_handle", "Title", 1, 1);
+    expect(policy.isChannelWhitelisted(-1009)).toBe(true);
+    expect(policy.isChannelWhitelisted(-1010)).toBe(false);
+    policy.observeAuthor({ kind: "user", userId: asUserId(42), username: "Ada", displayName: "Ada L" }, 1);
+    policy.setAlias("@ada", "Analyst", 1, 2);
+    expect(policy.aliasForOrigin({ kind: "user", userId: asUserId(42), username: "ada", displayName: "Ada L" })).toBe("Analyst");
+    policy.observeAuthor({ kind: "user", userId: asUserId(42), username: "new_ada", displayName: "Ada Lovelace" }, 3);
+    expect(policy.aliasForOrigin({ kind: "user", userId: asUserId(42), username: "new_ada", displayName: "Ada Lovelace" })).toBe("Analyst");
+  });
+});
+
+describe("schedule repository", () => {
+  test("materializes each UTC occurrence once", () => {
+    const { schedule } = open();
+    schedule.addSlot(60, 1, 1);
+    expect(schedule.materialize(1000)).toBe(true);
+    expect(schedule.materialize(1000)).toBe(false);
+    expect(schedule.run(1000)?.status).toBe("pending");
+    schedule.markRun(1000, "empty", 2000);
+    expect(schedule.run(1000)?.status).toBe("empty");
+    expect(schedule.slots()).toEqual([60]);
+  });
+});
