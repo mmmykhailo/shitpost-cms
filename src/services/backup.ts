@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -25,6 +25,7 @@ export const createBackupService = (input: { database: AppDatabase; directory: s
         check.close();
       }
       renameSync(temporaryPath, finalPath);
+      chmodSync(finalPath, 0o600);
       const backups = readdirSync(input.directory).filter((name) => /^bot-.*\.sqlite$/u.test(name)).sort().reverse();
       for (const old of backups.slice(7)) unlinkSync(join(input.directory, old));
       input.logger.info("backup_completed", { path: finalPath });
