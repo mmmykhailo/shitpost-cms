@@ -304,9 +304,9 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       case "publish_execute": {
         const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
-        if (!item || item.status !== "queued" || item.maintenanceStatus !== "idle" || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The queue head changed; reopen the dashboard.");
+        if (!item || deps.queue.getHead()?.id !== item.id || item.status !== "queued" || item.maintenanceStatus !== "idle" || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The queue head changed; reopen the dashboard.");
         const outcome = await deps.scheduler.manualPublish();
-        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, outcome.kind === "cleanup_pending" || outcome.kind === "uncertain" ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
+        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
         return sendDashboard(ctx);
       }
       case "slot_add": deps.admin.setPrompt(deps.config.adminUserId, "slot_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send the exact daily UTC slot as HH:MM.");
@@ -330,6 +330,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
         if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return ctx.reply("Uncertain and active-maintenance items require their state-specific resolution flow.");
+        return ctx.reply(`Retry queue item #${itemId} from ${item.status}?`, { reply_markup: keyboard([[await button(deps, "Confirm retry", "queue_retry_execute", { itemId }, item.contentVersion)], [await button(deps, "Cancel", "queue")]]) });
+      }
+      case "queue_retry_execute": {
+        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        const item = deps.queue.findItemById(itemId);
+        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return ctx.reply("This queue item changed; reopen the queue.");
         deps.queue.retryItem(itemId, deps.now());
         deps.admin.audit("queue_retry", String(deps.config.adminUserId), deps.now(), itemId, undefined, { previousStatus: item.status });
         return sendQueue(ctx);
