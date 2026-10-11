@@ -2,7 +2,7 @@ import type { AppDatabase } from "./database";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
 import { validateOrderedMessageIds, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
-import { OperationConflictError } from "../errors";
+import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
 import type { MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
@@ -477,6 +477,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   });
 
   const recordOutput = (operationId: string, role: OperationOutputRole | "destination" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
+    if (!Number.isSafeInteger(chatId)) throw new InvalidTelegramOutputError("Invalid numeric Telegram output chat ID");
+    if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new InvalidTelegramOutputError("Invalid numeric Telegram output ID");
+    if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new InvalidTelegramOutputError("Invalid numeric Telegram output ordinal");
     const kind = role === "replacement" ? "replacement" : role === "temporary_preview" ? "temporary_preview" : "destination";
     const normalizedRole = role === "destination" ? "transferred" : role;
     const result = database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);

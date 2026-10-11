@@ -152,7 +152,33 @@ describe("queue repository", () => {
     const first = queue.claimPublication("output-owner", "publish", 1_002)!;
     database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, created_at, updated_at) VALUES ('output-rival', 'publish', 2, 'running', 1, 0, 1000, 1000)").run();
     queue.recordOutput(first.operationId, "transferred", -200, 904, 0, 1_003);
+    expect(() => queue.recordOutput(first.operationId, "transferred", -200, 904, 0, 1_004)).not.toThrow();
     expect(() => queue.recordOutput("output-rival", "transferred", -200, 904, 0, 1_004)).toThrow(/already belongs/);
+  });
+
+  test("rejects invalid numeric Telegram output IDs before SQLite binding", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(33) }), 1_000);
+    const claimed = queue.claimPublication("numeric-output", "publish", 1_001)!;
+    const invalid = [
+      [Number.NaN, 901, 0],
+      [-200, {} as unknown as number, 0],
+      [-200, Number.NaN, 0],
+      [-200, Number.POSITIVE_INFINITY, 0],
+      [-200, 0, 0],
+      [-200, -1, 0],
+      [-200, 901.5, 0],
+      [-200, 902, -1],
+    ] as const;
+
+    for (const [chatId, messageId, ordinal] of invalid) {
+      expect(() => queue.recordOutput(claimed.operationId, "transferred", chatId, messageId, ordinal, 1_002)).toThrow(/Invalid numeric Telegram output/);
+    }
+    expect((database.raw.query("SELECT COUNT(*) AS count FROM operation_outputs").get() as { count: number }).count).toBe(0);
+
+    queue.recordOutput(claimed.operationId, "transferred", -200, 903, 0, 1_003);
+    expect(() => queue.recordOutput(claimed.operationId, "transferred", -200, 903, 0, 1_004)).not.toThrow();
+    expect((database.raw.query("SELECT COUNT(*) AS count FROM operation_outputs").get() as { count: number }).count).toBe(1);
   });
 
   test("a new boot reconciles a prior live lease immediately", () => {

@@ -7,6 +7,13 @@ export class OperationConflictError extends Error {
   }
 }
 
+export class InvalidTelegramOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidTelegramOutputError";
+  }
+}
+
 type TelegramLikeError = {
   error_code?: unknown;
   description?: unknown;
@@ -28,6 +35,9 @@ const descriptionOf = (error: unknown): string => {
 const numeric = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
 
 export const classifyTelegramError = (error: unknown, method?: string): NormalizedTelegramError => {
+  if (error instanceof InvalidTelegramOutputError) {
+    return { kind: "ambiguous_send_result", method: method ?? "recordOutput", description: error.message, cause: error };
+  }
   if (typeof error === "object" && error !== null && "kind" in error && "description" in error) {
     const normalized = error as NormalizedTelegramError;
     if (method !== undefined && normalized.method === undefined) return { ...normalized, method };

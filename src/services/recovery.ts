@@ -106,7 +106,7 @@ export const createRecoveryService = (input: {
         input.recovery?.addPreviewPending(operationId, sourceId, ordinal, input.clock.now());
         input.recovery?.setPhase(operationId, "preview_pending", input.clock.now());
         const preview = await input.gateway.forwardMessage({ targetChatId: input.adminChatId, sourceChatId: input.queueChannelId, messageId: sourceId });
-        const previewId = preview.message_id as unknown as MessageId;
+        const previewId = asMessageId(preview.message_id);
         previews.push(previewId);
         const captured = snapshotFromMessage(preview);
         const origin = originForRecoveredMessage(captured.origin, input.queueChannelId);

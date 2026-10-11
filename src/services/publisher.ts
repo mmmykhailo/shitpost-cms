@@ -56,17 +56,32 @@ export const createPublicationService = (input: {
     finally { finish?.(); }
   };
 
-  const cleanupDestination = async (ids: readonly MessageId[]): Promise<boolean> => {
-    if (ids.length === 0) return true;
+  const logUncertainty = (claimed: Claimed, error: NormalizedTelegramError, context: { phase?: string; expectedOutputCount?: number; knownOutputCount?: number } = {}): void => {
+    let evidence: ReturnType<QueueRepository["operationEvidence"]>;
+    try { evidence = input.queue.operationEvidence(claimed.item.id); }
+    catch { evidence = undefined; }
+    input.logger.error("publication_uncertain", {
+      itemId: claimed.item.id,
+      operationId: claimed.operationId,
+      operationPhase: context.phase ?? evidence?.phase,
+      expectedOutputCount: context.expectedOutputCount ?? evidence?.expectedOutputCount,
+      knownOutputCount: context.knownOutputCount ?? evidence?.knownDestinationIds.length ?? 0,
+      errorKind: error.kind,
+      telegramMethod: error.method,
+    });
+  };
+
+  const cleanupDestination = async (ids: readonly MessageId[]): Promise<{ ok: true } | { ok: false; error: NormalizedTelegramError }> => {
+    if (ids.length === 0) return { ok: true };
     try {
       await input.gateway.deleteMessages(input.targetChannelId, ids);
-      return true;
+      return { ok: true };
     } catch (error) {
       const normalized = classifyTelegramError(error);
       // A destination message that is already absent is a confirmed cleanup.
-      if (normalized.kind === "source_missing") return true;
+      if (normalized.kind === "source_missing") return { ok: true };
       input.logger.error("destination_partial_cleanup_failed", { error: normalized.kind, count: ids.length });
-      return false;
+      return { ok: false, error: normalized };
     }
   };
 
@@ -150,7 +165,7 @@ export const createPublicationService = (input: {
     capturedSourceGeneration: claimed.capturedSourceGeneration,
   });
 
-  const failClaim = async (claimed: Claimed, error: NormalizedTelegramError): Promise<PublicationOutcome> => {
+  const failClaim = async (claimed: Claimed, error: NormalizedTelegramError, context: { expectedOutputCount?: number; knownOutputCount?: number } = {}): Promise<PublicationOutcome> => {
     const now = input.clock.now();
     if (error.kind === "source_missing") {
       input.queue.markMissing(claimed.item.id, claimed.operationId, now);
@@ -165,6 +180,7 @@ export const createPublicationService = (input: {
       input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", now, error.kind, error.description);
       input.queue.setOperationState(claimed.operationId, "uncertain", now, error.kind, JSON.stringify({ description: error.description }));
       input.queue.setOperationPhase(claimed.operationId, "uncertain", now, error.kind, JSON.stringify({ description: error.description }));
+      logUncertainty(claimed, error, { ...context, phase: "uncertain" });
       return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
     }
     const status = classifyPlanError(error);
@@ -201,10 +217,11 @@ export const createPublicationService = (input: {
       if (destinationIds.length !== sourceIds.length) {
         input.queue.markPartialCleanupPending(guard, input.clock.now(), "partial_result", "Telegram returned fewer destination messages than the immutable output contract requires");
         const cleaned = await cleanupDestination(destinationIds);
-        if (!cleaned) {
+        if (!cleaned.ok) {
           input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", "Known partial destination output could not be confirmed deleted");
           input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
           input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
+          logUncertainty(claimed, cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
           return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
         }
         input.queue.transition(claimed.item.id, "publishing", "needs_review", input.clock.now(), "partial_result", "Telegram returned fewer destination messages than the source contract requires");
@@ -230,10 +247,11 @@ export const createPublicationService = (input: {
       const attributionWasSeparate = plan.kind === "copy_with_separate_byline";
       if (destinationIds.length > 0) {
         const cleaned = await cleanupDestination(destinationIds);
-        if (!cleaned || attributionWasSeparate && normalized.kind === "ambiguous_send_result") {
+        if (!cleaned.ok || attributionWasSeparate && normalized.kind === "ambiguous_send_result") {
           input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", normalized.description);
           input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
           input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
+          logUncertainty(claimed, cleaned.ok ? normalized : cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
           return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
         }
         // An edit failure after the known base messages were removed is safe to
@@ -244,7 +262,7 @@ export const createPublicationService = (input: {
           return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
         }
       }
-      return failClaim(claimed, normalized);
+      return failClaim(claimed, normalized, { expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: destinationIds.length });
     }
 
     try {
