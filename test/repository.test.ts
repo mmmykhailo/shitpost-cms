@@ -57,6 +57,15 @@ describe("queue repository", () => {
     expect(queue.findItemById(1)?.origin).toEqual(origin);
     expect(queue.getCurrentSnapshotSet(1)[0]?.origin).toEqual(origin);
   });
+
+  test("startup recovery makes an output-less expired publication explicit", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(22) }), 1_000);
+    expect(queue.claimPublication("expired-op", "publish", 1_000)?.item.status).toBe("publishing");
+    expect(queue.recoverExpiredOperations(302_000)).toEqual([1]);
+    expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
+    expect((database.raw.query("SELECT state FROM operations WHERE id = 'expired-op'").get() as { state: string }).state).toBe("uncertain");
+  });
 });
 
 describe("policy repository", () => {
