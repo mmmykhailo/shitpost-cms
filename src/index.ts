@@ -72,6 +72,7 @@ const main = async (): Promise<void> => {
   let currentRights: { queue: BotMembership; target: BotMembership } | undefined;
   let stopped = false;
   let shutdownPromise: Promise<void> | undefined;
+  let pollingPromise: Promise<void> | undefined;
 
   const shutdown = (signal: string): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
@@ -80,14 +81,21 @@ const main = async (): Promise<void> => {
       operationTracker.stopAccepting();
       supervisor.requestStop();
       logger.info("shutdown_started", { signal });
+      const shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
       try {
         await bot.stop();
       } catch (error) {
         logger.warn("bot_stop_failed", { error: safeErrorDescription(error) });
       }
-      const shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
-      const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - Date.now()));
+      if (pollingPromise !== undefined) {
+        try {
+          await pollingPromise;
+        } catch (error) {
+          logger.warn("polling_drain_failed", { error: safeErrorDescription(error) });
+        }
+      }
       const operationsDrained = await operationTracker.waitForEmpty(Math.max(0, shutdownDeadline - Date.now()));
+      const tasksDrained = await supervisor.stopAndDrain(Math.max(0, shutdownDeadline - Date.now()));
       const clean = tasksDrained && operationsDrained;
       let checkpointed = false;
       try {
@@ -170,7 +178,8 @@ const main = async (): Promise<void> => {
     logger.error("polling_error", { error: safeErrorDescription(error.error) });
   });
 
-  supervisor.start("renewal", async (signal) => {
+  const startBackgroundWork = (): void => {
+    supervisor.start("renewal", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
         for (const item of queue.listActive(10_000).filter((entry) => entry.maintenanceStatus === "renewal_cleanup_pending")) await renewal.cleanupPending(item.id);
@@ -180,15 +189,15 @@ const main = async (): Promise<void> => {
       }
       await abortableSleep(systemClock, RENEWAL_INTERVAL_MS, signal);
     }
-  });
-  supervisor.start("pending_updates", async (signal) => {
+    });
+    supervisor.start("pending_updates", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { ingestion.finalizeAlbums(); }
       catch (error) { logger.error("pending_update_finalizer_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 1_000, signal);
     }
-  });
-  supervisor.start("publication_cleanup", async (signal) => {
+    });
+    supervisor.start("publication_cleanup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
         for (const item of queue.listActive(10_000).filter((entry) => entry.status === "published_cleanup_pending")) await publisher.cleanupPending(item.id);
@@ -197,8 +206,8 @@ const main = async (): Promise<void> => {
       }
       await abortableSleep(systemClock, 60_000, signal);
     }
-  });
-  supervisor.start("operation_recovery", async (signal) => {
+    });
+    supervisor.start("operation_recovery", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
         const now = systemClock.now();
@@ -210,15 +219,15 @@ const main = async (): Promise<void> => {
       }
       await abortableSleep(systemClock, 60_000, signal);
     }
-  });
-  supervisor.start("orphan_cleanup", async (signal) => {
+    });
+    supervisor.start("orphan_cleanup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { await orphanCleanup.runOnce(); }
       catch (error) { logger.error("orphan_cleanup_worker_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 15 * 60_000, signal);
     }
-  });
-  supervisor.start("alerts", async (signal) => {
+    });
+    supervisor.start("alerts", async (signal) => {
     while (!signal.aborted && !stopped) {
       try {
         const now = systemClock.now();
@@ -267,23 +276,23 @@ const main = async (): Promise<void> => {
       }
       await abortableSleep(systemClock, 60_000, signal);
     }
-  });
-  supervisor.start("retention", async (signal) => {
+    });
+    supervisor.start("retention", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { retention.runOnce(); }
       catch (error) { logger.error("retention_worker_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
     }
-  });
-  supervisor.start("backup", async (signal) => {
+    });
+    supervisor.start("backup", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { backup.runOnce(); lastSuccessfulBackupAt = systemClock.now(); }
       catch (error) { logger.error("backup_worker_failed", { error: safeErrorDescription(error) }); }
       await abortableSleep(systemClock, 24 * 60 * 60_000, signal);
     }
-  });
-  supervisor.start("scheduler", async (signal) => scheduler.run(signal));
-  supervisor.start("lease_heartbeat", async (signal) => {
+    });
+    supervisor.start("scheduler", async (signal) => scheduler.run(signal));
+    supervisor.start("lease_heartbeat", async (signal) => {
     while (!signal.aborted && !stopped) {
       await abortableSleep(systemClock, 20_000, signal);
       if (signal.aborted || stopped) return;
@@ -294,10 +303,17 @@ const main = async (): Promise<void> => {
         return;
       }
     }
-  });
+    });
+  };
 
   try {
-    await bot.start({ allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"] });
+    pollingPromise = bot.start({
+      allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"],
+      onStart: async () => {
+        startBackgroundWork();
+      },
+    });
+    await pollingPromise;
   } catch (error) {
     if (!stopped) logger.error("polling_stopped", { error: safeErrorDescription(error) });
   } finally {
