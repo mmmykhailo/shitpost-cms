@@ -13,7 +13,7 @@ import { snapshotFixture } from "./fixtures";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
-const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean } = {}) => {
+const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: boolean; ambiguousEdit?: boolean; ambiguousByline?: boolean; shortTransfer?: boolean; ambiguousTransfer?: boolean } = {}) => {
   let nextMessageId = 1000;
   let deleteAttempts = 0;
   const calls: string[] = [];
@@ -21,8 +21,8 @@ const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: bo
     getBotIdentity: async () => ({ id: asUserId(1) }),
     getChat: async (id) => ({ id: Number(id) as never, type: "channel" }),
     getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
-    forwardMessages: async ({ messageIds }) => { calls.push("forward"); return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
-    copyMessages: async ({ messageIds }) => { calls.push("copy"); return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
+    forwardMessages: async ({ messageIds }) => { calls.push("forward"); if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
+    copyMessages: async ({ messageIds }) => { calls.push("copy"); if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
     forwardMessage: async () => { throw new Error("not used"); },
     editText: async () => { calls.push("editText"); if (options.ambiguousEdit) throw { kind: "ambiguous_send_result", description: "edit response lost" }; },
     editCaption: async () => { calls.push("editCaption"); },
@@ -129,6 +129,29 @@ describe("publication service", () => {
     expect(result).toMatchObject({ kind: "blocked", status: "needs_review" });
     expect(queue.findItemById(1)?.status).toBe("needs_review");
     expect(queue.currentSourceIds(1)).toEqual([asMessageId(6), asMessageId(7)]);
+    expect(fake.calls.filter((call) => call.startsWith("delete:")).length).toBe(1);
+  });
+
+  test("blocks an ambiguous transfer before source cleanup", async () => {
+    const fake = fakeGateway({ ambiguousTransfer: true });
+    const { queue, service } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(60) }), 1_000);
+    const result = await service.publishNext();
+    expect(result.kind).toBe("uncertain");
+    expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
+    expect(fake.calls).toEqual(["copy"]);
+    expect(fake.calls.filter((call) => call.startsWith("delete:"))).toHaveLength(0);
+  });
+
+  test("keeps a short result uncertain when known-output cleanup is ambiguous", async () => {
+    const fake = fakeGateway({ shortTransfer: true, failDelete: true });
+    const { queue, service } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(61), mediaGroupId: "album-uncertain" }), 1_000);
+    queue.addAlbumMember(1, snapshotFixture({ messageId: asMessageId(62), mediaGroupId: "album-uncertain", ordinal: 1 }), 1_100);
+    queue.finalizeAlbums(20_000);
+    const result = await service.publishNext();
+    expect(result.kind).toBe("uncertain");
+    expect(queue.findItemById(1)?.status).toBe("uncertain_publish");
     expect(fake.calls.filter((call) => call.startsWith("delete:")).length).toBe(1);
   });
 
