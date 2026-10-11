@@ -12,9 +12,11 @@
     "test": "bun test",
     "test:coverage": "bun test --coverage --coverage-reporter=lcov",
     "coverage:gate": "bun scripts/check-coverage.ts",
+    "test:coverage:gate": "bun scripts/run-coverage-gate.ts",
     "test:deploy": "bash test/deploy/release.test.sh && bash test/deploy/backup.test.sh",
     "typecheck": "tsc --noEmit",
-    "check": "bun run typecheck && bun run test"
+    "check": "bun run typecheck && bun run test",
+    "check:all": "bun run typecheck && bun run test && bun run test:coverage:gate && bun run test:deploy"
   },
   "dependencies": {
     "grammy": "1.38.4"
