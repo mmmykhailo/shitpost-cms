@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { createDatabase } from "../src/db/database";
 import { createAlertRepository } from "../src/db/alert-repository";
 import { createAdminRepository } from "../src/db/admin-repository";
@@ -106,6 +107,26 @@ describe("operations safety net", () => {
     expect(second.previousPath).toBeDefined();
     expect(Bun.file(destination).size).toBeGreaterThan(0);
     expect(Bun.file(second.previousPath!).size).toBeGreaterThan(0);
+  });
+
+  test("rejects non-standalone and schema-less restore sources", () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-restore-invalid-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    resources.push({ directory, close: database.close });
+    const backup = createBackupService({ database, directory: join(directory, "backups"), logger: createLogger("error"), now: () => 3_000 });
+    const source = backup.runOnce();
+    const service = createRestoreService();
+
+    writeFileSync(`${source}-wal`, "sidecar");
+    expect(() => service.inspectBackup(source)).toThrow(/WAL sidecars/);
+    rmSync(`${source}-wal`);
+    expect(() => service.restoreBackup(source, source)).toThrow(/different files/);
+
+    const schemaLess = join(directory, "schema-less.sqlite");
+    const raw = new Database(schemaLess);
+    raw.exec("CREATE TABLE schema_migrations (version INTEGER)");
+    raw.close();
+    expect(() => service.inspectBackup(schemaLess)).toThrow(/no schema migration history/);
   });
 
   test("expires, validates, consumes, and purges admin state", () => {
