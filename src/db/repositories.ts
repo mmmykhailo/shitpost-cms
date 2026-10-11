@@ -296,6 +296,37 @@ export const createQueueRepository = (database: AppDatabase) => {
   const operationOutputIds = (operationId: string, kind: "destination" | "replacement" | "temporary_preview"): MessageId[] =>
     (database.raw.query("SELECT telegram_message_id FROM operation_outputs WHERE operation_id = ? AND kind = ? ORDER BY ordinal, telegram_message_id").all(operationId, kind) as Array<{ telegram_message_id: number }>).map((row) => row.telegram_message_id as MessageId);
 
+  const recoverExpiredOperations = (now: number): number[] => database.transaction(() => {
+    const rows = database.raw.query("SELECT id, item_id, state FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at IS NULL OR lease_expires_at <= ?)").all(now) as Array<{ id: string; item_id: number; state: string }>;
+    const recovered: number[] = [];
+    for (const row of rows) {
+      const item = findItemById(row.item_id);
+      if (!item) continue;
+      if (item.status === "publishing") {
+        const destinationIds = operationOutputIds(row.id, "destination");
+        if (destinationIds.length > 0) {
+          database.raw.query("UPDATE queue_items SET status = 'published_cleanup_pending', destination_message_ids_json = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(JSON.stringify(destinationIds), item.id);
+          setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+        } else {
+          database.raw.query("UPDATE queue_items SET status = 'uncertain_publish', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ?").run(item.id);
+          setOperationState(row.id, "uncertain", now, "startup_recovery");
+        }
+        recovered.push(item.id);
+      } else if (item.status === "renewing") {
+        const replacementIds = operationOutputIds(row.id, "replacement");
+        if (item.sourceGeneration > 0 && replacementIds.length > 0) {
+          database.raw.query("UPDATE queue_items SET status = 'renewed_cleanup_pending', claimed_operation_id = NULL, claimed_at = NULL WHERE id = ?").run(item.id);
+          setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+        } else {
+          database.raw.query("UPDATE queue_items SET status = 'uncertain_renewal', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ?").run(item.id);
+          setOperationState(row.id, "uncertain", now, "startup_recovery");
+        }
+        recovered.push(item.id);
+      }
+    }
+    return recovered;
+  });
+
   const recordOutput = (operationId: string, kind: "destination" | "replacement" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
     database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?)").run(operationId, kind, chatId, messageId, ordinal, now);
   };
@@ -392,6 +423,7 @@ export const createQueueRepository = (database: AppDatabase) => {
     setOperationState,
     operationForItem,
     operationOutputIds,
+    recoverExpiredOperations,
     recordOutput,
     setDestinationMessageIds,
     installRenewedGeneration,

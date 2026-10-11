@@ -74,6 +74,9 @@ const main = async (): Promise<void> => {
     return;
   }
 
+  const recoveredOperations = queue.recoverExpiredOperations(Date.now());
+  if (recoveredOperations.length > 0) logger.warn("startup_operations_recovered", { count: recoveredOperations.length });
+
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, logger, now: systemClock.now });
   const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock: systemClock, logger });
   const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock: systemClock, logger });
