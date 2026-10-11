@@ -109,8 +109,7 @@ export const createRenewalService = (input: {
       // ingestion layer also treats these IDs as candidates if Telegram emits
       // the channel update before this process sees the response.
       for (const [ordinal, messageId] of replacementIds.entries()) {
-        input.queue.recordOutput(claimed.operationId, "replacement", input.queueChannelId, messageId, ordinal, input.clock.now());
-        input.generated.register(input.queueChannelId, [messageId], claimed.operationId, "renewal", input.clock.now());
+        input.queue.recordReplacementOutput(claimed.operationId, input.queueChannelId, messageId, ordinal, input.clock.now());
       }
 
       if (replacementIds.length !== oldSourceIds.length) {

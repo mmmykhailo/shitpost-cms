@@ -77,6 +77,27 @@ describe("queue repository", () => {
     expect(queue.findItemById(1)?.status).toBe("blocked");
   });
 
+  test("startup recovery installs an exact durable renewal output set", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(26), telegramDate: 0 }), 1_000);
+    const claimed = queue.claimRenewal("renew-recover", 100_000, 64_000)!;
+    const guard = {
+      operationId: claimed.operationId,
+      itemId: 1,
+      capturedContentVersion: claimed.capturedContentVersion,
+      capturedSourceGeneration: claimed.capturedSourceGeneration,
+    };
+    queue.setOperationPhase("renew-recover", "replacement_pending", 100_000);
+    queue.recordReplacementOutput("renew-recover", -100, 902, 0, 100_001);
+    queue.markReplacementOutputsRecorded(guard, 100_002);
+
+    expect(queue.recoverExpiredOperations(400_001)).toEqual([1]);
+    expect(queue.findItemById(1)?.sourceGeneration).toBe(1);
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    expect(queue.currentSourceIds(1)).toEqual([asMessageId(902)]);
+    expect((database.raw.query("SELECT phase, state FROM operations WHERE id = 'renew-recover'").get() as { phase: string; state: string })).toEqual({ phase: "generation_installed", state: "cleanup_pending" });
+  });
+
   test("startup recovery never treats recorded base output as complete publication", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(24) }), 1_000);

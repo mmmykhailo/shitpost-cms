@@ -379,8 +379,13 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const recoverExpiredOperations = (now: number, bootId?: string): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null }>;
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number }>;
     const recovered: number[] = [];
+    const markRenewalUncertain = (itemId: number, operationId: string): void => {
+      database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(itemId, operationId);
+      setOperationPhase(operationId, "uncertain", now, "startup_recovery");
+      setOperationState(operationId, "uncertain", now, "startup_recovery");
+    };
     for (const row of rows) {
       const item = findItemById(row.item_id);
       if (!item) continue;
@@ -389,14 +394,33 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
           database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
           setOperationPhase(row.id, "failed", now, "startup_recovery");
           setOperationState(row.id, "failed", now, "startup_recovery");
+        } else if (row.phase === "replacement_outputs_recorded") {
+          const oldMessages = getMessages(item.id, row.captured_source_generation).sort((left, right) => left.ordinal - right.ordinal);
+          const replacementIds = operationOutputIds(row.id, "replacement");
+          const exactCount = row.expected_source_count !== null && row.expected_source_count === oldMessages.length && row.expected_source_count === replacementIds.length;
+          const guardMatches = item.maintenanceStatus === "renewing" && item.maintenanceOperationId === row.id && item.contentVersion === row.captured_content_version && item.sourceGeneration === row.captured_source_generation;
+          if (!exactCount || !guardMatches) {
+            markRenewalUncertain(item.id, row.id);
+          } else {
+            const nextGeneration = row.captured_source_generation + 1;
+            for (const [ordinal, message] of oldMessages.entries()) {
+              const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
+              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds[ordinal]!, ordinal, telegramDate: now });
+            }
+            const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
+            if (Number(installed.changes) !== 1) {
+              markRenewalUncertain(item.id, row.id);
+            } else {
+              setOperationPhase(row.id, "generation_installed", now, "startup_recovery");
+              setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+            }
+          }
         } else if (row.phase === "generation_installed" || row.phase === "old_source_cleanup_pending") {
-          database.raw.query("UPDATE queue_items SET maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
+          database.raw.query("UPDATE queue_items SET maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND source_generation = ?").run(item.id, row.id, row.captured_source_generation + 1);
           setOperationPhase(row.id, "old_source_cleanup_pending", now, "startup_recovery");
           setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
         } else {
-          database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
-          setOperationPhase(row.id, "uncertain", now, "startup_recovery");
-          setOperationState(row.id, "uncertain", now, "startup_recovery");
+          markRenewalUncertain(item.id, row.id);
         }
         recovered.push(item.id);
         continue;
@@ -425,6 +449,11 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const normalizedRole = role === "destination" ? "transferred" : role;
     database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);
   };
+
+  const recordReplacementOutput = (operationId: string, chatId: number, messageId: number, ordinal: number, now: number): void => database.transaction(() => {
+    recordOutput(operationId, "replacement", chatId, messageId, ordinal, now);
+    database.raw.query("INSERT OR REPLACE INTO generated_messages (chat_id, message_id, operation_id, kind, created_at, consumed_at) VALUES (?, ?, ?, 'renewal', ?, NULL)").run(chatId, messageId, operationId, now);
+  });
 
   const persistPublicationContract = (operationId: string, contract: PublicationContract, now: number): void => database.transaction(() => {
     const validated = validatePublicationContract(contract);
@@ -562,8 +591,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     if (!operation || operation.type !== "renew" || !["generation_installed", "old_source_cleanup_pending"].includes(operation.phase)) throw new Error("Renewal cleanup guard conflict");
     const item = findItemById(guard.itemId);
     if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration + 1) throw new Error("Renewal completion CAS conflict");
-    const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, NULL)");
-    for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, now);
+    const terminal = reason === "telegram_age_limit";
+    const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, terminal ? now : null, terminal ? 1 : 0, terminal ? null : now, terminal ? reason : null);
     const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewal_cleanup_pending' AND content_version = ? AND source_generation = ?").run(item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration + 1);
     if (Number(result.changes) !== 1) throw new Error("Renewal maintenance cleanup guard conflict");
     setOperationState(guard.operationId, "done", now, orphanIds.length > 0 ? reason : undefined);
@@ -753,6 +783,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     operationSourceIds,
     recoverExpiredOperations,
     recordOutput,
+    recordReplacementOutput,
     persistPublicationContract,
     beginPublicationTransfer,
     markPartialCleanupPending,
