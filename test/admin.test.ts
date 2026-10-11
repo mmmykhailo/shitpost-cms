@@ -83,13 +83,14 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const warnings: Array<{ event: string; fields: LogFields | undefined }> = [];
   let nextMessageId = 100;
   let deleteFailure: unknown;
+  let resolvedChat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" } = { id: asChatId(-100555), type: "channel" };
 
   const gateway = {
     deleteMessages: async (chatId: number, messageIds: readonly number[]): Promise<void> => {
       deleted.push({ chatId: Number(chatId), messageIds: messageIds.map(Number) });
       if (deleteFailure !== undefined) throw deleteFailure;
     },
-    getChat: async () => ({ id: asChatId(-100555), type: "channel" as const }),
+    getChat: async () => resolvedChat,
   } as unknown as TelegramGateway;
 
   const logger = {
@@ -140,8 +141,33 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     gateway,
     publisher: {} as AdminDeps["publisher"],
     scheduler: { nextAt: () => undefined, manualPublish } as AdminDeps["scheduler"],
-    recovery: {} as AdminDeps["recovery"],
-    health: {} as AdminDeps["health"],
+    recovery: { recover: async () => ({ itemId: 1, sourceIds: [asMessageId(1)] }), reconcileExpiredSessions: async () => ({ completed: 0, blocked: 0 }) } as AdminDeps["recovery"],
+    health: {
+      snapshot: () => ({
+        databaseOk: true,
+        bootId: "admin-test",
+        uptimeMs: 0,
+        leaseOwned: true,
+        lastCleanShutdownAt: null,
+        lastSuccessfulUpdateAt: null,
+        lastRightsCheckAt: undefined,
+        lastBackupAt: undefined,
+        queueCounts: {},
+        queueHead: undefined,
+        oldestLogicalAgeMs: undefined,
+        oldestPhysicalAgeMs: undefined,
+        nextSlotAt: undefined,
+        lastSchedulerScanAt: null,
+        activeOperations: 0,
+        uncertainOperations: 0,
+        pendingUpdates: {},
+        orphanCounts: { unresolved: 0, terminal: 0 },
+        renewalCapacity: { safe: true },
+        lastOperation: undefined,
+        rights: undefined,
+        alerts: { active: 0, critical: 0, immediate: 0, normal: 0 },
+      }),
+    } as AdminDeps["health"],
     logger,
     now: () => NOW,
   } as AdminDeps;
@@ -149,7 +175,13 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
 
   return {
     bot,
+    database,
     queue,
+    policy,
+    pending,
+    orphan,
+    gateway,
+    config,
     admin,
     schedule,
     calls,
@@ -157,6 +189,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     deleted,
     warnings,
     setDeleteFailure: (error: unknown): void => { deleteFailure = error; },
+    setResolvedChat: (chat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" }): void => { resolvedChat = chat; },
     lastSent: (): SentMessage => {
       const message = sent.at(-1);
       if (!message) throw new Error("No bot message was sent");
@@ -460,6 +493,151 @@ describe("admin schedule handlers", () => {
         { chatId: ADMIN_CHAT_ID, messageIds: [runningMenu.message.message_id] },
         { chatId: ADMIN_CHAT_ID, messageIds: [pausedMenu.message.message_id] },
       ]);
+    } finally {
+      harness.close();
+    }
+  });
+});
+
+describe("admin command, queue, and publication handlers", () => {
+  test("renders every dashboard command and paginates a populated queue", async () => {
+    const harness = createHarness();
+    try {
+      for (const [index, command] of ["start", "manage", "queue", "schedule", "whitelist", "authors", "health"].entries()) {
+        await harness.run(commandUpdate(300 + index, 300 + index, command));
+        expect(harness.lastSent().message.text.length).toBeGreaterThan(0);
+      }
+      expect(harness.calls.some((call) => call.method === "setMyCommands")).toBe(true);
+      for (let index = 0; index < 11; index += 1) harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1000 + index) }), NOW + index);
+      await harness.run(commandUpdate(310, 310, "queue"));
+      const firstPage = harness.lastSent();
+      expect(firstPage.message.text).toContain("items 1–10");
+      await harness.run(callbackUpdate(311, "queue-next", harness.callbackData(firstPage, "Next"), firstPage.message));
+      expect(harness.lastSent().message.text).toContain("items 11–11");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("manages whitelist and author prompts, including invalid input and confirmation", async () => {
+    const harness = createHarness();
+    try {
+      await harness.run(commandUpdate(320, 320, "whitelist"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(321, "whitelist-add", harness.callbackData(menu, "Add channel"), menu.message));
+      let question = harness.lastSent();
+      await harness.run(replyUpdate(322, 322, "not a channel", question.message));
+      expect(harness.lastSent().message.text).toContain("exact public");
+      await harness.run(replyUpdate(323, 323, "@valid_channel", question.message));
+      const confirmation = harness.lastSent();
+      expect(confirmation.message.text).toContain("Confirm whitelist");
+      await harness.run(callbackUpdate(324, "whitelist-confirm", harness.callbackData(confirmation, "Confirm"), confirmation.message));
+      expect(harness.policy.listChannels()).toHaveLength(1);
+
+      await harness.run(commandUpdate(325, 325, "authors"));
+      menu = harness.lastSent();
+      harness.policy.observeAuthor({ kind: "user", userId: asUserId(7), username: "observed_user", displayName: "Observed" }, NOW);
+      await harness.run(callbackUpdate(326, "alias-add", harness.callbackData(menu, "Set alias"), menu.message));
+      question = harness.lastSent();
+      await harness.run(replyUpdate(327, 327, "wrong-format", question.message));
+      expect(harness.lastSent().message.text).toContain("Use");
+      await harness.run(replyUpdate(328, 328, "@observed_user The Alias", question.message));
+      expect(harness.policy.listAuthors().find((author) => author.userId === 7)?.alias).toBe("The Alias");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("handles recovery prompts, safety review, and unauthorized private messages", async () => {
+    const harness = createHarness();
+    try {
+      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1) }), NOW);
+      await harness.run(commandUpdate(330, 330, "recover"));
+      const recoveryQuestion = harness.lastSent();
+      await harness.run(replyUpdate(331, 331, "88", recoveryQuestion.message));
+      expect(harness.sent.some((message) => message.message.text.includes("Recovered queue item #1"))).toBe(true);
+
+      harness.pending.upsert(snapshotFixture({ messageId: asMessageId(901) }), NOW, NOW);
+      harness.pending.markState(-1001234567890, 901, "quarantined_renewal_candidate", NOW, "renew-901", "renewal pending");
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(902) }), NOW).item;
+      harness.database.raw.query("INSERT INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, 0, ?, 903, 'age', ?, ?, 1, NULL, 'telegram_age_limit')").run(item.id, Number(QUEUE_CHAT_ID), NOW, NOW);
+      await harness.run(commandUpdate(332, 332, "manage"));
+      const dashboard = harness.lastSent();
+      await harness.run(callbackUpdate(333, "safety", harness.callbackData(dashboard, "Safety review"), dashboard.message));
+      expect(harness.lastSent().message.text).toContain("Safety review");
+
+      const stranger: User = { id: 99, is_bot: false, first_name: "Stranger" };
+      await harness.run(commandUpdate(334, 334, "queue"));
+      await harness.run({ update_id: 335, message: makeMessage(335, "hello", stranger) } as Update);
+      expect(harness.lastSent().message.text).toBe("Not authorized.");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("confirms retry, move, deletion, stale versions, and Telegram deletion outcomes", async () => {
+    const harness = createHarness();
+    try {
+      const first = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(950) }), NOW).item;
+      harness.queue.transition(first.id, "queued", "blocked", NOW, "manual", "review");
+      await harness.run(commandUpdate(340, 340, "queue"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(341, "retry", harness.callbackData(menu, "Retry #1"), menu.message));
+      let confirmation = harness.lastSent();
+      await harness.run(callbackUpdate(342, "retry-confirm", harness.callbackData(confirmation, "Confirm retry"), confirmation.message));
+      expect(harness.queue.findItemById(1)?.status).toBe("queued");
+
+      const second = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(951) }), NOW + 1).item;
+      await harness.run(commandUpdate(343, 343, "queue"));
+      menu = harness.lastSent();
+      await harness.run(callbackUpdate(344, "move", harness.callbackData(menu, `Move #${second.id}`), menu.message));
+      confirmation = harness.lastSent();
+      await harness.run(callbackUpdate(345, "move-confirm", harness.callbackData(confirmation, "Confirm move to end"), confirmation.message));
+      expect(harness.queue.findItemById(second.id)?.lastErrorCode).toBe("moved_to_end");
+
+      await harness.run(commandUpdate(346, 346, "queue"));
+      menu = harness.lastSent();
+      await harness.run(callbackUpdate(347, "delete", harness.callbackData(menu, "Delete #1"), menu.message));
+      confirmation = harness.lastSent();
+      await harness.run(callbackUpdate(348, "delete-confirm", harness.callbackData(confirmation, "Confirm delete #1"), confirmation.message));
+      expect(harness.queue.findItemById(1)?.status).toBe("deleted");
+
+      const stale = harness.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(952) }), NOW + 2).item;
+      const staleToken = harness.admin.createCallbackToken(ADMIN_ID, "queue_move_end", { itemId: stale.id }, NOW, stale.contentVersion);
+      harness.queue.updateSnapshot(QUEUE_CHAT_ID, 952, snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(952), editDate: NOW + 1, text: "changed" }));
+      await harness.run(callbackUpdate(349, "stale", `v1:${staleToken}`, makeMessage(349, "menu", BOT_INFO)));
+      expect(harness.lastSent().message.text).toContain("changed");
+
+      const missing = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(953) }), NOW + 3).item;
+      const missingToken = harness.admin.createCallbackToken(ADMIN_ID, "queue_delete_confirm", { itemId: missing.id }, NOW, missing.contentVersion);
+      harness.setDeleteFailure({ kind: "source_missing", description: "message not found" });
+      await harness.run(callbackUpdate(350, "missing", `v1:${missingToken}`, makeMessage(350, "menu", BOT_INFO)));
+      expect(harness.queue.findItemById(missing.id)?.status).toBe("deleted_external");
+
+      const denied = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(954) }), NOW + 4).item;
+      const deniedToken = harness.admin.createCallbackToken(ADMIN_ID, "queue_delete_confirm", { itemId: denied.id }, NOW, denied.contentVersion);
+      harness.setDeleteFailure({ kind: "permission_denied", description: "not enough rights" });
+      await harness.run(callbackUpdate(351, "denied", `v1:${deniedToken}`, makeMessage(351, "menu", BOT_INFO)));
+      expect(harness.lastSent().message.text).toContain("Deletion failed (permission_denied)");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test.each([
+    [{ kind: "cleanup_pending", itemId: 1, operationId: "op" }, "cleanup is pending"],
+    [{ kind: "retry_scheduled", itemId: 1, retryAt: NOW + 60_000 }, "retry is scheduled"],
+    [{ kind: "blocked", itemId: 1, status: "blocked", reason: "manual" }, "remains blocked"],
+    [{ kind: "failed", itemId: 1, status: "queued", error: "failed" }, "failed"],
+    [{ kind: "deleted_external", itemId: 1 }, "already missing"],
+    [{ kind: "empty" }, "queue is empty"],
+  ] as const)("renders publication outcome %s", async (outcome, expectedText) => {
+    const harness = createHarness(async () => outcome);
+    try {
+      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(980) }), NOW);
+      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW);
+      await harness.run(callbackUpdate(360, "outcome", `v1:${token}`, makeMessage(360, "menu", BOT_INFO)));
+      expect(harness.lastSent().message.text.toLowerCase()).toContain(expectedText);
     } finally {
       harness.close();
     }
