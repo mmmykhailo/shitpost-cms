@@ -1,7 +1,7 @@
 import type { Api } from "grammy";
 import type { Chat, ForceReply, InlineKeyboardMarkup, Message, MessageEntity as GrammyMessageEntity, ReplyKeyboardMarkup, ReplyKeyboardRemove } from "@grammyjs/types";
 import { classifyTelegramError } from "./errors";
-import type { ChatId, MessageId, MessageEntity, UserId } from "./types";
+import { asMessageId, type ChatId, type MessageId, type MessageEntity, type UserId } from "./types";
 
 export type ChatRef = ChatId | string;
 
@@ -85,13 +85,38 @@ export type TelegramGateway = {
   answerCallbackQuery(input: AnswerCallbackInput): Promise<void>;
 };
 
+const assertOutboundMessageId = (value: unknown, label: string): number => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a positive safe integer`);
+  return value;
+};
+
 const assertTransferIds = (messageIds: readonly MessageId[]): number[] => {
   if (messageIds.length < 1 || messageIds.length > 100) throw new Error("Telegram transfer requires 1–100 message IDs");
-  const numericIds = messageIds.map(Number);
+  const numericIds = messageIds.map((messageId, index) => assertOutboundMessageId(messageId, `Telegram transfer message ID at index ${index}`));
   for (let index = 1; index < numericIds.length; index += 1) {
     if (numericIds[index]! <= numericIds[index - 1]!) throw new Error("Telegram transfer message IDs must be strictly increasing");
   }
   return numericIds;
+};
+
+const ambiguousSendResult = (method: string, reason: string) => ({
+  kind: "ambiguous_send_result" as const,
+  method,
+  description: `Telegram ${method} returned an invalid message ID (${reason})`,
+});
+
+const returnedMessageId = (value: unknown, method: string, label: string): MessageId => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw ambiguousSendResult(method, `${label} is not a positive safe integer`);
+  return asMessageId(value);
+};
+
+const normalizeBulkTransferResult = (result: unknown, method: "copyMessages" | "forwardMessages", requestedCount: number): MessageId[] => {
+  if (!Array.isArray(result)) throw ambiguousSendResult(method, "response is not an array");
+  if (requestedCount > 0 && result.length === 0) throw ambiguousSendResult(method, "response is empty");
+  return result.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw ambiguousSendResult(method, `response element ${index} is not an object`);
+    return returnedMessageId((entry as { message_id?: unknown }).message_id, method, `response element ${index}`);
+  });
 };
 
 const toTelegramEntities = (entities: readonly MessageEntity[] | undefined): GrammyMessageEntity[] | undefined => entities?.map((entity) => {
@@ -130,17 +155,22 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
   const transfer = async (kind: "forward" | "copy", input: TransferMessagesInput): Promise<MessageId[]> => {
     const ids = assertTransferIds(input.messageIds);
     const options = input.disableNotification === undefined ? {} : { disable_notification: input.disableNotification };
-    const result = kind === "forward"
-      ? await call("forwardMessages", () => api.forwardMessages(input.targetChatId, input.sourceChatId, ids, options))
-      : await call("copyMessages", () => api.copyMessages(input.targetChatId, input.sourceChatId, ids, options));
-    return result.map((messageId) => messageId as unknown as MessageId);
+    const method = kind === "forward" ? "forwardMessages" : "copyMessages";
+    return call(method, async () => {
+      const result = kind === "forward"
+        ? await api.forwardMessages(input.targetChatId, input.sourceChatId, ids, options)
+        : await api.copyMessages(input.targetChatId, input.sourceChatId, ids, options);
+      return normalizeBulkTransferResult(result, method, ids.length);
+    });
   };
 
   const sendText = async (input: SendTextInput): Promise<MessageId> => {
     const entities = toTelegramEntities(input.entities);
     const options = entities === undefined ? {} : { entities };
-    const message = await call("sendMessage", () => api.sendMessage(input.chatId, input.text, options));
-    return message.message_id as unknown as MessageId;
+    return call("sendMessage", async () => {
+      const message = await api.sendMessage(input.chatId, input.text, options);
+      return returnedMessageId(message.message_id, "sendMessage", "response");
+    });
   };
 
   const editText = async (input: EditTextInput): Promise<void> => {
@@ -164,8 +194,10 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
     const options: { entities?: GrammyMessageEntity[]; reply_markup?: ReplyMarkup } = {};
     if (entities !== undefined) options.entities = entities;
     if (input.replyMarkup !== undefined) options.reply_markup = input.replyMarkup;
-    const message = await call("sendMessage", () => api.sendMessage(adminChatId, input.text, options));
-    return message.message_id as MessageId;
+    return call("sendMessage", async () => {
+      const message = await api.sendMessage(adminChatId, input.text, options);
+      return returnedMessageId(message.message_id, "sendMessage", "response");
+    });
   };
 
   const editAdminMessage = async (input: EditAdminMessageInput): Promise<void> => {
@@ -190,15 +222,20 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
     copyMessages: (input) => transfer("copy", input),
     forwardMessage: async (input) => {
       const options = input.disableNotification === undefined ? {} : { disable_notification: input.disableNotification };
-      return call("forwardMessage", () => api.forwardMessage(input.targetChatId, input.sourceChatId, input.messageId, options));
+      return call("forwardMessage", async () => {
+        const message = await api.forwardMessage(input.targetChatId, input.sourceChatId, input.messageId, options);
+        returnedMessageId(message.message_id, "forwardMessage", "response");
+        return message;
+      });
     },
     editText,
     editCaption,
     sendText,
     deleteMessages: async (chatId, messageIds) => {
       if (messageIds.length === 0) return;
-      for (let index = 0; index < messageIds.length; index += 100) {
-        const chunk = messageIds.slice(index, index + 100).map(Number);
+      const numericIds = messageIds.map((messageId, index) => assertOutboundMessageId(messageId, `Telegram deletion message ID at index ${index}`));
+      for (let index = 0; index < numericIds.length; index += 100) {
+        const chunk = numericIds.slice(index, index + 100);
         await call("deleteMessages", () => api.deleteMessages(chatId, chunk));
       }
     },
