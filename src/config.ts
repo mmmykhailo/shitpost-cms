@@ -11,6 +11,8 @@ export type AppConfig = {
   databasePath: string;
   dataDirectory: string;
   logLevel: LogLevel;
+  releaseSha: string;
+  runtimeStatusPath?: string;
 };
 
 const required = (environment: Record<string, string | undefined>, name: string): string => {
@@ -53,6 +55,16 @@ export const parseConfig = (
   if (!(["debug", "info", "warn", "error"] as const).includes(rawLogLevel as LogLevel)) {
     throw new Error("LOG_LEVEL must be one of debug, info, warn, error");
   }
+  const rawReleaseSha = environment.RELEASE_SHA?.trim() || undefined;
+  const runtimeStatusPath = environment.RUNTIME_STATUS_PATH?.trim() || undefined;
+  if (rawReleaseSha === undefined && runtimeStatusPath !== undefined) throw new Error("RELEASE_SHA is required when RUNTIME_STATUS_PATH is set");
+  if (rawReleaseSha !== undefined && runtimeStatusPath === undefined) throw new Error("RUNTIME_STATUS_PATH is required when RELEASE_SHA is set");
+  if (rawReleaseSha !== undefined && rawReleaseSha !== "development" && !/^[0-9a-f]{40}$/.test(rawReleaseSha)) {
+    throw new Error("RELEASE_SHA must be development or a 40-character lowercase hexadecimal SHA");
+  }
+  if (runtimeStatusPath !== undefined && (!isAbsolute(runtimeStatusPath) || runtimeStatusPath.includes("\0") || runtimeStatusPath.includes("\n"))) {
+    throw new Error("RUNTIME_STATUS_PATH must be an absolute path without control characters");
+  }
   return {
     botToken,
     adminUserId: asUserId(adminUserId),
@@ -61,5 +73,7 @@ export const parseConfig = (
     databasePath,
     dataDirectory: dirname(databasePath),
     logLevel: rawLogLevel as LogLevel,
+    releaseSha: rawReleaseSha ?? "development",
+    ...(runtimeStatusPath === undefined ? {} : { runtimeStatusPath }),
   };
 };

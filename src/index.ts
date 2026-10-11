@@ -25,6 +25,7 @@ import { abortableSleep, createOperationTracker, createTaskSupervisor } from "./
 import { registerAdminHandlers } from "./handlers/admin";
 import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
+import { createRuntimeStatusWriter } from "./runtime-status";
 import { systemClock, type UserId } from "./types";
 
 const RENEWAL_INTERVAL_MS = 15 * 60_000;
@@ -49,10 +50,23 @@ const main = async (): Promise<void> => {
   const runtime = createRuntimeLease(database, `${process.pid}-${bootId}`, systemClock);
   const supervisor = createTaskSupervisor({ logger });
   const operationTracker = createOperationTracker();
+  const runtimeStatus = createRuntimeStatusWriter({
+    releaseSha: config.releaseSha,
+    pid: process.pid,
+    processStartedAt: new Date(bootStartedAt).toISOString(),
+    ...(config.runtimeStatusPath === undefined ? {} : { path: config.runtimeStatusPath }),
+  });
   if (!runtime.acquire()) {
     logger.error("singleton_conflict", { error: "Another healthy queue bot process owns the database" });
     database.close();
     return;
+  }
+  try {
+    runtimeStatus.writeStarting();
+  } catch (error) {
+    runtime.release();
+    database.close();
+    throw error;
   }
   queue.setBootId(bootId);
   database.raw.query("UPDATE app_state SET current_boot_id = ? WHERE id = 1").run(bootId);
@@ -83,6 +97,11 @@ const main = async (): Promise<void> => {
       logger.info("shutdown_started", { signal });
       const shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
       try {
+        runtimeStatus.writeStopping();
+      } catch (error) {
+        logger.error("runtime_status_write_failed", { state: "stopping", error: safeErrorDescription(error) });
+      }
+      try {
         await bot.stop();
       } catch (error) {
         logger.warn("bot_stop_failed", { error: safeErrorDescription(error) });
@@ -111,6 +130,12 @@ const main = async (): Promise<void> => {
         if (!clean || !checkpointed) process.exitCode = 1;
         runtime.release();
         database.close();
+        try {
+          runtimeStatus.remove();
+        } catch (error) {
+          logger.error("runtime_status_remove_failed", { error: safeErrorDescription(error) });
+          process.exitCode = 1;
+        }
       }
     })();
     return shutdownPromise;
@@ -309,8 +334,9 @@ const main = async (): Promise<void> => {
   try {
     pollingPromise = bot.start({
       allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"],
-      onStart: async () => {
+      onStart: async (botInfo) => {
         startBackgroundWork();
+        runtimeStatus.writeReady(botInfo.id);
       },
     });
     await pollingPromise;
