@@ -189,12 +189,14 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
 
-  const sendSchedule = async (ctx: Context): Promise<void> => {
+  const sendSchedule = async (ctx: Context, notice?: string): Promise<void> => {
     const slots = deps.schedule.slots();
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Add UTC slot", "slot_add"), await button(deps, deps.schedule.enabled() ? "Pause" : "Resume", deps.schedule.enabled() ? "schedule_pause" : "schedule_resume")]];
     for (const slot of slots) rows.push([await button(deps, `Remove ${formatUtcSlot(slot)}`, "slot_remove", { minuteOfDay: slot })]);
     rows.push([await button(deps, "Back", "dashboard")]);
-    await ctx.reply(`Schedule is ${deps.schedule.enabled() ? "running" : "paused"}. Slots: ${slots.map(formatUtcSlot).join(", ") || "none"}`, { reply_markup: keyboard(rows) });
+    const lines = [`Schedule is ${deps.schedule.enabled() ? "running" : "paused"}. Slots: ${slots.map(formatUtcSlot).join(", ") || "none"}`];
+    if (notice !== undefined) lines.unshift(notice);
+    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
 
   const sendWhitelist = async (ctx: Context): Promise<void> => {
@@ -206,13 +208,14 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await ctx.reply(text, { reply_markup: keyboard(rows) });
   };
 
-  const sendAuthors = async (ctx: Context): Promise<void> => {
+  const sendAuthors = async (ctx: Context, notice?: string): Promise<void> => {
     const authors = deps.policy.listAuthors();
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set alias", "alias_add")]];
     for (const author of authors.filter((entry) => entry.alias).slice(0, 20)) rows.push([await button(deps, `Remove alias ${author.userId}`, "alias_remove", { userId: author.userId })]);
     rows.push([await button(deps, "Back", "dashboard")]);
-    const text = ["Observed authors", ...authors.slice(0, 20).map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)].join("\n");
-    await ctx.reply(text, { reply_markup: keyboard(rows) });
+    const lines = ["Observed authors", ...authors.slice(0, 20).map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
+    if (notice !== undefined) lines.unshift(notice);
+    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
 
   const sendHealth = async (ctx: Context): Promise<void> => {
@@ -235,9 +238,15 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const slot = parseUtcSlot(text);
         deps.schedule.addSlot(slot, deps.config.adminUserId, deps.now());
         deps.admin.clearPrompt(deps.config.adminUserId);
-        await ctx.reply(`Added ${formatUtcSlot(slot)}. Scheduling remains ${deps.schedule.enabled() ? "running" : "paused"}.`);
+        await sendSchedule(ctx, `Added ${formatUtcSlot(slot)}.`);
       } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Invalid UTC slot. Use HH:MM.");
+        const message = error instanceof Error ? error.message : "Invalid UTC slot. Use HH:MM.";
+        await beginPrompt(ctx, {
+          kind: "slot_add",
+          state: prompt.state,
+          text: `${message}\nReply with the daily UTC slot as HH:MM.`,
+          placeholder: "HH:MM UTC",
+        });
       }
       return true;
     }
@@ -268,7 +277,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const key = /^-?\d+$/.test(match[1]!) ? Number(match[1]) : match[1]!;
         deps.policy.setAlias(key, validateAlias(match[2]!), deps.config.adminUserId, deps.now());
         deps.admin.clearPrompt(deps.config.adminUserId);
-        await ctx.reply("Author alias saved.");
+        await sendAuthors(ctx, "Author alias saved.");
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Could not save alias. Observe the user in a queue post first.");
       }
@@ -280,6 +289,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         deps.admin.clearPrompt(deps.config.adminUserId);
         deps.admin.audit("recovery_completed", String(deps.config.adminUserId), deps.now(), recovered.itemId, undefined, { sourceIds: recovered.sourceIds });
         await ctx.reply(`Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}. Telegram history remains explicit; verify the supplied IDs covered the intended post.`);
+        await sendQueue(ctx);
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Recovery failed; no queue item was confirmed.");
       }
@@ -309,6 +319,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           else deps.queue.adoptConfirmedPublicationOutputs(itemId, operationId, item.contentVersion, sourceGeneration, deps.config.targetChannelId, ids, deps.now());
           deps.admin.clearPrompt(deps.config.adminUserId);
           await ctx.reply(prompt.kind === "renewal_adopt" ? `Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.` : `Adopted the exact destination IDs for queue item #${itemId}; source cleanup remains durable and retryable.`);
+          await sendQueue(ctx);
         } else {
           const ids = parseMessageIds(text.trim());
           try {
@@ -324,6 +335,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           }
           deps.admin.clearPrompt(deps.config.adminUserId);
           await ctx.reply(`Recorded explicit cleanup handling for queue item #${itemId}.`);
+          await sendQueue(ctx);
         }
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Could not apply that renewal resolution.");
@@ -367,11 +379,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
         return sendDashboard(ctx);
       }
-      case "slot_add": deps.admin.setPrompt(deps.config.adminUserId, "slot_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send the exact daily UTC slot as HH:MM.");
+      case "slot_add": return beginPrompt(ctx, { kind: "slot_add", state: {}, text: "Reply with the daily UTC slot as HH:MM.", placeholder: "HH:MM UTC" });
       case "slot_remove": if (typeof payload.minuteOfDay === "number") deps.schedule.removeSlot(payload.minuteOfDay, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
       case "schedule_pause": deps.schedule.setEnabled(false, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
-      case "schedule_resume": if (deps.schedule.slots().length === 0) return ctx.reply("Add at least one UTC slot first."); deps.schedule.setEnabled(true, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
-      case "whitelist_add": deps.admin.setPrompt(deps.config.adminUserId, "whitelist_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send an exact public @handle or numeric channel ID.");
+      case "schedule_resume": if (deps.schedule.slots().length === 0) return sendSchedule(ctx, "Add at least one UTC slot before resuming."); deps.schedule.setEnabled(true, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
+      case "whitelist_add": return beginPrompt(ctx, { kind: "whitelist_add", state: {}, text: "Reply with an exact public @handle or numeric channel ID.", placeholder: "@channel or numeric ID" });
       case "whitelist_confirm": {
         if (typeof payload.chatId !== "number") return ctx.reply("Invalid confirmation payload.");
         deps.policy.upsertChannel(payload.chatId, typeof payload.username === "string" ? payload.username : undefined, typeof payload.title === "string" ? payload.title : undefined, deps.config.adminUserId, deps.now());
@@ -382,7 +394,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         return ctx.reply("Remove this numeric channel from the whitelist?", { reply_markup: keyboard([[await button(deps, "Confirm removal", "whitelist_remove_execute", { chatId: payload.chatId })], [await button(deps, "Cancel", "whitelist")]]) });
       }
       case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId, deps.config.adminUserId, deps.now()); return sendWhitelist(ctx);
-      case "alias_add": deps.admin.setPrompt(deps.config.adminUserId, "alias_add", {}, ctx.callbackQuery?.message?.message_id, deps.now()); return ctx.reply("Send `<user id or @observed_username> <alias>`.");
+      case "alias_add": return beginPrompt(ctx, { kind: "alias_add", state: {}, text: "Reply with a user ID or @observed_username followed by the alias.", placeholder: "user and alias" });
       case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId, deps.config.adminUserId, deps.now()); return sendAuthors(ctx);
       case "queue_retry": {
         if (itemId === undefined) return ctx.reply("Invalid queue item.");
@@ -450,8 +462,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       case "uncertain_publish_adopt_prompt":
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
-        deps.admin.setPrompt(deps.config.adminUserId, "uncertain_publish_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
-        return ctx.reply(`Reply with exactly ${payload.expectedCount} destination message IDs in Telegram order, separated by spaces or commas.`);
+        return beginPrompt(ctx, {
+          kind: "uncertain_publish_adopt",
+          state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase },
+          text: `Reply with exactly ${payload.expectedCount} destination message IDs in Telegram order, separated by spaces or commas.`,
+          placeholder: "message IDs",
+        });
       case "uncertain_publish_delete_retry": {
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
@@ -495,12 +511,20 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       case "renewal_adopt_prompt":
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
-        deps.admin.setPrompt(deps.config.adminUserId, "renewal_adopt", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
-        return ctx.reply(`Reply with exactly ${payload.expectedCount} replacement message IDs in Telegram order, separated by spaces or commas.`);
+        return beginPrompt(ctx, {
+          kind: "renewal_adopt",
+          state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase },
+          text: `Reply with exactly ${payload.expectedCount} replacement message IDs in Telegram order, separated by spaces or commas.`,
+          placeholder: "message IDs",
+        });
       case "renewal_cleanup_prompt":
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
-        deps.admin.setPrompt(deps.config.adminUserId, "renewal_manual_cleanup", { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, phase: payload.phase }, ctx.callbackQuery?.message?.message_id, deps.now());
-        return ctx.reply("Reply with the exact replacement message IDs to delete or retry, in Telegram order. The item remains blocked until this explicit cleanup decision is recorded.");
+        return beginPrompt(ctx, {
+          kind: "renewal_manual_cleanup",
+          state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, phase: payload.phase },
+          text: "Reply with the exact replacement message IDs to delete or retry, in Telegram order. The item remains blocked until this explicit cleanup decision is recorded.",
+          placeholder: "message IDs",
+        });
       case "renewal_no_replacement": {
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
@@ -584,7 +608,14 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   command("whitelist", sendWhitelist);
   command("authors", sendAuthors);
   command("health", sendHealth);
-  command("recover", async (ctx) => { deps.admin.setPrompt(deps.config.adminUserId, "recover", {}, ctx.message?.message_id, deps.now()); await ctx.reply("Recovery accepts a configured queue-channel message link or explicit message ID. This flow is intentionally explicit because Telegram cannot enumerate missed history."); });
+  command("recover", async (ctx) => {
+    await beginPrompt(ctx, {
+      kind: "recover",
+      state: {},
+      text: "Recovery accepts a configured queue-channel message link or explicit message ID. This flow is intentionally explicit because Telegram cannot enumerate missed history.",
+      placeholder: "queue link or message ID",
+    });
+  });
   command("cancel", async (ctx) => { deps.admin.clearPrompt(deps.config.adminUserId); await ctx.reply("Pending admin prompt cancelled."); });
 
   bot.callbackQuery(/.*/, handleCallback);
