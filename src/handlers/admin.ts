@@ -16,7 +16,7 @@ import type { SchedulerService } from "../services/scheduler";
 import type { RecoveryService } from "../services/recovery";
 import type { HealthService } from "../services/health";
 import type { OperationTracker } from "../services/task-supervisor";
-import type { ChatId, MessageId, UserId } from "../types";
+import { asChatId, asMessageId, type ChatId, type MessageId, type UserId } from "../types";
 
 type AdminDeps = {
   config: AppConfig;
@@ -34,6 +34,13 @@ type AdminDeps = {
   logger: Logger;
   operationTracker?: OperationTracker;
   now: () => number;
+};
+
+type PromptSpec = {
+  kind: string;
+  state: unknown;
+  text: string;
+  placeholder?: string;
 };
 
 const cleanDisplay = (value: string | undefined): string => (value ?? "").replace(/[\u0000-\u001F\u007F]/gu, " ").slice(0, 120);
@@ -76,6 +83,56 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   const reject = async (ctx: Context): Promise<void> => {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Not authorized", show_alert: true });
     else if (ctx.chat?.type === "private") await ctx.reply("Not authorized.");
+  };
+
+  const beginPrompt = async (ctx: Context, spec: PromptSpec): Promise<void> => {
+    const question = await ctx.reply(spec.text, {
+      reply_markup: {
+        force_reply: true,
+        ...(spec.placeholder === undefined ? {} : { input_field_placeholder: spec.placeholder }),
+      },
+    });
+    const questionChatId = asChatId(question.chat.id);
+    const questionMessageId = asMessageId(question.message_id);
+    try {
+      deps.admin.setPrompt(
+        deps.config.adminUserId,
+        spec.kind,
+        spec.state,
+        questionMessageId,
+        deps.now(),
+      );
+    } catch (error) {
+      try {
+        await deps.gateway.deleteMessages(questionChatId, [questionMessageId]);
+      } catch (cleanupError) {
+        deps.logger.warn("admin_prompt_delete_failed", {
+          chatId: questionChatId,
+          messageId: questionMessageId,
+          errorKind: classifyTelegramError(cleanupError).kind,
+        });
+      }
+      throw error;
+    }
+  };
+
+  const deleteCallbackMenu = async (ctx: Context, action: string): Promise<void> => {
+    const message = ctx.callbackQuery?.message;
+    if (!message) return;
+    const chatId = asChatId(message.chat.id);
+    const messageId = asMessageId(message.message_id);
+    try {
+      await deps.gateway.deleteMessages(chatId, [messageId]);
+    } catch (error) {
+      const normalized = classifyTelegramError(error);
+      if (normalized.kind === "source_missing") return;
+      deps.logger.warn("admin_menu_delete_failed", {
+        chatId,
+        messageId,
+        action,
+        errorKind: normalized.kind,
+      });
+    }
   };
 
   const dashboardKeyboard = async (): Promise<InlineKeyboardMarkup> => keyboard([
@@ -284,6 +341,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const token = data.slice(3);
     const resolved = deps.admin.consumeCallbackToken(deps.config.adminUserId, token, deps.now());
     if (!resolved) return ctx.reply("This action expired. Open the dashboard again.");
+    await deleteCallbackMenu(ctx, resolved.action);
     const payload = (resolved.payload && typeof resolved.payload === "object" ? resolved.payload : {}) as Record<string, unknown>;
     const itemId = typeof payload.itemId === "number" ? payload.itemId : undefined;
     if (itemId !== undefined && resolved.itemVersion !== undefined && deps.queue.findItemById(itemId)?.contentVersion !== resolved.itemVersion) return ctx.reply("This queue item changed. Open the queue again.");
