@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import * as ts from "typescript";
 
@@ -249,11 +249,13 @@ export const formatCoverageReport = (report: CoverageReport): string => {
   return lines.join("\n");
 };
 
-export const runCoverageGate = (options: { root?: string; coveragePath?: string } = {}): CoverageReport => {
+export const runCoverageGate = (options: { root?: string; coveragePath?: string; summaryPath?: string } = {}): CoverageReport => {
   const root = options.root ?? process.cwd();
   const coveragePath = resolve(root, options.coveragePath ?? process.env.COVERAGE_FILE?.trim() ?? "coverage/lcov.info");
   const report = evaluateCoverage({ lcov: readFileSync(coveragePath, "utf8"), sourceFiles: inventorySourceFiles(root), root });
-  console.log(formatCoverageReport(report));
+  const summary = formatCoverageReport(report);
+  if (options.summaryPath !== undefined) writeFileSync(resolve(root, options.summaryPath), `${summary}\n`);
+  console.log(summary);
   if (report.failures.length > 0) throw new Error("coverage gate failed");
   return report;
 };

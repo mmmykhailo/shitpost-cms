@@ -5,6 +5,7 @@ import { runCoverageGate } from "./check-coverage";
 const root = process.cwd();
 const coverageDirectory = resolve(root, "coverage");
 const lcovPath = resolve(coverageDirectory, "lcov.info");
+const summaryPath = resolve(coverageDirectory, "summary.txt");
 
 rmSync(coverageDirectory, { recursive: true, force: true });
 mkdirSync(coverageDirectory, { recursive: true });
@@ -18,7 +19,7 @@ if (!processResult.success) {
   process.exitCode = processResult.exitCode ?? 1;
 } else {
   try {
-    runCoverageGate({ root, coveragePath: lcovPath });
+    runCoverageGate({ root, coveragePath: lcovPath, summaryPath });
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
