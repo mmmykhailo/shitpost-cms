@@ -63,7 +63,10 @@ done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.sqlite' -print | sort)
 UNMARKED_COUNT=0
 UNMARKED_BACKUPS=()
 for backup_name in "${BACKUPS[@]}"; do
-  [[ "$backup_name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{40}(\.[0-9]+)?\.sqlite$ ]] || fail "unexpected backup filename: $backup_name"
+  # The application writes bot-<ISO timestamp>.sqlite backups to this same
+  # directory; deployment backups use the release timestamp/SHA format.
+  [[ "$backup_name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{40}(\.[0-9]+)?\.sqlite$ ||
+    "$backup_name" =~ ^bot-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3}Z\.sqlite$ ]] || fail "unexpected backup filename: $backup_name"
   if [ -e "$BACKUP_DIR/${backup_name}.keep" ]; then
     continue
   fi

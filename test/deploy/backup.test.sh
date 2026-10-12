@@ -19,7 +19,12 @@ sqlite3 "$FAKE_ROOT/data/bot.sqlite" 'PRAGMA journal_mode=WAL; CREATE TABLE queu
 DATABASE_PATH="$FAKE_ROOT/data/bot.sqlite" RELEASE_SHA="$BASE_RELEASE_SHA" "$SCRIPT_PATH"
 
 readonly BACKUP_DIR="$FAKE_ROOT/data/backups"
-readonly FIRST_BACKUP="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.sqlite' -print | head -n 1)"
+readonly APPLICATION_BACKUP="$BACKUP_DIR/bot-2026-10-12T08-24-20-665Z.sqlite"
+sqlite3 "$FAKE_ROOT/data/bot.sqlite" ".backup $APPLICATION_BACKUP"
+chmod 0600 "$APPLICATION_BACKUP"
+DATABASE_PATH="$FAKE_ROOT/data/bot.sqlite" RELEASE_SHA="$BASE_RELEASE_SHA" "$SCRIPT_PATH"
+
+readonly FIRST_BACKUP="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "*-${BASE_RELEASE_SHA}.sqlite" -print | head -n 1)"
 [ -n "$FIRST_BACKUP" ]
 [ -f "${FIRST_BACKUP}.meta" ]
 sqlite3 "$FIRST_BACKUP" 'PRAGMA integrity_check;' | grep -qx ok
@@ -42,4 +47,4 @@ if DATABASE_PATH="$FAKE_ROOT/data/bot.sqlite" RELEASE_SHA="$BASE_RELEASE_SHA" "$
   exit 1
 fi
 
-printf 'SQLite pre-start backup, integrity, rotation, and keep-marker tests passed\n'
+printf 'SQLite pre-start backup, integrity, rotation, keep-marker, and application-backup compatibility tests passed\n'
