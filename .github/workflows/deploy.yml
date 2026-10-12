@@ -164,8 +164,12 @@ jobs:
           ssh_dir="$RUNNER_TEMP/deploy-ssh"
           mkdir -p "$ssh_dir"
           chmod 0700 "$ssh_dir"
-          printf '%s' "$VPS_SSH_KEY" > "$ssh_dir/id_deploy"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$ssh_dir/id_deploy"
           chmod 0600 "$ssh_dir/id_deploy"
+          if ! ssh-keygen -p -P '' -N '' -f "$ssh_dir/id_deploy" >/dev/null 2>&1; then
+            printf '%s\n' 'VPS_SSH_KEY must be a readable, passphrase-free private key' >&2
+            exit 1
+          fi
           ssh-keygen -y -P '' -f "$ssh_dir/id_deploy" > "$ssh_dir/id_deploy.pub"
           chmod 0644 "$ssh_dir/id_deploy.pub"
           printf 'CI deploy key fingerprint: '
