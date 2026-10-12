@@ -23,7 +23,7 @@ fail() {
 [[ "$APP_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "APP_USER is invalid"
 [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "DEPLOY_USER is invalid"
 [[ "$ROOT_DIR" == /* ]] || fail "ROOT_DIR must be an absolute path"
-[[ "$ROOT_DIR" != *$'\n'* && "$ROOT_DIR" != *$'\r'* && "$ROOT_DIR" != *$'\0'* ]] || fail "ROOT_DIR contains control characters"
+[[ "$ROOT_DIR" != *$'\n'* && "$ROOT_DIR" != *$'\r'* ]] || fail "ROOT_DIR contains control characters"
 [[ "$ROOT_DIR" != *[[:space:]]* ]] || fail "ROOT_DIR must not contain whitespace"
 case "$SKIP_UFW" in
   0|1) ;;
