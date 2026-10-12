@@ -243,15 +243,14 @@ jobs:
           manifest_file="$RUNNER_TEMP/release-manifest.json"
           printf '{"sha":"%s","deployedAt":"%s","bunVersion":"1.3.4","filesChecksum":"%s"}\n' "$GITHUB_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files_checksum" > "$manifest_file"
           rsync -az --delete --chmod=D755,F644 \
-            --exclude='*' \
-            --include='/src/***' \
-            --include='/deploy/***' \
-            --include='/package.json' \
-            --include='/bun.lock' \
-            --include='/bunfig.toml' \
-            --include='/tsconfig.json' \
             -e "ssh -F $ssh_dir/config" \
-            ./ "vps:$release_dir/"
+            src/ "vps:$release_dir/src/"
+          rsync -az --delete --chmod=D755,F644 \
+            -e "ssh -F $ssh_dir/config" \
+            deploy/ "vps:$release_dir/deploy/"
+          rsync -az --chmod=F644 \
+            -e "ssh -F $ssh_dir/config" \
+            package.json bun.lock bunfig.toml tsconfig.json "vps:$release_dir/"
           rsync -az --chmod=F644 -e "ssh -F $ssh_dir/config" "$manifest_file" "vps:$release_dir/release-manifest.json"
           ssh -F "$ssh_dir/config" vps "chmod 0755 '$release_dir'/deploy/*.sh"
 
