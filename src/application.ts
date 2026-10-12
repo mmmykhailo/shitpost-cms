@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Bot } from "grammy";
 import { parseConfig, type AppConfig } from "./config";
+import { classifyTelegramError } from "./errors";
 import { createLogger, safeErrorDescription, type Logger } from "./logger";
 import { createDatabase, type AppDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
@@ -31,6 +32,8 @@ import { systemClock, type Clock, type UserId } from "./types";
 const RENEWAL_INTERVAL_MS = 15 * 60_000;
 const RENEWAL_START_AGE_MS = 36 * 60 * 60_000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
+const STARTUP_CHECK_ATTEMPTS = 3;
+const STARTUP_CHECK_RETRYABLE_KINDS = new Set(["rate_limited", "transient_network", "transient_server"]);
 
 type ApplicationProcess = {
   pid: number;
@@ -195,7 +198,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     processLike.once("SIGTERM", () => { void shutdown("SIGTERM"); });
   }
 
-  try {
+  const validateTelegramStartup = async (): Promise<void> => {
     const identity = await gateway.getBotIdentity();
     validatedBotId = identity.id;
     database.raw.query("UPDATE app_state SET bot_id = ?, bot_username = ? WHERE id = 1").run(identity.id, identity.username ?? null);
@@ -207,8 +210,25 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     lastSuccessfulRightsCheckAt = clock.now();
     currentRights = { queue: queueMembership, target: targetMembership };
     logger.info("telegram_rights_validated", { botId: identity.id, queueChatId: config.queueChannelId, targetChatId: config.targetChannelId });
+  };
+
+  try {
+    for (let attempt = 1; attempt <= STARTUP_CHECK_ATTEMPTS; attempt += 1) {
+      try {
+        await validateTelegramStartup();
+        break;
+      } catch (error) {
+        const normalized = classifyTelegramError(error);
+        const retryable = STARTUP_CHECK_RETRYABLE_KINDS.has(normalized.kind);
+        if (!retryable || attempt === STARTUP_CHECK_ATTEMPTS) throw error;
+        const delay = Math.min(10_000, Math.max(1_000 * (2 ** (attempt - 1)), (normalized.retryAfterSeconds ?? 0) * 1_000));
+        logger.warn("startup_rights_check_retry", { attempt, delayMs: delay, kind: normalized.kind, method: normalized.method, error: safeErrorDescription(error) });
+        await clock.sleep(delay);
+      }
+    }
   } catch (error) {
-    logger.error("startup_rights_check_failed", { error: safeErrorDescription(error) });
+    const normalized = classifyTelegramError(error);
+    logger.error("startup_rights_check_failed", { kind: normalized.kind, method: normalized.method, error: safeErrorDescription(error) });
     try { await gateway.sendAdminMessage({ chatId: adminChatId, text: `Queue bot cannot start: ${safeErrorDescription(error)}` }); }
     catch (alertError) { logger.error("startup_admin_alert_failed", { error: safeErrorDescription(alertError) }); }
     await shutdown("startup_failure");

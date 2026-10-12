@@ -293,5 +293,6 @@ describe("stored-data validation matrix", () => {
     for (const value of values) expect(classifyTelegramError(value).kind).toBeDefined();
     expect(classifyTelegramError({ kind: "source_missing", description: "missing" }, "deleteMessages")).toMatchObject({ kind: "source_missing", method: "deleteMessages" });
     expect(safeErrorDescription(new Error("123456:abcdefghijklmnopqrstuvwxyz-_"))).toBe("[redacted]");
+    expect(safeErrorDescription({ kind: "permission_denied", description: "Forbidden: bot was kicked" })).toBe("Forbidden: bot was kicked");
   });
 });
