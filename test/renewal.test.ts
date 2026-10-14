@@ -95,7 +95,24 @@ describe("renewal service", () => {
     if (expectedKind === "deleted_external") expect(queue.findItemById(1)?.status).toBe("deleted_external");
     if (expectedKind === "uncertain") expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
     if (expectedKind === "blocked") expect(queue.findItemById(1)?.maintenanceStatus).toBe("idle");
+    if (expectedKind === "blocked") expect(queue.findItemById(1)?.maintenanceRetryNotBefore).toBe(160_000);
     if (expectedKind === "retry_scheduled") expect(result.kind === "retry_scheduled" && result.retryAt).toBeGreaterThan(100_000);
+  });
+
+  test("keeps the complete Telegram flood wait on the item retry deadline", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async () => { throw { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 }; },
+    };
+    const { queue, renewal } = open(gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(481), telegramDate: 0, origin: { kind: "absent" } }), 1);
+
+    const result = await renewal.renewNext(36_000);
+
+    expect(result.kind).toBe("retry_scheduled");
+    expect(result.kind === "retry_scheduled" && result.retryAt).toBeGreaterThanOrEqual(1_900_000);
+    expect(queue.findItemById(1)?.maintenanceRetryNotBefore).toBe(result.kind === "retry_scheduled" ? result.retryAt : undefined);
   });
 
   test("quarantines malformed replacement IDs as an ambiguous result", async () => {
@@ -110,17 +127,19 @@ describe("renewal service", () => {
     expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
   });
 
-  test("quarantines a partial replacement when known output cleanup is ambiguous", async () => {
+  test("preserves originals and replacement evidence when an album replacement is partial", async () => {
     const fake = gatewayWithDeleteFailure("transient_network", true);
     const { queue, database } = open(fake.gateway);
     const first = snapshotFixture({ messageId: asMessageId(45), mediaGroupId: "renewal-album", telegramDate: 0, origin: { kind: "absent" } });
     const second = snapshotFixture({ messageId: asMessageId(46), mediaGroupId: "renewal-album", telegramDate: 0, origin: { kind: "absent" } });
+    const third = snapshotFixture({ messageId: asMessageId(47), mediaGroupId: "renewal-album", telegramDate: 0, origin: { kind: "absent" } });
     const album = queue.observeQueueSnapshot(first, 1).item;
     queue.addAlbumMember(album.id, second, 1);
+    queue.addAlbumMember(album.id, third, 1);
     queue.finalizeAlbums(100_000);
     const partialGateway: TelegramGateway = {
       ...fake.gateway,
-      copyMessages: async () => [asMessageId(910)],
+      copyMessages: async () => { fake.calls.push("copy"); return [asMessageId(910), asMessageId(911)]; },
     };
     const partialRenewal = createRenewalService({
       queue,
@@ -133,7 +152,15 @@ describe("renewal service", () => {
       operationId: () => "renew-partial",
     });
     expect((await partialRenewal.renewNext(36_000)).kind).toBe("uncertain");
-    expect(queue.findItemById(1)?.maintenanceStatus).toBe("uncertain_renewal");
+    const item = queue.findItemById(1);
+    expect(item?.status).toBe("queued");
+    expect(item?.maintenanceStatus).toBe("uncertain_renewal");
+    expect(queue.currentSourceIds(1)).toEqual([asMessageId(45), asMessageId(46), asMessageId(47)]);
+    expect(queue.operationEvidence(1)?.knownReplacementIds).toEqual([asMessageId(910), asMessageId(911)]);
+    expect(fake.calls).toEqual(["copy"]);
+    expect(item?.lastErrorCode).toBe("partial_replacement");
+    expect(item?.lastError).toContain("expected 3");
+    expect(item?.lastError).toContain("received 2");
   });
 
   test("copies originless queue posts into a new generation and cleans the old source", async () => {

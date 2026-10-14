@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { validateOrderedMessageIds } from "../domain/validation";
+import { RENEWAL_ITEM_RETRY_MS } from "../domain/renewal-policy";
 import { classifyTelegramError } from "../errors";
 import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } from "../db/repositories";
 import type { Logger } from "../logger";
@@ -58,7 +60,7 @@ export const createRenewalService = (input: {
       return { kind: "deleted_external", itemId: claimed.item.id };
     }
     if (error.kind === "rate_limited") {
-      const retryAt = now + Math.min((error.retryAfterSeconds ?? 60) * 1000 + Math.floor(Math.random() * 500), 300_000);
+      const retryAt = now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000) + Math.floor(Math.random() * 500);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt };
     }
@@ -68,7 +70,7 @@ export const createRenewalService = (input: {
     }
     // Renewal is physical maintenance. A definite rejection must not alter the
     // logical publication status captured at claim time.
-    input.queue.failRenewal(claimed.item.id, claimed.operationId, now, error.kind, error.description);
+    input.queue.setRetry(claimed.item.id, claimed.operationId, now, now + RENEWAL_ITEM_RETRY_MS, error.kind, error.description);
     return { kind: "blocked", itemId: claimed.item.id, reason: error.kind };
   };
 
@@ -113,35 +115,40 @@ export const createRenewalService = (input: {
         ? await input.gateway.copyMessages(transferInput)
         : await input.gateway.forwardMessages(transferInput);
 
+      let validatedReplacementIds: MessageId[] | undefined;
+      let validationError: unknown;
+      try { validatedReplacementIds = validateOrderedMessageIds(replacementIds, "renewal replacement IDs"); }
+      catch (error) { validationError = error; }
+
       // Persist every known result before doing any state transition. The
       // ingestion layer also treats these IDs as candidates if Telegram emits
       // the channel update before this process sees the response.
+      const recordedIds = new Set<number>();
       for (const [ordinal, messageId] of replacementIds.entries()) {
-        input.queue.recordReplacementOutput(claimed.operationId, input.queueChannelId, messageId, ordinal, input.clock.now());
-      }
-
-      if (replacementIds.length !== oldSourceIds.length) {
+        if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0 || recordedIds.has(messageId)) continue;
         try {
-          await input.gateway.deleteMessages(input.queueChannelId, replacementIds);
-          // A confirmed short result means at least one source member did not
-          // receive a replacement. Remove the remaining old members best effort
-          // and classify the logical item as externally deleted.
-          const missingOldIds = oldSourceIds.slice(replacementIds.length);
-          if (missingOldIds.length > 0) {
-            try { await input.gateway.deleteMessages(input.queueChannelId, missingOldIds); }
-            catch (cleanupError) { input.logger.warn("missing_renewal_members_cleanup_failed", { itemId: claimed.item.id, error: classifyTelegramError(cleanupError).kind }); }
-          }
-          input.queue.markMissing(claimed.item.id, claimed.operationId, input.clock.now());
-          return { kind: "deleted_external", itemId: claimed.item.id };
-        } catch (cleanupError) {
-          const normalized = classifyTelegramError(cleanupError);
-          input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "partial_cleanup", normalized.description);
+          input.queue.recordReplacementOutput(claimed.operationId, input.queueChannelId, messageId, ordinal, input.clock.now());
+          recordedIds.add(messageId);
+        } catch (error) {
+          const description = `Replacement output ${messageId} could not be safely recorded: ${error instanceof Error ? error.message : "unknown storage error"}`;
+          input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "ambiguous_send_result", description);
           return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
         }
       }
 
+      if (replacementIds.length !== oldSourceIds.length) {
+        const description = `Incomplete replacement: expected ${oldSourceIds.length} messages but received ${replacementIds.length}; known replacement IDs: ${[...recordedIds].join(", ") || "none"}. Originals remain current pending review.`;
+        input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "partial_replacement", description);
+        return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
+      }
+      if (validatedReplacementIds === undefined) {
+        const description = validationError instanceof Error ? validationError.message : "Replacement message IDs were invalid or out of order";
+        input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "ambiguous_send_result", description);
+        return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
+      }
+
       input.queue.markReplacementOutputsRecorded(guard, input.clock.now());
-      const nextSnapshots = replacementSnapshots(snapshots, replacementIds, input.clock.now());
+      const nextSnapshots = replacementSnapshots(snapshots, validatedReplacementIds, input.clock.now());
       const generation = input.queue.installRenewedGeneration(guard, nextSnapshots, input.clock.now());
       return cleanupOldGeneration(claimed, oldSourceIds, generation);
     } catch (error) {

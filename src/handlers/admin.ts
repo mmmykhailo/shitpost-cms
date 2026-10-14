@@ -557,7 +557,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         else rows.push([await button(deps, "Delete known replacements", "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
         rows.push([await button(deps, "Enter manual cleanup IDs", "renewal_cleanup_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
         rows.push([await button(deps, "Back", "queue")]);
-        return ctx.reply([`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs: ${evidence.knownReplacementIds.join(", ") || "none"}`, `Expected replacement count: ${evidence.expectedSourceCount ?? "unknown"}`, "The logical publication status remains unchanged until a physical resolution is confirmed."].join("\n"), { reply_markup: keyboard(rows) });
+        const replacementCount = evidence.expectedSourceCount === undefined ? `${evidence.knownReplacementIds.length} known` : `${evidence.knownReplacementIds.length} of ${evidence.expectedSourceCount}`;
+        const details = [`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs (${evidence.knownReplacementIds.length}): ${evidence.knownReplacementIds.join(", ") || "none"}`, `Known replacement count: ${replacementCount}`, `Expected replacement count: ${evidence.expectedSourceCount ?? "unknown"}`];
+        if (evidence.errorCode === "partial_replacement") details.push("Resolution reason: partial_replacement. The incomplete set cannot be adopted as-is; originals remain current until a complete replacement is verified.");
+        details.push("The logical publication status remains unchanged until a physical resolution is confirmed.");
+        return ctx.reply(details.join("\n"), { reply_markup: keyboard(rows) });
       }
       case "renewal_adopt_known": {
         if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");

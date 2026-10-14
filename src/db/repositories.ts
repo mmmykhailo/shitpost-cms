@@ -672,6 +672,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   const operationEvidence = (itemId: number): {
     operationId: string;
     type: string;
+    errorCode?: string;
     expectedSourceCount?: number;
     phase: string;
     expectedOutputCount?: number;
@@ -681,11 +682,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     capturedContentVersion: number;
     capturedSourceGeneration: number;
   } | undefined => {
-    const operation = database.raw.query("SELECT id, type, phase, expected_source_count, expected_output_count, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; type: string; phase: string; expected_source_count: number | null; expected_output_count: number | null; captured_content_version: number; captured_source_generation: number } | null;
+    const operation = database.raw.query("SELECT id, type, phase, error_code, expected_source_count, expected_output_count, captured_content_version, captured_source_generation FROM operations WHERE item_id = ? ORDER BY created_at DESC LIMIT 1").get(itemId) as { id: string; type: string; phase: string; error_code: string | null; expected_source_count: number | null; expected_output_count: number | null; captured_content_version: number; captured_source_generation: number } | null;
     if (!operation) return undefined;
     const result: {
       operationId: string;
       type: string;
+      errorCode?: string;
       expectedSourceCount?: number;
       phase: string;
       expectedOutputCount?: number;
@@ -704,6 +706,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       capturedContentVersion: operation.captured_content_version,
       capturedSourceGeneration: operation.captured_source_generation,
     };
+    if (operation.error_code !== null) result.errorCode = operation.error_code;
     if (operation.expected_source_count !== null) result.expectedSourceCount = operation.expected_source_count;
     if (operation.expected_output_count !== null) result.expectedOutputCount = operation.expected_output_count;
     return result;
@@ -757,11 +760,23 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     if (!item || item.maintenanceStatus !== "uncertain_renewal" || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Uncertain renewal adoption guard conflict");
     const originals = getMessages(item.id, guard.capturedSourceGeneration).sort((left, right) => left.ordinal - right.ordinal);
     if (originals.length !== validatedReplacementIds.length) throw conflict("Uncertain renewal adoption source count does not match the captured contract");
+    const knownReplacementIds = operationOutputIds(guard.operationId, "replacement");
+    let nextKnownIndex = 0;
+    const knownOrdinals = new Map<number, number>();
+    for (const messageId of knownReplacementIds) {
+      while (nextKnownIndex < validatedReplacementIds.length && validatedReplacementIds[nextKnownIndex] !== messageId) nextKnownIndex += 1;
+      if (nextKnownIndex >= validatedReplacementIds.length) throw conflict("Known partial replacement IDs conflict with the entered complete set; explicitly delete the known replacements or resolve them before adoption");
+      knownOrdinals.set(messageId, nextKnownIndex);
+      nextKnownIndex += 1;
+    }
     for (const messageId of validatedReplacementIds) {
       const outputOwner = database.raw.query("SELECT operation_id FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(item.queueChatId, messageId) as { operation_id: string } | null;
       if (outputOwner && outputOwner.operation_id !== guard.operationId) throw conflict("A replacement message belongs to another operation");
       const generatedOwner = database.raw.query("SELECT operation_id FROM generated_messages WHERE chat_id = ? AND message_id = ?").get(item.queueChatId, messageId) as { operation_id: string } | null;
       if (generatedOwner && generatedOwner.operation_id !== guard.operationId) throw conflict("A replacement message is already registered to another operation");
+    }
+    for (const [messageId, ordinal] of knownOrdinals) {
+      database.raw.query("UPDATE operation_outputs SET ordinal = ? WHERE operation_id = ? AND kind = 'replacement' AND chat_id = ? AND telegram_message_id = ?").run(ordinal, guard.operationId, item.queueChatId, messageId);
     }
     for (const [ordinal, messageId] of validatedReplacementIds.entries()) {
       recordOutput(guard.operationId, "replacement", item.queueChatId, messageId, ordinal, now);

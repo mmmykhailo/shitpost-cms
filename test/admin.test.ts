@@ -732,6 +732,41 @@ describe("admin command, queue, and publication handlers", () => {
 });
 
 describe("admin uncertainty resolution handlers", () => {
+  test("shows incomplete renewal evidence and rejects a conflicting exact replacement set", async () => {
+    const harness = createHarness();
+    try {
+      const first = snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1701), mediaGroupId: "partial-review", telegramDate: 0 });
+      const item = harness.queue.observeQueueSnapshot(first, 1).item;
+      harness.queue.addAlbumMember(item.id, snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1702), mediaGroupId: "partial-review", telegramDate: 0 }), 1);
+      harness.queue.addAlbumMember(item.id, snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1703), mediaGroupId: "partial-review", telegramDate: 0 }), 1);
+      harness.queue.finalizeAlbums(NOW);
+      const claimed = harness.queue.claimRenewal("partial-review-op", NOW, NOW)!;
+      harness.queue.recordReplacementOutput(claimed.operationId, QUEUE_CHAT_ID, asMessageId(1711), 0, NOW);
+      harness.queue.recordReplacementOutput(claimed.operationId, QUEUE_CHAT_ID, asMessageId(1712), 1, NOW);
+      harness.queue.setRenewalUncertain(item.id, claimed.operationId, NOW, "partial_replacement", "Incomplete replacement: expected 3 messages but received 2");
+
+      await harness.run(commandUpdate(430, 430, "queue"));
+      const queueMenu = harness.lastSent();
+      await harness.run(callbackUpdate(431, "open-partial", harness.callbackData(queueMenu, "Resolve renewal #1"), queueMenu.message));
+      const review = harness.lastSent();
+      expect(review.message.text).toContain("partial_replacement");
+      expect(review.message.text).toContain("Known replacement IDs (2): 1711, 1712");
+      expect(review.message.text).toContain("Known replacement count: 2 of 3");
+      const reviewButtons = (review.payload.reply_markup as InlineKeyboardMarkup).inline_keyboard.flat().map((button) => button.text);
+      expect(reviewButtons).not.toContain("Adopt known replacements");
+
+      await harness.run(callbackUpdate(432, "enter-exact-partial", harness.callbackData(review, "Enter exact replacements"), review.message));
+      const prompt = harness.lastSent();
+      await harness.run(replyUpdate(433, 433, "1711 1713 1714", prompt.message));
+      expect(harness.lastSent().message.text).toContain("Known partial replacement IDs conflict");
+      expect(harness.queue.findItemById(item.id)?.sourceGeneration).toBe(0);
+      expect(harness.queue.currentSourceIds(item.id)).toEqual([asMessageId(1701), asMessageId(1702), asMessageId(1703)]);
+      expect(harness.queue.operationEvidence(item.id)?.knownReplacementIds).toEqual([asMessageId(1711), asMessageId(1712)]);
+    } finally {
+      harness.close();
+    }
+  });
+
   test("retries, adopts, and prompts for uncertain publication evidence", async () => {
     const retryHarness = createHarness();
     try {
