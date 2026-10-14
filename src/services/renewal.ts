@@ -6,6 +6,7 @@ import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } fr
 import type { Logger } from "../logger";
 import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, StoredMessageSnapshot } from "../types";
 import type { TelegramGateway } from "../telegram";
+import type { TelegramCooldown } from "../telegram-cooldown";
 import type { OperationTracker } from "./task-supervisor";
 
 export type RenewalOutcome =
@@ -27,6 +28,7 @@ export const createRenewalService = (input: {
   queueChannelId: ChatId;
   clock: Clock;
   logger: Logger;
+  cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
 }) => {
@@ -60,7 +62,8 @@ export const createRenewalService = (input: {
       return { kind: "deleted_external", itemId: claimed.item.id };
     }
     if (error.kind === "rate_limited") {
-      const retryAt = now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000) + Math.floor(Math.random() * 500);
+      const retryAt = input.cooldown?.extendForRetryAfter(error.retryAfterSeconds, now)
+        ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt };
     }

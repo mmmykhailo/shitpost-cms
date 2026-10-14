@@ -2,6 +2,7 @@ import { classifyTelegramError } from "../errors";
 import type { OrphanRepository, OrphanSource } from "../db/orphan-repository";
 import type { Clock } from "../types";
 import type { TelegramGateway } from "../telegram";
+import type { TelegramCooldown } from "../telegram-cooldown";
 import type { Logger } from "../logger";
 
 export type OrphanCleanupService = ReturnType<typeof createOrphanCleanupService>;
@@ -11,11 +12,13 @@ export const createOrphanCleanupService = (input: {
   gateway: TelegramGateway;
   clock: Clock;
   logger: Logger;
+  cooldown?: TelegramCooldown;
   onPermissionAlert?: (orphan: OrphanSource) => Promise<void>;
 }) => {
   const nextAttempt = (now: number, attemptCount: number): number => now + Math.min(6 * 60 * 60_000, Math.max(60_000, 60_000 * (2 ** Math.min(attemptCount, 8))));
 
   const runOnce = async (): Promise<{ attempted: number; resolved: number; terminal: number }> => {
+    if (input.cooldown?.isActive()) return { attempted: 0, resolved: 0, terminal: 0 };
     const now = input.clock.now();
     const due = input.orphan.due(now);
     const groups = new Map<string, OrphanSource[]>();
@@ -27,8 +30,11 @@ export const createOrphanCleanupService = (input: {
     }
     let resolved = 0;
     let terminal = 0;
+    let attempted = 0;
     for (const group of groups.values()) {
+      if (input.cooldown?.isActive()) break;
       const first = group[0]!;
+      attempted += group.length;
       try {
         await input.gateway.deleteMessages(first.chatId as never, group.map((orphan) => orphan.messageId) as never);
         for (const orphan of group) {
@@ -46,7 +52,11 @@ export const createOrphanCleanupService = (input: {
             terminal += 1;
           } else {
             const attemptNow = input.clock.now();
-            const retryAt = normalized.kind === "permission_denied" ? attemptNow + 6 * 60 * 60_000 : nextAttempt(attemptNow, orphan.attemptCount);
+            const localRetryAt = normalized.kind === "permission_denied" ? attemptNow + 6 * 60 * 60_000 : nextAttempt(attemptNow, orphan.attemptCount);
+            const floodRetryAt = normalized.kind === "rate_limited"
+              ? input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, attemptNow) ?? attemptNow + Math.ceil(Math.max(1, normalized.retryAfterSeconds ?? 60) * 1_000)
+              : attemptNow;
+            const retryAt = Math.max(localRetryAt, floodRetryAt);
             input.orphan.markAttempt(orphan, attemptNow, retryAt);
             if (normalized.kind === "permission_denied") {
               try { await input.onPermissionAlert?.(orphan); }
@@ -55,9 +65,10 @@ export const createOrphanCleanupService = (input: {
           }
         }
         input.logger.warn("orphan_cleanup_failed", { itemId: first.itemId, generation: first.sourceGeneration, count: group.length, error: normalized.kind });
+        if (normalized.kind === "rate_limited") break;
       }
     }
-    return { attempted: due.length, resolved, terminal };
+    return { attempted, resolved, terminal };
   };
 
   return { runOnce };

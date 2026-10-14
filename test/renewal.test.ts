@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
+import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createOrphanCleanupService } from "../src/services/orphan-cleanup";
 import { createRenewalService } from "../src/services/renewal";
+import { createTelegramCooldown } from "../src/telegram-cooldown";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
@@ -45,6 +47,7 @@ const open = (gateway: TelegramGateway) => {
   const database = createDatabase(join(directory, "bot.sqlite"));
   const queue = createQueueRepository(database);
   const clock = createFakeClock(100_000);
+  const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
   const renewal = createRenewalService({
     queue,
     policy: createPolicyRepository(database),
@@ -53,10 +56,11 @@ const open = (gateway: TelegramGateway) => {
     queueChannelId: asChatId(-100),
     clock,
     logger: createLogger("error"),
+    cooldown,
     operationId: (() => { let i = 0; return () => `renew-${++i}`; })(),
   });
   resources.push({ directory, close: database.close });
-  return { queue, renewal, database };
+  return { queue, renewal, database, cooldown, clock };
 };
 
 afterEach(() => {
@@ -105,14 +109,15 @@ describe("renewal service", () => {
       ...fake.gateway,
       copyMessages: async () => { throw { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 }; },
     };
-    const { queue, renewal } = open(gateway);
+    const { queue, renewal, cooldown } = open(gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(481), telegramDate: 0, origin: { kind: "absent" } }), 1);
 
     const result = await renewal.renewNext(36_000);
 
     expect(result.kind).toBe("retry_scheduled");
-    expect(result.kind === "retry_scheduled" && result.retryAt).toBeGreaterThanOrEqual(1_900_000);
+    expect(result.kind === "retry_scheduled" && result.retryAt).toBe(1_900_000);
     expect(queue.findItemById(1)?.maintenanceRetryNotBefore).toBe(result.kind === "retry_scheduled" ? result.retryAt : undefined);
+    expect(cooldown.notBefore()).toBe(1_900_000);
   });
 
   test("quarantines malformed replacement IDs as an ambiguous result", async () => {
@@ -218,6 +223,31 @@ describe("renewal service", () => {
     expect((await orphanCleanup.runOnce()).attempted).toBe(1);
     expect(alerts).toHaveLength(1);
     expect((database.raw.query("SELECT next_attempt_at FROM orphaned_sources WHERE telegram_message_id = 903").get() as { next_attempt_at: number }).next_attempt_at).toBeGreaterThan(100_000);
+  });
+
+  test("stops orphan cleanup after a flood wait and persists the full shared deadline", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, database, cooldown, clock } = open(fake.gateway);
+    const item = queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(541), telegramDate: 0 }), 1).item;
+    const insert = database.raw.query("INSERT INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, attempt_count, next_attempt_at) VALUES (?, ?, -100, ?, 'transient', ?, ?, 0, ?)");
+    insert.run(item.id, 0, 9501, 1, 1, 100_000);
+    insert.run(item.id, 1, 9502, 1, 1, 100_000);
+    let calls = 0;
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      deleteMessages: async () => { calls += 1; throw { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 }; },
+    };
+    const cleanup = createOrphanCleanupService({ orphan: createOrphanRepository(database), gateway, clock, logger: createLogger("error"), cooldown });
+
+    const result = await cleanup.runOnce();
+    const attempts = database.raw.query("SELECT COUNT(*) AS count FROM orphaned_sources WHERE attempt_count > 0 AND next_attempt_at >= ?").get(1_900_000) as { count: number };
+
+    expect(result.attempted).toBe(1);
+    expect(calls).toBe(1);
+    expect(attempts.count).toBe(1);
+    expect(cooldown.notBefore()).toBe(1_900_000);
+    expect((await cleanup.runOnce()).attempted).toBe(0);
+    expect(calls).toBe(1);
   });
 
   test("retries a durable post-install cleanup phase without republishing", async () => {

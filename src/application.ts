@@ -11,6 +11,7 @@ import { createGeneratedMessageRepository, createPolicyRepository, createQueueRe
 import { createPendingUpdateRepository } from "./db/pending-update-repository";
 import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
+import { createTelegramCooldownRepository } from "./db/telegram-cooldown-repository";
 import { createRuntimeLease } from "./db/runtime";
 import { createTelegramGateway, type BotMembership, type TelegramGateway } from "./telegram";
 import { createIngestionService } from "./services/ingestion";
@@ -27,10 +28,10 @@ import { registerAdminHandlers } from "./handlers/admin";
 import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
 import { createRuntimeStatusWriter } from "./runtime-status";
+import { createTelegramCooldown, installTelegramCooldownTransformer } from "./telegram-cooldown";
+import { RENEWAL_IDLE_SCAN_MS, RENEWAL_START_AGE_MS } from "./domain/renewal-policy";
 import { systemClock, type Clock, type UserId } from "./types";
 
-const RENEWAL_INTERVAL_MS = 15 * 60_000;
-const RENEWAL_START_AGE_MS = 36 * 60 * 60_000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 const STARTUP_CHECK_ATTEMPTS = 3;
 const STARTUP_CHECK_RETRYABLE_KINDS = new Set(["rate_limited", "transient_network", "transient_server"]);
@@ -136,6 +137,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   if (interruptedRuns > 0) logger.warn("interrupted_schedule_runs_recovered", { count: interruptedRuns });
 
   const bot = options.bot ?? new Bot(config.botToken);
+  const telegramCooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
+  installTelegramCooldownTransformer(bot.api, telegramCooldown, clock);
   const adminChatId = adminChatIdFromUserId(config.adminUserId);
   const gateway = options.gateway ?? createTelegramGateway(bot.api, adminChatId);
   const alerts = createAlertService({ alert: alertRepository, gateway, adminChatId, logger });
@@ -236,8 +239,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   }
 
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: clock.now });
-  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker });
-  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker });
+  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
@@ -247,6 +250,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     gateway,
     clock,
     logger,
+    cooldown: telegramCooldown,
     onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, clock.now()),
   });
   const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
@@ -283,7 +287,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
       } catch (error) {
         logger.error("renewal_worker_failed", { error: safeErrorDescription(error) });
       }
-      await abortableSleep(clock, RENEWAL_INTERVAL_MS, signal);
+      await abortableSleep(clock, RENEWAL_IDLE_SCAN_MS, signal);
     }
     });
     supervisor.start("pending_updates", async (signal) => {

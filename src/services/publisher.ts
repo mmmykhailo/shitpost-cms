@@ -6,6 +6,7 @@ import type { Logger } from "../logger";
 import { classifyTelegramError } from "../errors";
 import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PublicationContract, PublicationPlan, QueueItemStatus, StoredMessageSnapshot } from "../types";
 import type { TelegramGateway } from "../telegram";
+import type { TelegramCooldown } from "../telegram-cooldown";
 import type { ChatId } from "../types";
 import type { OperationTracker } from "./task-supervisor";
 
@@ -27,8 +28,11 @@ type PreparedPublication = {
   contract: PublicationContract;
 };
 
-const retryAtFor = (error: NormalizedTelegramError, now: number): number => {
-  if (error.kind === "rate_limited" && error.retryAfterSeconds !== undefined) return now + Math.min(error.retryAfterSeconds * 1000 + Math.floor(Math.random() * 500), 300_000);
+const retryAtFor = (error: NormalizedTelegramError, now: number, cooldown?: TelegramCooldown): number => {
+  if (error.kind === "rate_limited") {
+    if (cooldown !== undefined) return cooldown.extendForRetryAfter(error.retryAfterSeconds, now);
+    return now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1_000);
+  }
   return now + 60_000;
 };
 
@@ -45,6 +49,7 @@ export const createPublicationService = (input: {
   targetChannelId: ChatId;
   clock: Clock;
   logger: Logger;
+  cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
 }) => {
@@ -174,7 +179,7 @@ export const createPublicationService = (input: {
       return { kind: "deleted_external", itemId: claimed.item.id, operationId: claimed.operationId };
     }
     if (error.kind === "rate_limited") {
-      const retryAt = retryAtFor(error, now);
+      const retryAt = retryAtFor(error, now, input.cooldown);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
     }

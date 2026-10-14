@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
+import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
 import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createPublicationService } from "../src/services/publisher";
+import { createTelegramCooldown } from "../src/telegram-cooldown";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
@@ -46,9 +48,10 @@ const open = (gateway: TelegramGateway) => {
   const queue = createQueueRepository(database);
   const policy = createPolicyRepository(database);
   const clock = createFakeClock(10_000);
-  const service = createPublicationService({ queue, policy, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
+  const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
+  const service = createPublicationService({ queue, policy, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
   resources.push({ directory, close: database.close });
-  return { database, queue, policy, service, clock };
+  return { database, queue, policy, service, clock, cooldown };
 };
 
 afterEach(() => {
@@ -89,6 +92,19 @@ describe("publication service", () => {
     expect((await missingRun.service.publishNext()).kind).toBe("deleted_external");
     expect(missingRun.queue.findItemById(1)?.status).toBe("deleted_external");
     expect(missing.calls).toEqual(["copy"]);
+  });
+
+  test("persists the full Telegram flood wait for publication retries", async () => {
+    const limited = fakeGateway({ transferFailure: { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 } });
+    const run = open(limited.gateway);
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(121) }), 1_000);
+
+    const result = await run.service.publishNext();
+
+    expect(result.kind).toBe("retry_scheduled");
+    expect(result.kind === "retry_scheduled" && result.retryAt).toBe(1_810_000);
+    expect(run.queue.findItemById(1)?.retryNotBefore).toBe(1_810_000);
+    expect(run.cooldown.notBefore()).toBe(1_810_000);
   });
 
   test("blocks unsupported and mixed-caption plans before transfer", async () => {
