@@ -17,6 +17,7 @@ import { createTelegramGateway, type BotMembership, type TelegramGateway } from 
 import { createIngestionService } from "./services/ingestion";
 import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
+import { createRenewalWorker } from "./services/renewal-worker";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
 import { createAlertService, resolutionTextForDedupeKey } from "./services/alerts";
@@ -29,7 +30,6 @@ import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
 import { createRuntimeStatusWriter } from "./runtime-status";
 import { createTelegramCooldown, installTelegramCooldownTransformer } from "./telegram-cooldown";
-import { RENEWAL_IDLE_SCAN_MS, RENEWAL_START_AGE_MS } from "./domain/renewal-policy";
 import { systemClock, type Clock, type UserId } from "./types";
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
@@ -241,6 +241,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: clock.now });
   const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
@@ -279,17 +280,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   });
 
   const startBackgroundWork = (): void => {
-    supervisor.start("renewal", async (signal) => {
-    while (!signal.aborted && !stopped) {
-      try {
-        for (const item of queue.listActive(10_000).filter((entry) => entry.maintenanceStatus === "renewal_cleanup_pending")) await renewal.cleanupPending(item.id);
-        await renewal.renewNext(RENEWAL_START_AGE_MS);
-      } catch (error) {
-        logger.error("renewal_worker_failed", { error: safeErrorDescription(error) });
-      }
-      await abortableSleep(clock, RENEWAL_IDLE_SCAN_MS, signal);
-    }
-    });
+    supervisor.start("renewal", (signal) => renewalWorker.run(signal));
     supervisor.start("pending_updates", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { ingestion.finalizeAlbums(); }

@@ -94,6 +94,7 @@ export const createRenewalService = (input: {
         input.queue.completeRenewalWithOrphans(guard, [], input.clock.now());
         return { kind: "renewed", itemId: claimed.item.id, generation };
       }
+      if (normalized.kind === "rate_limited") input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, input.clock.now());
       // The replacement generation is already durable. Keep it current and
       // make each old ID independently retryable instead of wedging the item.
       input.queue.completeRenewalWithOrphans(guard, oldSourceIds, input.clock.now(), normalized.kind === "permission_denied" ? "permission_denied" : normalized.kind);
@@ -161,12 +162,15 @@ export const createRenewalService = (input: {
 
   const renewClaimedTracked = async (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): Promise<RenewalOutcome> => tracked(claimed.operationId, () => renewClaimed(claimed));
 
-  const renewNext = async (minimumAgeMs: number): Promise<RenewalOutcome> => {
+  const renewNextAttempt = async (minimumAgeMs: number): Promise<{ outcome: RenewalOutcome; sourceCount: number }> => {
     const now = input.clock.now();
     const claimed = input.queue.claimRenewal(newOperationId(), now, now - minimumAgeMs);
-    if (!claimed) return { kind: "nothing_due" };
-    return renewClaimedTracked(claimed);
+    if (!claimed) return { outcome: { kind: "nothing_due" }, sourceCount: 0 };
+    const sourceCount = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).length;
+    return { outcome: await renewClaimedTracked(claimed), sourceCount };
   };
+
+  const renewNext = async (minimumAgeMs: number): Promise<RenewalOutcome> => (await renewNextAttempt(minimumAgeMs)).outcome;
 
   const cleanupPending = async (itemId: number): Promise<RenewalOutcome> => {
     const item = input.queue.findItemById(itemId);
@@ -183,5 +187,5 @@ export const createRenewalService = (input: {
     });
   };
 
-  return { renewNext, renewClaimed, cleanupPending };
+  return { renewNext, renewNextAttempt, renewClaimed, cleanupPending };
 };
