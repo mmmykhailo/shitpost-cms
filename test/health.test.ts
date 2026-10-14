@@ -64,6 +64,40 @@ describe("health service", () => {
     }
   });
 
+  test("reports due uncertain renewal items without inventing a deadline projection", () => {
+    const directory = mkdtempSync(join(tmpdir(), "shitpost-cms-health-capacity-"));
+    const database = createDatabase(join(directory, "bot.sqlite"));
+    try {
+      const now = 1_800_000_000_000;
+      const queue = createQueueRepository(database);
+      const item = queue.observeQueueSnapshot(snapshotFixture({
+        chatId: asChatId(-100),
+        messageId: asMessageId(20),
+        telegramDate: now - 36 * 60 * 60_000,
+      }), now).item;
+      database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal' WHERE id = ?").run(item.id);
+      const service = createHealthService({
+        database,
+        queue,
+        schedule: createScheduleRepository(database),
+        pending: createPendingUpdateRepository(database),
+        orphan: createOrphanRepository(database),
+        alerts: createAlertRepository(database),
+        now: () => now,
+        cooldown: { notBefore: () => now + 10_000 },
+      });
+
+      const snapshot = service.snapshot();
+
+      expect(snapshot.oldestPhysicalAgeMs).toBe(36 * 60 * 60_000);
+      expect(snapshot.renewalCapacity).toMatchObject({ safe: false, blockedItemIds: [item.id], availableAt: now + 10_000, totalMessages: 0 });
+      expect(snapshot.renewalCapacity.projectedFirstMiss).toBeUndefined();
+    } finally {
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when the database quick check throws and handles empty optional state", () => {
     const database = {
       raw: { query: (sql: string) => { if (sql === "PRAGMA quick_check") throw new Error("closed"); return { get: () => ({ retry_at: null, current_boot_id: null, created_at: 1, last_clean_shutdown_at: null, last_scheduler_scan_at: null, last_successful_update_at: null, active: null, uncertain: null }), all: () => [] }; } },

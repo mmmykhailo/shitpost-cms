@@ -73,13 +73,60 @@ describe("operations safety net", () => {
     expect(resolutionTextForDedupeKey("future_condition:example")).toBe("Condition future_condition:example cleared.");
   });
 
-  test("projects renewal throughput against the 46-hour deadline", () => {
-    const now = 1_000_000;
-    const safe = calculateRenewalCapacity({ now, messagesPerMinute: 20, sources: [{ itemId: 1, physicalCreatedAt: now - 45 * 60 * 60_000, memberCount: 1 }] });
-    const unsafe = calculateRenewalCapacity({ now, messagesPerMinute: 1, sources: [{ itemId: 1, physicalCreatedAt: now - 45 * 60 * 60_000, memberCount: 120 }] });
-    expect(safe.safe).toBe(true);
-    expect(unsafe.safe).toBe(false);
-    expect(unsafe.projectedFirstMiss?.itemId).toBe(1);
+  test("uses the worker pacing cost for single messages and albums", () => {
+    const now = 36 * 60 * 60_000;
+    const capacity = calculateRenewalCapacity({ now, sources: [
+      { itemId: 1, logicalSequence: 1, physicalCreatedAt: 0, memberCount: 1 },
+      { itemId: 2, logicalSequence: 2, physicalCreatedAt: 0, memberCount: 10 },
+    ] });
+
+    expect(capacity).toMatchObject({ safe: true, availableAt: now + 33_000, totalMessages: 11 });
+  });
+
+  test("flags the first source that exceeds the 46-hour deadline", () => {
+    const now = 36 * 60 * 60_000;
+    const sources = Array.from({ length: 21 }, (_, index) => ({
+      itemId: index + 1,
+      logicalSequence: index + 1,
+      physicalCreatedAt: now - (46 * 60 * 60_000 - 60_000),
+      memberCount: 1,
+    }));
+    const capacity = calculateRenewalCapacity({ now, sources });
+
+    expect(capacity.safe).toBe(false);
+    expect(capacity.projectedFirstMiss).toMatchObject({ itemId: 21, projectedAt: now + 63_000 });
+  });
+
+  test("lets a ready source go before an older source with a future retry", () => {
+    const now = 36 * 60 * 60_000;
+    const capacity = calculateRenewalCapacity({ now, sources: [
+      { itemId: 1, logicalSequence: 1, physicalCreatedAt: now - (46 * 60 * 60_000 - 60_000), memberCount: 1, maintenanceRetryNotBefore: now + 5 * 60 * 60_000 },
+      { itemId: 2, logicalSequence: 2, physicalCreatedAt: now - 45 * 60 * 60_000, memberCount: 1 },
+    ] });
+
+    expect(capacity.projectedFirstMiss).toMatchObject({ itemId: 1, projectedAt: now + 5 * 60 * 60_000 + 3_000 });
+  });
+
+  test("applies shared cooldown to every projected source", () => {
+    const now = 36 * 60 * 60_000;
+    const capacity = calculateRenewalCapacity({ now, cooldownUntil: now + 10_000, sources: [
+      { itemId: 1, physicalCreatedAt: 0, memberCount: 1 },
+      { itemId: 2, physicalCreatedAt: 0, memberCount: 1 },
+    ] });
+
+    expect(capacity.availableAt).toBe(now + 16_000);
+  });
+
+  test("projects eligibility from the 36-hour start age and surfaces due uncertainty", () => {
+    const now = 20 * 60 * 60_000;
+    const eligibleLater = calculateRenewalCapacity({ now, sources: [{ itemId: 2, physicalCreatedAt: 0, memberCount: 1 }] });
+    const blocked = calculateRenewalCapacity({ now: 36 * 60 * 60_000, sources: [
+      { itemId: 1, physicalCreatedAt: 0, memberCount: 1, maintenanceStatus: "uncertain_renewal" },
+    ] });
+
+    expect(eligibleLater.availableAt).toBe(36 * 60 * 60_000 + 3_000);
+    expect(blocked).toMatchObject({ safe: false, blockedItemIds: [1], totalMessages: 0, availableAt: 36 * 60 * 60_000 });
+    expect(blocked.projectedFirstMiss).toBeUndefined();
   });
 
   test("creates an integrity-checked rolling backup", () => {

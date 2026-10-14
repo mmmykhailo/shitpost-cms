@@ -254,7 +254,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     cooldown: telegramCooldown,
     onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, clock.now()),
   });
-  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights });
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights, cooldown: telegramCooldown });
   const retention = createRetentionService({ queue, generated, pending, admin, alerts: alertRepository, clock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: clock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
@@ -357,7 +357,13 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
         for (const item of queue.listRecentlyDeletedExternal(now - 24 * 60 * 60_000)) await raise(`deleted_external:${item.id}`, "normal", `Queue source for item #${item.id} disappeared from Telegram before publication.`);
         for (const orphan of orphanRepository.terminal()) await raise(`orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`, "immediate", `Orphaned source ${orphan.messageId} for queue item #${orphan.itemId} is past Telegram's deletion age limit and requires manual cleanup.`);
         const capacity = health.snapshot().renewalCapacity;
-        if (!capacity.safe) await raise("renewal_capacity", "critical", `Renewal capacity is unsafe; projected first deadline miss is item #${capacity.projectedFirstMiss?.itemId ?? "unknown"}.`);
+        if (!capacity.safe) {
+          const reasons = [
+            ...(capacity.blockedItemIds?.length ? [`due uncertain renewals require admin resolution for item(s) #${capacity.blockedItemIds.join(", #")}`] : []),
+            ...(capacity.projectedFirstMiss ? [`projected deadline miss for item #${capacity.projectedFirstMiss.itemId}`] : []),
+          ];
+          await raise("renewal_capacity", "critical", `Renewal capacity is unsafe: ${reasons.join("; ")}.`);
+        }
         for (const existing of alertRepository.active()) {
           const dynamic = /^(?:renewal_warning|renewal_critical|blocked_head|needs_edit|needs_review|uncertain_publish|uncertain_renewal|deleted_external|orphan_manual|renewal_capacity|permissions):/.test(existing.dedupeKey) || existing.dedupeKey === "renewal_capacity";
           if (dynamic && !activeConditions.has(existing.dedupeKey)) await alerts.resolve(existing.dedupeKey, resolutionTextForDedupeKey(existing.dedupeKey), now);
