@@ -8,8 +8,10 @@ import { main as applicationMain, waitForShutdownStage, type ApplicationOptions 
 import { main, runEntrypoint } from "../src/index";
 import { createDatabase } from "../src/db/database";
 import { createRuntimeLease } from "../src/db/runtime";
+import { createQueueRepository } from "../src/db/repositories";
 import { asChatId, asMessageId, asUserId, type Clock } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
+import { snapshotFixture } from "./fixtures";
 
 const loggerSpy = (): { logger: Logger; events: string[] } => {
   const events: string[] = [];
@@ -158,6 +160,34 @@ describe("application composition", () => {
       expect(harness.signalHandlers.has("SIGINT")).toBe(true);
       expect(harness.signalHandlers.has("SIGTERM")).toBe(true);
       expect(harness.options.process?.exitCode).toBe(0);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  test("groups terminal orphan IDs by item and generation with current-source context", async () => {
+    const harness = makeApplicationHarness();
+    const database = createDatabase(harness.config.databasePath);
+    const queue = createQueueRepository(database);
+    const item = queue.observeQueueSnapshot(snapshotFixture({
+      chatId: harness.config.queueChannelId,
+      messageId: asMessageId(40),
+      telegramDate: 1_000_000 - 36 * 60 * 60_000,
+    }), 1_000_000).item;
+    database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal' WHERE id = ?").run(item.id);
+    const insert = database.raw.query("INSERT INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, 'age_limit', ?, ?, 1, NULL, 'telegram_age_limit')");
+    insert.run(item.id, 0, Number(harness.config.queueChannelId), 5001, 900_000, 900_000);
+    insert.run(item.id, 0, Number(harness.config.queueChannelId), 5002, 900_001, 900_001);
+    insert.run(item.id, 1, Number(harness.config.queueChannelId), 5003, 900_002, 900_002);
+    database.close();
+    try {
+      await applicationMain(harness.options);
+
+      const orphanAlerts = harness.adminAlerts.filter((message) => message.includes("Orphaned sources for queue item"));
+      expect(orphanAlerts).toHaveLength(2);
+      expect(orphanAlerts).toContain("[immediate] Orphaned sources for queue item #1, generation 0, are past Telegram's deletion age limit and require manual cleanup. Old source IDs: 5001, 5002. Current generation 0 source IDs: 40.");
+      expect(orphanAlerts).toContain("[immediate] Orphaned sources for queue item #1, generation 1, are past Telegram's deletion age limit and require manual cleanup. Old source IDs: 5003. Current generation 0 source IDs: 40.");
+      expect(harness.adminAlerts).toContain("[critical] Renewal capacity is unsafe: due uncertain renewals require admin resolution for item(s) #1.");
     } finally {
       harness.cleanup();
     }

@@ -355,7 +355,19 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
           if (item.maintenanceStatus === "uncertain_renewal") await raise(`uncertain_renewal:${item.id}`, "immediate", `Renewal for queue item #${item.id} is uncertain and requires admin resolution.`);
         }
         for (const item of queue.listRecentlyDeletedExternal(now - 24 * 60 * 60_000)) await raise(`deleted_external:${item.id}`, "normal", `Queue source for item #${item.id} disappeared from Telegram before publication.`);
-        for (const orphan of orphanRepository.terminal()) await raise(`orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`, "immediate", `Orphaned source ${orphan.messageId} for queue item #${orphan.itemId} is past Telegram's deletion age limit and requires manual cleanup.`);
+        const manualOrphanGroups = new Map<string, { itemId: number; sourceGeneration: number; messageIds: Set<number> }>();
+        for (const orphan of orphanRepository.terminal()) {
+          const key = `orphan_manual:${orphan.itemId}:${orphan.sourceGeneration}`;
+          const group = manualOrphanGroups.get(key) ?? { itemId: orphan.itemId, sourceGeneration: orphan.sourceGeneration, messageIds: new Set<number>() };
+          group.messageIds.add(orphan.messageId);
+          manualOrphanGroups.set(key, group);
+        }
+        for (const [key, group] of manualOrphanGroups) {
+          const item = queue.findItemById(group.itemId);
+          const currentIds = item ? queue.currentSourceIds(item.id) : [];
+          const currentGeneration = item?.sourceGeneration === undefined ? "unknown" : String(item.sourceGeneration);
+          await raise(key, "immediate", `Orphaned sources for queue item #${group.itemId}, generation ${group.sourceGeneration}, are past Telegram's deletion age limit and require manual cleanup. Old source IDs: ${[...group.messageIds].sort((left, right) => left - right).join(", ")}. Current generation ${currentGeneration} source IDs: ${currentIds.join(", ") || "unavailable"}.`);
+        }
         const capacity = health.snapshot().renewalCapacity;
         if (!capacity.safe) {
           const reasons = [

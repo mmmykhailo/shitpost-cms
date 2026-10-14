@@ -94,7 +94,10 @@ describe("queue repository", () => {
     expect(queue.recoverExpiredOperations(400_001)).toEqual([1]);
     expect(queue.findItemById(1)?.sourceGeneration).toBe(1);
     expect(queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+    expect(queue.findItemById(1)?.physicalCreatedAt).toBe(100_000);
+    expect(queue.findItemById(1)?.lastRenewedAt).toBe(400_001);
     expect(queue.currentSourceIds(1)).toEqual([asMessageId(902)]);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.telegramDate).toBe(100_000);
     expect((database.raw.query("SELECT phase, state FROM operations WHERE id = 'renew-recover'").get() as { phase: string; state: string })).toEqual({ phase: "generation_installed", state: "cleanup_pending" });
   });
 

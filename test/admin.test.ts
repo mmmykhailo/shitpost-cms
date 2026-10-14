@@ -10,7 +10,10 @@ import { createDatabase } from "../src/db/database";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
-import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
+import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
+import { createRenewalService } from "../src/services/renewal";
+import { createFakeClock } from "../src/clock";
+import { createLogger } from "../src/logger";
 import type { TelegramGateway } from "../src/telegram";
 import { asChatId, asMessageId, asUserId, type PublicationContract } from "../src/types";
 import type { LogFields } from "../src/logger";
@@ -82,11 +85,21 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const deleted: Array<{ chatId: number; messageIds: number[] }> = [];
   const warnings: Array<{ event: string; fields: LogFields | undefined }> = [];
   let nextMessageId = 100;
+  let nextSourceMessageId = 5_000;
+  const sourceTransfers: number[][] = [];
   let deleteFailure: unknown;
   let physicalAgeMs: number | undefined;
   let resolvedChat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" } = { id: asChatId(-100555), type: "channel" };
 
   const gateway = {
+    copyMessages: async ({ messageIds }: { messageIds: readonly number[] }) => {
+      sourceTransfers.push(messageIds.map(Number));
+      return messageIds.map(() => asMessageId(nextSourceMessageId++));
+    },
+    forwardMessages: async ({ messageIds }: { messageIds: readonly number[] }) => {
+      sourceTransfers.push(messageIds.map(Number));
+      return messageIds.map(() => asMessageId(nextSourceMessageId++));
+    },
     deleteMessages: async (chatId: number, messageIds: readonly number[]): Promise<void> => {
       deleted.push({ chatId: Number(chatId), messageIds: messageIds.map(Number) });
       if (deleteFailure !== undefined) throw deleteFailure;
@@ -188,6 +201,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     calls,
     sent,
     deleted,
+    sourceTransfers,
     warnings,
     setDeleteFailure: (error: unknown): void => { deleteFailure = error; },
     setPhysicalAge: (ageMs: number): void => { physicalAgeMs = ageMs; },
@@ -562,6 +576,88 @@ describe("admin command, queue, and publication handlers", () => {
       harness.setPhysicalAge(queueAge);
       await harness.run(commandUpdate(297, 297, "health"));
       expect(harness.lastSent().message.text).toContain("oldest physical source age: 2.87 days");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("keeps the queue link on each replacement across repeated real renewals", async () => {
+    const harness = createHarness();
+    try {
+      const logicalAge = 247_668_018;
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({
+        chatId: QUEUE_CHAT_ID,
+        messageId: asMessageId(1502),
+        telegramDate: NOW - logicalAge,
+        origin: { kind: "absent" },
+      }), NOW - logicalAge).item;
+      const clock = createFakeClock(NOW);
+      const renewal = createRenewalService({
+        queue: harness.queue,
+        policy: harness.policy,
+        generated: createGeneratedMessageRepository(harness.database),
+        gateway: harness.gateway,
+        queueChannelId: QUEUE_CHAT_ID,
+        clock,
+        logger: createLogger("error"),
+      });
+      const links: string[] = [];
+
+      for (let renewalNumber = 0; renewalNumber < 3; renewalNumber += 1) {
+        await harness.run(commandUpdate(360 + renewalNumber, 360 + renewalNumber, "queue"));
+        const listing = harness.lastSent();
+        expect(listing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+        const link = (listing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
+        expect(link).toBeDefined();
+        expect(listing.message.text.slice(link!.offset, link!.offset + link!.length)).toBe(`#${item.id}`);
+        links.push(link!.url);
+
+        expect((await renewal.renewNext(36 * 60 * 60_000)).kind).toBe("renewed");
+        if (renewalNumber < 2) clock.advance(36 * 60 * 60_000);
+      }
+      await harness.run(commandUpdate(363, 363, "queue"));
+      const finalListing = harness.lastSent();
+      expect(finalListing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+      const finalLink = (finalListing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
+      expect(finalLink).toBeDefined();
+      expect(finalListing.message.text.slice(finalLink!.offset, finalLink!.offset + finalLink!.length)).toBe(`#${item.id}`);
+      links.push(finalLink!.url);
+
+      expect(links).toEqual([
+        "https://t.me/c/1234567890/1502",
+        "https://t.me/c/1234567890/5000",
+        "https://t.me/c/1234567890/5001",
+        "https://t.me/c/1234567890/5002",
+      ]);
+      expect(harness.queue.currentSourceIds(item.id)).toEqual([asMessageId(5002)]);
+      expect(harness.sourceTransfers).toEqual([[1502], [5000], [5001]]);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("links an album label to its first current member and falls back to plain text for invalid chats", async () => {
+    const harness = createHarness();
+    try {
+      const album = harness.queue.observeQueueSnapshot(snapshotFixture({
+        chatId: QUEUE_CHAT_ID,
+        messageId: asMessageId(1510),
+        mediaGroupId: "linked-album",
+      }), NOW).item;
+      harness.queue.addAlbumMember(album.id, snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1512), mediaGroupId: "linked-album" }), NOW + 100);
+      harness.queue.finalizeAlbums(NOW + 10_000);
+
+      await harness.run(commandUpdate(364, 364, "queue"));
+      const listing = harness.lastSent();
+      const link = (listing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
+      expect(link?.url).toBe("https://t.me/c/1234567890/1510");
+      expect(harness.queue.currentSourceIds(album.id)).toEqual([asMessageId(1510), asMessageId(1512)]);
+
+      harness.config.queueChannelId = asChatId(-123_456_789);
+      await harness.run(commandUpdate(365, 365, "queue"));
+      const invalidChatListing = harness.lastSent();
+      expect(invalidChatListing.message.text).toContain(`#${album.id}`);
+      expect(invalidChatListing.payload.entities).toEqual([]);
     } finally {
       harness.close();
     }

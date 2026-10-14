@@ -395,7 +395,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const recoverExpiredOperations = (now: number, bootId?: string): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number }>;
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation, created_at FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number; created_at: number }>;
     const recovered: number[] = [];
     const markRenewalUncertain = (itemId: number, operationId: string): void => {
       database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(itemId, operationId);
@@ -431,9 +431,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
             const nextGeneration = row.captured_source_generation + 1;
             for (const [ordinal, message] of oldMessages.entries()) {
               const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
-              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds![ordinal]!, ordinal, telegramDate: now });
+              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds![ordinal]!, ordinal, telegramDate: row.created_at });
             }
-            const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
+            const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, row.created_at, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
             if (Number(installed.changes) !== 1) {
               markRenewalUncertain(item.id, row.id);
             } else {
@@ -581,7 +581,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     setOperationPhase(guard.operationId, "replacement_outputs_recorded", now);
   });
 
-  const installRenewedGeneration = (guardOrItemId: OperationGuard | number, operationIdOrSnapshots: string | readonly StoredMessageSnapshot[], snapshotsOrNow: readonly StoredMessageSnapshot[] | number, maybeNow?: number): number => database.transaction(() => {
+  const installRenewedGeneration = (guardOrItemId: OperationGuard | number, operationIdOrSnapshots: string | readonly StoredMessageSnapshot[], snapshotsOrNow: readonly StoredMessageSnapshot[] | number, maybeNow?: number, maybeSourceCreatedAt?: number): number => database.transaction(() => {
     const guard: OperationGuard = typeof guardOrItemId === "number"
       ? (() => {
         const item = findItemById(guardOrItemId);
@@ -591,13 +591,14 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       : guardOrItemId;
     const replacementSnapshots = (typeof guardOrItemId === "number" ? snapshotsOrNow : operationIdOrSnapshots) as readonly StoredMessageSnapshot[];
     const now = (typeof guardOrItemId === "number" ? maybeNow : snapshotsOrNow) as number;
+    const sourceCreatedAt = (typeof guardOrItemId === "number" ? maybeSourceCreatedAt : maybeNow) ?? now;
     const operation = guardRow(guard);
     if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || !["replacement_outputs_recorded", "claimed"].includes(operation.phase)) throw conflict("Renewal generation guard conflict");
     const item = findItemById(guard.itemId);
     if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Renewal generation CAS conflict");
     const nextGeneration = item.sourceGeneration + 1;
     for (const snapshot of replacementSnapshots) insertSnapshot(item.id, nextGeneration, snapshot);
-    const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, now, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, sourceCreatedAt, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
     if (Number(result.changes) !== 1) throw conflict("Renewal generation install lost its lease");
     setOperationState(guard.operationId, "cleanup_pending", now);
     setOperationPhase(guard.operationId, "generation_installed", now);

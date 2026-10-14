@@ -185,6 +185,62 @@ describe("renewal service", () => {
     expect((database.raw.query("SELECT COUNT(*) AS count FROM orphaned_sources WHERE resolved_at IS NULL").get() as { count: number }).count).toBe(0);
   });
 
+  test("dates a replacement from immediately before the transfer request", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    let advanceClock = (): void => {};
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async (transfer) => {
+        const result = await fake.gateway.copyMessages(transfer);
+        advanceClock();
+        return result;
+      },
+    };
+    const { queue, renewal, clock } = open(gateway);
+    advanceClock = () => clock.advance(45_000);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(56), telegramDate: 0, origin: { kind: "absent" } }), 1);
+
+    expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
+
+    expect(queue.findItemById(1)?.physicalCreatedAt).toBe(100_000);
+    expect(queue.findItemById(1)?.lastRenewedAt).toBe(145_000);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.telegramDate).toBe(100_000);
+  });
+
+  test("recovers an old complete replacement without restarting its age window", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const copiedFrom: number[][] = [];
+    const gateway: TelegramGateway = {
+      ...fake.gateway,
+      copyMessages: async (transfer) => {
+        copiedFrom.push(transfer.messageIds.map(Number));
+        return fake.gateway.copyMessages(transfer);
+      },
+    };
+    const { queue, renewal, clock } = open(gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(57), telegramDate: 0, origin: { kind: "absent" } }), 1);
+    const claimed = queue.claimRenewal("renew-recovery-age", 100_000, 64_000)!;
+    const guard = { operationId: claimed.operationId, itemId: 1, capturedContentVersion: claimed.capturedContentVersion, capturedSourceGeneration: claimed.capturedSourceGeneration };
+    queue.setOperationPhase(claimed.operationId, "replacement_pending", 100_001);
+    queue.recordReplacementOutput(claimed.operationId, -100, 905, 0, 100_002);
+    queue.markReplacementOutputsRecorded(guard, 100_003);
+
+    clock.advance(40 * 60 * 60_000);
+    expect(queue.recoverExpiredOperations(clock.now())).toEqual([1]);
+    expect(queue.findItemById(1)?.physicalCreatedAt).toBe(100_000);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.telegramDate).toBe(100_000);
+    expect(queue.findItemById(1)?.maintenanceStatus).toBe("renewal_cleanup_pending");
+
+    expect((await renewal.cleanupPending(1)).kind).toBe("renewed");
+    expect(fake.calls).toEqual(["delete"]);
+    expect(copiedFrom).toEqual([]);
+    expect(clock.now() - queue.findItemById(1)!.physicalCreatedAt).toBe(40 * 60 * 60_000);
+
+    expect((await renewal.renewNext(36 * 60 * 60_000)).kind).toBe("renewed");
+    expect(copiedFrom).toEqual([[905]]);
+    expect(queue.findItemById(1)?.sourceGeneration).toBe(2);
+  });
+
   test("re-forwards semantic channel origins", async () => {
     const fake = gatewayWithDeleteFailure();
     const { queue, renewal } = open(fake.gateway);

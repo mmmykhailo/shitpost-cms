@@ -40,11 +40,11 @@ export const createRenewalService = (input: {
     finally { finish?.(); }
   };
 
-  const replacementSnapshots = (snapshots: readonly StoredMessageSnapshot[], messageIds: readonly MessageId[], now: number): StoredMessageSnapshot[] => {
+  const replacementSnapshots = (snapshots: readonly StoredMessageSnapshot[], messageIds: readonly MessageId[], sourceCreatedAt: number): StoredMessageSnapshot[] => {
     if (snapshots.length !== messageIds.length) throw new Error("Renewal output count does not match source count");
     return snapshots.map((snapshot, ordinal) => {
       const { editDate: _editDate, ...withoutEditDate } = snapshot;
-      return { ...withoutEditDate, messageId: messageIds[ordinal]!, ordinal, telegramDate: now };
+      return { ...withoutEditDate, messageId: messageIds[ordinal]!, ordinal, telegramDate: sourceCreatedAt };
     });
   };
 
@@ -115,6 +115,7 @@ export const createRenewalService = (input: {
     input.queue.setOperationPhase(claimed.operationId, "replacement_pending", now);
     try {
       const transferInput = { targetChatId: input.queueChannelId, sourceChatId: input.queueChannelId, messageIds: oldSourceIds, disableNotification: true };
+      const sourceCreatedAt = input.clock.now();
       const replacementIds = claimed.item.origin.kind === "absent"
         ? await input.gateway.copyMessages(transferInput)
         : await input.gateway.forwardMessages(transferInput);
@@ -152,8 +153,9 @@ export const createRenewalService = (input: {
       }
 
       input.queue.markReplacementOutputsRecorded(guard, input.clock.now());
-      const nextSnapshots = replacementSnapshots(snapshots, validatedReplacementIds, input.clock.now());
-      const generation = input.queue.installRenewedGeneration(guard, nextSnapshots, input.clock.now());
+      const installedAt = input.clock.now();
+      const nextSnapshots = replacementSnapshots(snapshots, validatedReplacementIds, sourceCreatedAt);
+      const generation = input.queue.installRenewedGeneration(guard, nextSnapshots, installedAt, sourceCreatedAt);
       return cleanupOldGeneration(claimed, oldSourceIds, generation);
     } catch (error) {
       return handleError(claimed, classifyTelegramError(error));

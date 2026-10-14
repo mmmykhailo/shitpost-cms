@@ -6,25 +6,31 @@ import { createDatabase } from "../src/db/database";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
 import { createIngestionService } from "../src/services/ingestion";
+import { createRenewalService } from "../src/services/renewal";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId } from "../src/types";
+import type { TelegramGateway } from "../src/telegram";
 import { snapshotFixture } from "./fixtures";
 
 const open = () => {
   const directory = mkdtempSync(join(tmpdir(), "queuebot-ingestion-"));
   const database = createDatabase(join(directory, "bot.sqlite"));
   let currentTime = 10_000;
+  const clock = { now: () => currentTime, sleep: async (milliseconds: number) => { currentTime += milliseconds; } };
+  const queue = createQueueRepository(database);
+  const policy = createPolicyRepository(database);
+  const generated = createGeneratedMessageRepository(database);
   const pending = createPendingUpdateRepository(database);
   const service = createIngestionService({
     queueChannelId: asChatId(-100),
-    queue: createQueueRepository(database),
-    policy: createPolicyRepository(database),
-    generated: createGeneratedMessageRepository(database),
+    queue,
+    policy,
+    generated,
     pending,
     logger: createLogger("error"),
-    now: () => currentTime,
+    now: clock.now,
   });
-  return { directory, database, service, pending, advance: (milliseconds: number) => { currentTime += milliseconds; } };
+  return { directory, database, service, pending, queue, policy, generated, clock, advance: (milliseconds: number) => { currentTime += milliseconds; } };
 };
 
 let current: ReturnType<typeof open> | undefined;
@@ -80,5 +86,61 @@ describe("ingestion service", () => {
     expect(current.service.finalizePendingUpdates()).toEqual([]);
     expect(current.pending.find(-100, 902)?.state).toBe("consumed_generated");
     expect(queue.findBySource(-100, 902)).toBeUndefined();
+  });
+
+  test("suppresses a replacement update finalized before the send promise resolves", async () => {
+    current = open();
+    const earlier = current.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(700), telegramDate: 0 }), 1).item;
+    const later = current.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(701), telegramDate: 0 }), 2).item;
+    const uncertain = current.queue.claimRenewal("earlier-uncertain-renewal", 10_000, 10_000)!;
+    current.queue.setRenewalUncertain(earlier.id, uncertain.operationId, 10_000, "transient_network", "response lost");
+    current.queue.recordReplacementOutput(uncertain.operationId, -100, 801, 0, 10_000);
+    current.advance(1);
+
+    const deleted: number[] = [];
+    const gateway: TelegramGateway = {
+      getBotIdentity: async () => ({ id: 1 as never }),
+      getChat: async () => ({ id: asChatId(-100), type: "channel" }),
+      getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
+      forwardMessages: async () => [],
+      copyMessages: async () => {
+        const replacementId = asMessageId(902);
+        current!.pending.upsert(snapshotFixture({ chatId: asChatId(-100), messageId: replacementId, telegramDate: current!.clock.now() }), current!.clock.now());
+        current!.advance(2_000);
+        expect(current!.service.finalizePendingUpdates()).toEqual([]);
+        expect(current!.pending.find(-100, replacementId)).toMatchObject({ state: "quarantined_renewal_candidate", candidateOperationId: "earlier-uncertain-renewal" });
+        return [replacementId];
+      },
+      forwardMessage: async () => { throw new Error("unused"); },
+      editText: async () => {},
+      editCaption: async () => {},
+      sendText: async () => asMessageId(1),
+      deleteMessages: async (_chatId, ids) => { deleted.push(...ids.map(Number)); },
+      sendAdminMessage: async () => asMessageId(1),
+      editAdminMessage: async () => {},
+      answerCallbackQuery: async () => {},
+    };
+    const renewal = createRenewalService({
+      queue: current.queue,
+      policy: current.policy,
+      generated: current.generated,
+      gateway,
+      queueChannelId: asChatId(-100),
+      clock: current.clock,
+      logger: createLogger("error"),
+      operationId: () => "later-successful-renewal",
+    });
+
+    expect((await renewal.renewNext(0)).kind).toBe("renewed");
+    expect(current.queue.findItemById(earlier.id)?.sourceGeneration).toBe(0);
+    expect(current.queue.currentSourceIds(earlier.id)).toEqual([asMessageId(700)]);
+    expect(current.queue.operationEvidence(earlier.id)?.knownReplacementIds).toEqual([asMessageId(801)]);
+    expect(current.queue.currentSourceIds(later.id)).toEqual([asMessageId(902)]);
+    expect(current.queue.operationEvidence(later.id)?.knownReplacementIds).toEqual([asMessageId(902)]);
+    expect(deleted).toEqual([701]);
+
+    expect(current.service.finalizePendingUpdates()).toEqual([]);
+    expect(current.pending.find(-100, 902)).toMatchObject({ state: "consumed_generated", candidateOperationId: "later-successful-renewal" });
+    expect(current.queue.listActive(10).map((item) => item.id)).toEqual([earlier.id, later.id]);
   });
 });
