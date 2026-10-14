@@ -21,7 +21,9 @@ The database defaults to `./data/bot.sqlite`. It is WAL-backed and is intentiona
 - Albums are collected briefly and count as one logical FIFO item.
 - A source is deleted only after the complete destination output is recorded. Ambiguous sends stop for admin review; they are never silently retried.
 - The Bot API retains unconsumed updates for at most 24 hours, so the process must be monitored. It cannot enumerate missed queue history.
-- Ordinary Bot API deletion has a 48-hour age limit. The renewal worker creates a new physical queue generation at 36 hours while SQLite keeps the immutable logical FIFO order. Renewals visibly move messages to the bottom of the private channel.
+- `/queue` links each stable item number to its current queue-channel source; an album links to its first current member. The displayed queue age is total time since the item was first enqueued and does not reset on renewal. `/health` reports physical source age separately.
+- Ordinary Bot API deletion has a 48-hour age limit. At 36 hours, a sequential worker drains due renewals using conservative per-message pacing while SQLite keeps the immutable logical FIFO order. Renewals continue when scheduled publishing is paused and visibly move messages to the bottom of the private channel.
+- Renewal requires the complete replacement set before old sources are deleted. Uncertain or partial results preserve the originals for admin review. A Telegram flood wait is persisted as a shared cooldown across outbound mutations and survives restart.
 - Queue and destination IDs are numeric Telegram chat IDs. Publication slots are strict daily `HH:MM UTC` values, with at most 96 slots.
 
 ## Admin commands

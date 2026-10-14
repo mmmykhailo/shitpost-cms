@@ -14,5 +14,9 @@ The real Telegram checklist remains a deployment prerequisite. It requires a dis
 8. Configured rights allow queue and destination cleanup.
 9. Protected and unsupported content produces the expected errors.
 10. Private queue message links used by recovery resolve as expected.
+11. Reopening `/queue` after one and repeated renewals links the stable item number to the current replacement message.
+12. A renewed album retains every member and order, and its queue link opens the first current member.
+13. `/queue`, `/manage`, and `/health` display readable ages and label total queue age separately from physical source age.
+14. Partial album replacement evidence is shown for admin review while surviving originals remain in the queue.
 
-Record the date, Bot API behavior, and any plan changes here before enabling production scheduling. In particular, a failed origin-preservation check blocks the Bot API renewal design.
+The added checks 11–14 are still unverified against live Telegram; the automated suite uses fake transport and local clocks. Record the date, observed Bot API behavior, and any plan changes here before enabling production scheduling. In particular, a failed origin-preservation check blocks the Bot API renewal design.
