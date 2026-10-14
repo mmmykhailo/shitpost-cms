@@ -83,6 +83,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const warnings: Array<{ event: string; fields: LogFields | undefined }> = [];
   let nextMessageId = 100;
   let deleteFailure: unknown;
+  let physicalAgeMs: number | undefined;
   let resolvedChat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" } = { id: asChatId(-100555), type: "channel" };
 
   const gateway = {
@@ -155,7 +156,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
         queueCounts: {},
         queueHead: undefined,
         oldestLogicalAgeMs: undefined,
-        oldestPhysicalAgeMs: undefined,
+        oldestPhysicalAgeMs: physicalAgeMs,
         nextSlotAt: undefined,
         lastSchedulerScanAt: null,
         activeOperations: 0,
@@ -189,6 +190,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     deleted,
     warnings,
     setDeleteFailure: (error: unknown): void => { deleteFailure = error; },
+    setPhysicalAge: (ageMs: number): void => { physicalAgeMs = ageMs; },
     setResolvedChat: (chat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" }): void => { resolvedChat = chat; },
     lastSent: (): SentMessage => {
       const message = sent.at(-1);
@@ -532,6 +534,39 @@ describe("admin schedule handlers", () => {
 });
 
 describe("admin command, queue, and publication handlers", () => {
+  test("renders readable queue age and links the stable item number to its current source", async () => {
+    const harness = createHarness();
+    try {
+      const queueAge = 247_668_018;
+      const sourceMessageId = 1501;
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({
+        chatId: QUEUE_CHAT_ID,
+        messageId: asMessageId(sourceMessageId),
+        telegramDate: NOW - queueAge,
+      }), NOW - queueAge).item;
+
+      await harness.run(commandUpdate(299, 299, "queue"));
+
+      const listing = harness.lastSent();
+      expect(listing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+      expect(listing.message.text).not.toContain(`${queueAge} ms`);
+      const entities = listing.payload.entities as Array<{ type: string; offset: number; length: number; url?: string }>;
+      const link = entities?.find((entity) => entity.type === "text_link");
+      expect(link).toBeDefined();
+      expect(listing.message.text.slice(link!.offset, link!.offset + link!.length)).toBe(`#${item.id}`);
+      expect(link?.url).toBe("https://t.me/c/1234567890/1501");
+      expect(listing.payload.parse_mode).toBeUndefined();
+
+      await harness.run(commandUpdate(298, 298, "manage"));
+      expect(harness.lastSent().message.text).toContain("logical age 2.87 days");
+      harness.setPhysicalAge(queueAge);
+      await harness.run(commandUpdate(297, 297, "health"));
+      expect(harness.lastSent().message.text).toContain("oldest physical source age: 2.87 days");
+    } finally {
+      harness.close();
+    }
+  });
+
   test("renders every dashboard command and paginates a populated queue", async () => {
     const harness = createHarness();
     try {
@@ -540,12 +575,16 @@ describe("admin command, queue, and publication handlers", () => {
         expect(harness.lastSent().message.text.length).toBeGreaterThan(0);
       }
       expect(harness.calls.some((call) => call.method === "setMyCommands")).toBe(true);
-      for (let index = 0; index < 11; index += 1) harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1000 + index) }), NOW + index);
+      for (let index = 0; index < 11; index += 1) harness.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1000 + index) }), NOW + index);
       await harness.run(commandUpdate(310, 310, "queue"));
       const firstPage = harness.lastSent();
       expect(firstPage.message.text).toContain("items 1–10");
+      expect(firstPage.payload.entities).toHaveLength(10);
       await harness.run(callbackUpdate(311, "queue-next", harness.callbackData(firstPage, "Next"), firstPage.message));
-      expect(harness.lastSent().message.text).toContain("items 11–11");
+      const secondPage = harness.lastSent();
+      expect(secondPage.message.text).toContain("items 11–11");
+      expect(secondPage.payload.entities).toHaveLength(1);
+      expect((secondPage.payload.entities as Array<{ url: string }>)[0]?.url).toBe("https://t.me/c/1234567890/1010");
     } finally {
       harness.close();
     }
@@ -602,6 +641,22 @@ describe("admin command, queue, and publication handlers", () => {
       await harness.run(commandUpdate(334, 334, "queue"));
       await harness.run({ update_id: 335, message: makeMessage(335, "hello", stranger) } as Update);
       expect(harness.lastSent().message.text).toBe("Not authorized.");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("keeps queue link offsets correct when the uncertainty notice precedes rows", async () => {
+    const harness = createHarness();
+    try {
+      prepareUncertainPublication(harness, 1601);
+      await harness.run(commandUpdate(338, 338, "queue"));
+      const listing = harness.lastSent();
+      expect(listing.message.text).toContain("destination may already contain");
+      const link = (listing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
+      expect(link).toBeDefined();
+      expect(listing.message.text.slice(link!.offset, link!.offset + link!.length)).toBe("#1");
+      expect(link?.url).toBe("https://t.me/c/1234567890/1601");
     } finally {
       harness.close();
     }

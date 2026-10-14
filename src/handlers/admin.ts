@@ -2,7 +2,9 @@ import type { Bot, Context } from "grammy";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { classifyTelegramError } from "../errors";
 import { validateAlias } from "../domain/byline";
+import { formatAge } from "../domain/age";
 import { formatUtcSlot, parseUtcSlot } from "../domain/schedule";
+import { buildQueueMessageLink } from "../domain/telegram-message-link";
 import { validateOrderedMessageIds } from "../domain/validation";
 import type { PolicyRepository, QueueRepository, ScheduleRepository } from "../db/repositories";
 import type { AdminRepository } from "../db/admin-repository";
@@ -62,13 +64,14 @@ const button = async (deps: AdminDeps, text: string, action: string, payload: un
 const keyboard = (rows: Array<Awaited<ReturnType<typeof button>>[]>): InlineKeyboardMarkup => ({ inline_keyboard: rows });
 
 const dashboardText = (deps: AdminDeps): string => {
+  const now = deps.now();
   const counts = deps.queue.statusCounts();
   const head = deps.queue.getHead();
   const slots = deps.schedule.slots();
   const next = deps.scheduler.nextAt();
   const nextText = next === undefined ? "not configured" : new Date(next).toISOString();
   const status = deps.schedule.enabled() ? "running" : "paused";
-  const headText = head ? `#${head.id} · ${head.status} · logical age ${Math.max(0, deps.now() - head.enqueuedAt)} ms` : "empty";
+  const headText = head ? `#${head.id} · ${head.status} · logical age ${formatAge(Math.max(0, now - head.enqueuedAt))}` : "empty";
   return [
     "Telegram queue manager",
     `Schedule: ${status} · ${slots.map(formatUtcSlot).join(", ") || "no UTC slots"}`,
@@ -163,13 +166,25 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendQueue = async (ctx: Context, offset = 0): Promise<void> => {
+    const now = deps.now();
     const pageSize = 10;
     const page = deps.queue.listActive(pageSize + 1, Math.max(0, offset));
     const items = page.slice(0, pageSize);
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
-    const lines = [`Queue (FIFO) · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`, ...items.map((item) => `#${item.id} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${Math.max(0, deps.now() - item.enqueuedAt)} ms`)];
-    if (deps.queue.getHead()?.status === "uncertain_publish") lines.splice(1, 0, "The destination may already contain this post. This item stays in the active FIFO queue until an explicit resolution prevents duplication.");
+    const lines = [`Queue (FIFO) · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`];
+    if (deps.queue.getHead()?.status === "uncertain_publish") lines.push("The destination may already contain this post. This item stays in the active FIFO queue until an explicit resolution prevents duplication.");
+    let text = lines.join("\n");
+    const entities: Array<{ type: "text_link"; offset: number; length: number; url: string }> = [];
     for (const item of items) {
+      const label = `#${item.id}`;
+      const row = `${label} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${formatAge(Math.max(0, now - item.enqueuedAt))}`;
+      const rowOffset = text.length + 1;
+      text += `\n${row}`;
+      const sourceMessageId = deps.queue.currentSourceIds(item.id)[0];
+      if (sourceMessageId !== undefined) {
+        const url = buildQueueMessageLink(deps.config.queueChannelId, sourceMessageId);
+        if (url !== undefined) entities.push({ type: "text_link", offset: rowOffset, length: label.length, url });
+      }
       const actions: Array<Awaited<ReturnType<typeof button>>> = [await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion)];
       if (item.status === "uncertain_publish") actions.push(await button(deps, `Resolve #${item.id}`, "queue_uncertain", { itemId: item.id }, item.contentVersion));
       else if (item.maintenanceStatus === "uncertain_renewal") actions.push(await button(deps, `Resolve renewal #${item.id}`, "renewal_uncertain", { itemId: item.id }, item.contentVersion));
@@ -182,7 +197,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (page.length > pageSize) navigation.push(await button(deps, "Next", "queue", { offset: offset + pageSize }));
     if (navigation.length > 0) rows.push(navigation);
     rows.push([await button(deps, "Back", "dashboard")]);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await ctx.reply(text, { entities, link_preview_options: { is_disabled: true }, reply_markup: keyboard(rows) });
   };
 
   const sendPublicationOutcome = async (ctx: Context, outcome: PublicationOutcome): Promise<void> => {
@@ -274,10 +289,10 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
 
   const sendHealth = async (ctx: Context): Promise<void> => {
     const health = deps.health.snapshot();
-    const oldest = health.oldestPhysicalAgeMs === undefined ? "none" : `${Math.floor(health.oldestPhysicalAgeMs / 3_600_000)}h`;
+    const oldest = health.oldestPhysicalAgeMs === undefined ? "none" : formatAge(health.oldestPhysicalAgeMs);
     const pending = Object.entries(health.pendingUpdates).map(([state, count]) => `${state}=${count}`).join(", ") || "none";
     const rights = health.rights ? `queue post/delete=${health.rights.queue.canPostMessages}/${health.rights.queue.canDeleteMessages} · target post/edit/delete=${health.rights.target.canPostMessages}/${health.rights.target.canEditMessages}/${health.rights.target.canDeleteMessages}` : "unknown";
-    await ctx.reply(["Health", `Database: ${health.databaseOk ? "available" : "failed"}`, `Boot: ${health.bootId ?? "unknown"} · lease ${health.leaseOwned ? "owned" : "lost"}`, `Queue head: ${health.queueHead ?? "empty"} · oldest physical source: ${oldest}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`, `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`, `Pending updates: ${pending}`, `Orphans: ${health.orphanCounts.unresolved} unresolved · ${health.orphanCounts.terminal} manual`, `Renewal capacity: ${health.renewalCapacity.safe ? "safe" : "unsafe"}`, `Telegram rights: ${rights}`, `Last update: ${health.lastSuccessfulUpdateAt ? new Date(health.lastSuccessfulUpdateAt).toISOString() : "unknown"}`, `Last rights check: ${health.lastRightsCheckAt ? new Date(health.lastRightsCheckAt).toISOString() : "unknown"}`, `Last backup: ${health.lastBackupAt ? new Date(health.lastBackupAt).toISOString() : "unknown"}`, `Active alerts: ${health.alerts.active}`].join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) });
+    await ctx.reply(["Health", `Database: ${health.databaseOk ? "available" : "failed"}`, `Boot: ${health.bootId ?? "unknown"} · lease ${health.leaseOwned ? "owned" : "lost"}`, `Queue head: ${health.queueHead ?? "empty"} · oldest physical source age: ${oldest}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`, `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`, `Pending updates: ${pending}`, `Orphans: ${health.orphanCounts.unresolved} unresolved · ${health.orphanCounts.terminal} manual`, `Renewal capacity: ${health.renewalCapacity.safe ? "safe" : "unsafe"}`, `Telegram rights: ${rights}`, `Last update: ${health.lastSuccessfulUpdateAt ? new Date(health.lastSuccessfulUpdateAt).toISOString() : "unknown"}`, `Last rights check: ${health.lastRightsCheckAt ? new Date(health.lastRightsCheckAt).toISOString() : "unknown"}`, `Last backup: ${health.lastBackupAt ? new Date(health.lastBackupAt).toISOString() : "unknown"}`, `Active alerts: ${health.alerts.active}`].join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) });
   };
 
   const handlePrompt = async (ctx: Context, text: string): Promise<boolean> => {
