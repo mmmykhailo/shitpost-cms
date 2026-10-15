@@ -1,17 +1,20 @@
 # Telegram Channel Queue Bot — Implementation Plan
 
-Status: **implementation-ready**  
+Status: **baseline design; implementation behavior updated 2026-10-15**
+
 Last researched: 2026-10-04
+
+This document began as the pre-implementation design. The current queue-preparation implementation changes several baseline rules: queue content is prepared before publication, channel policy is captured at receipt, issue items do not block later ready items, hidden sender names can have exact-string nicknames, and unknown recovery defaults to the messages as shown. The sections below have been updated where those changes affect operator or product behavior. See the current code and `docs/queue-preparation-implementation-plan.md` for the complete prepared-queue state machine. This status describes local implementation work, not a production deployment or live Telegram verification.
 
 ## 1. Objective
 
-Build a Bun + TypeScript bot that treats a private Telegram channel as a FIFO queue and publishes one logical post at each configured wall-clock slot to a destination channel.
+Build a Bun + TypeScript bot that treats a private Telegram channel as an ordered queue, prepares posts so the queue shows the content intended for publication, and publishes the earliest eligible logical post at each configured wall-clock slot to a destination channel.
 
 For every queued post:
 
-- If its original source is a whitelisted channel, forward it so Telegram keeps the source attribution.
-- If its original source is a non-whitelisted channel, copy it so Telegram removes the source attribution.
-- If its original source is a user, copy it and append `by <name>` using a configured alias when one exists, otherwise the Telegram display name.
+- Capture channel whitelist policy when a post is received. A listed channel source is forwarded during preparation so Telegram keeps source attribution; an unlisted channel source is copied without attribution.
+- Copy identifiable-user sources during preparation and append one generated `by <name>` credit using a configured nickname when one exists, otherwise the Telegram display name.
+- Hidden-user sender names may have persistent exact-string nicknames, separate from stable user-ID aliases.
 - After successful publication, delete the source post from the queue channel.
 - Let the single administrator identified by `ADMIN_USER_ID` manage the publication slots, channel whitelist, author aliases, and queue status in a private chat with the bot.
 
@@ -29,7 +32,7 @@ These constraints are architectural, not framework-specific.
 
 4. **Some content cannot be copied.** Service messages, paid media, giveaways, giveaway winners, and invoices cannot be copied; some protected content cannot be forwarded. Such items must remain in the queue and produce an admin alert instead of being deleted. [Bot API: `copyMessages`](https://core.telegram.org/bots/api#copymessages), [Telegram content protection](https://core.telegram.org/api/content-protection)
 
-5. **User origins are not always identifiable.** `forward_origin` may contain a known user, only a hidden-user display string, a chat, or a channel. A hidden user has no stable ID, so a durable custom alias cannot safely be attached to that person. [Bot API: `MessageOrigin`](https://core.telegram.org/bots/api#messageorigin)
+5. **User origins are not always identifiable.** `forward_origin` may contain a known user, only a hidden-user display string, a chat, or a channel. A hidden user has no stable ID; the product intentionally supports a shared nickname keyed by the exact forwarded sender-name string, separate from identifiable-user aliases. [Bot API: `MessageOrigin`](https://core.telegram.org/bots/api#messageorigin)
 
 6. **Exactly-once delivery is not fully achievable with the Bot API.** Publishing to Telegram and committing local SQLite state cannot be one atomic transaction. The design prefers no data loss and reduces duplicate risk, but a process/network failure after Telegram accepted a post and before the response was durably recorded can leave an uncertain outcome requiring admin review.
 
@@ -90,14 +93,14 @@ Before implementation, run a small Bun compatibility spike that starts grammY ag
 
 ### 4.2 Origin policy
 
-Apply one deterministic pure function to the first message in the logical item:
+Capture channel delivery mode when the item is received, then apply one deterministic preparation policy to the first message in the logical item:
 
 | `forward_origin` | Policy |
 | --- | --- |
 | `channel` and `origin.chat.id` is whitelisted | `forwardMessage` / `forwardMessages`; preserve Telegram attribution |
 | `channel` and not whitelisted | `copyMessage` / `copyMessages`; no attribution |
 | `user` | Copy; append `by <alias>` when an alias matches stable user ID, otherwise Telegram first + optional last name |
-| `hidden_user` | Copy; append `by <sender_user_name>`; aliases are unavailable because Telegram supplies no stable identity |
+| `hidden_user` | Copy; append `by <exact-name nickname or sender_user_name>`; nickname keys are the exact forwarded sender-name string and remain separate from user-ID aliases |
 | `chat` | Copy without attribution unless a future product decision adds chat whitelisting |
 | absent | Copy without attribution; this is the confirmed behavior for posts composed directly in the queue |
 
@@ -106,14 +109,14 @@ Alias lookup order:
 1. stable Telegram user ID;
 2. last-seen normalized username only to resolve an admin's alias-management input to that stable ID;
 3. Telegram display name (`first_name` plus optional `last_name`) when no alias exists;
-4. `sender_user_name` for a hidden user;
+4. An exact-name nickname for a hidden user, otherwise `sender_user_name`;
 5. `Unknown` only if Telegram supplied no usable display string.
 
-Store both stable ID and last-seen username when possible. Usernames are mutable and must not be the canonical key once an ID has been observed. A username is never used as the public byline unless it is itself the configured alias; the default is the user's Telegram display name.
+Store both stable ID and last-seen username when possible. Usernames are mutable and must not be the canonical key once an ID has been observed. A username is never used as the public byline unless it is itself the configured alias; the default is the user's Telegram display name. Hidden-name keys are case-, whitespace-, and Unicode-sequence-sensitive by design.
 
 ### 4.3 Appending the byline
 
-- Append plain text `\n\nby <name>` without parse mode, avoiding injection through aliases or Telegram names.
+- During preparation, append plain text `\n\nby <name>` without parse mode, avoiding injection through aliases or Telegram names. Publication transfers the prepared representation and must not append a second credit.
 - For a text message, copy it, then edit the copied text with the original entities plus the plain byline.
 - For one media message, call `copyMessage` with a replacement caption containing the original caption plus byline.
 - For an album, call `copyMessages` to preserve grouping, then edit the caption of the designated caption-bearing item.
@@ -137,9 +140,9 @@ Any source-bearing non-active state
 
 Publication sequence:
 
-1. Atomically claim the oldest `queued` item in SQLite as `publishing`.
-2. Decide forward/copy/byline behavior from the stored origin and current whitelist/alias state.
-3. Publish the complete item to `TARGET_CHANNEL_ID`.
+1. Select the earliest eligible prepared item in `logical_sequence` order; do not let an issue item block a later ready candidate.
+2. Atomically claim the candidate in SQLite and validate its captured version, source generation, and prepared contract.
+3. Transfer the prepared members and groups to `TARGET_CHANNEL_ID` without recalculating whitelist/nickname policy or adding a second credit.
 4. Immediately persist every destination message ID and transition to `published_cleanup_pending`.
 5. Delete all source message IDs with `deleteMessages`.
 6. Transition to `done` and retain a compact audit row; do not retain full message content indefinitely.
@@ -213,7 +216,7 @@ Author alias flow:
 
 - The bot indexes `MessageOriginUser` identities observed in queue posts.
 - An arbitrary Telegram username cannot always be resolved to a user by the Bot API. `@username` alias entry therefore works only after that user has been observed; otherwise the UI explains how to queue/forward a sample first or enter a numeric user ID.
-- Hidden-user forward origins can display a name but cannot be assigned a stable alias.
+- Hidden-user forward origins can receive a shared nickname keyed by their exact sender-name string; this is separate from stable user-ID aliases.
 
 Recovery flow for >24-hour downtime:
 
@@ -414,10 +417,10 @@ Add a small optional manual sandbox checklist for a separate Telegram test bot a
 ## 10. Acceptance criteria
 
 - A new queue post is durably indexed once, including after duplicate Telegram updates.
-- At each enabled wall-clock slot, exactly one locally known logical item is selected FIFO.
+- At each enabled wall-clock slot, the earliest eligible prepared logical item is selected in stable queue order; issue items do not block later ready items.
 - A whitelisted channel origin remains visibly forwarded from that channel.
 - A non-whitelisted channel origin has no source attribution.
-- A known user origin has `by <configured alias>`; an unaliased known/hidden user uses Telegram's supplied display name.
+- A known user origin has one `by <configured nickname>` credit when configured; hidden-user names can have their own exact-string nickname. Nickname refresh never overwrites an administrator edit.
 - An album remains one grouped album and counts as one queue item.
 - The source is deleted only after confirmed publication of the complete item.
 - Restart after successful publication but before deletion performs cleanup only.
@@ -453,7 +456,7 @@ This section is normative. If an earlier summary is less precise, these rules wi
 
 ### 12.1 Terminology
 
-- **Logical item**: one publishable unit in SQLite. It is either one Telegram message or one media album.
+- **Logical item**: one publishable unit in SQLite. It may contain a Telegram message or album plus a separate generated/admin-selected credit member.
 - **Physical source**: the current Telegram message ID or ordered list of message IDs in the private queue channel that backs a logical item.
 - **Generation**: an integer starting at `0` and incremented every time a physical source is renewed.
 - **Publication output**: every destination-channel message created for one logical item. Usually one message or one album; a user-origin message that cannot carry a caption may also create a second attribution message.
@@ -467,20 +470,22 @@ This section is normative. If an earlier summary is less precise, these rules wi
 3. A source is never deleted before a usable replacement or complete publication output has been durably recorded.
 4. A publication output is never intentionally created twice. When the result of an API call is uncertain, automation stops for that item and asks the admin rather than guessing.
 5. A scheduled slot publishes at most one logical item. Albums still count as one item.
-6. The oldest unresolved logical item controls FIFO. Later items do not pass a blocked, `needs_edit`, or uncertain head item unless the admin explicitly deletes it or moves it to the end.
-7. Whitelist and alias policy is evaluated at publication time, not enqueue time. Changes therefore apply to posts that are already waiting.
+6. `logical_sequence` remains the stable order, but issue or unprepared items do not block later ready candidates. Definite no-output failures may yield to the next ready candidate in one bounded slot attempt. A possible output, successful publication, or shared Telegram outage/access condition stops that attempt.
+7. Channel delivery policy is captured at receipt. Nickname updates refresh only untouched generated credits and do not recalculate captured delivery or overwrite administrator edits.
 8. Origin identity is captured at first ingestion and never replaced by the queue channel's identity during renewal.
 9. Telegram message IDs are always stored together with their chat ID; a bare message ID is never treated as globally unique.
 10. All timestamps used for scheduling and leases are UTC Unix epoch milliseconds. Telegram's second-resolution `date`/`edit_date` values are converted once at the boundary.
 11. No SQLite transaction remains open while awaiting a Telegram network call.
 12. Unknown Telegram message types fail closed into admin review; they are never silently published or deleted.
 
-### 12.3 FIFO behavior when the head cannot publish
+### 12.3 Ordered selection when an item cannot publish
 
-- A transient failure keeps the head item in place with `retry_not_before`. The current slot may retry within its short retry budget; otherwise the next slot tries the same head item.
-- A permanent content/permission/length failure changes the head to `blocked` or `needs_edit`. Future slots report that the queue is blocked and publish nothing.
-- The admin can **Retry now**, **Delete**, or **Move to end**. Moving to end assigns a new sequence in one transaction and records an audit event.
-- An item manually deleted in Telegram is removed when absence is proven, allowing the next item to become head.
+- The queue retains each item's logical position. Publication scans in that order for the earliest eligible prepared candidate.
+- An issue, active retry delay, or unfinished preparation makes that item ineligible for the current attempt; later ready items can proceed without moving it to the end.
+- A definite failure before any output may be recorded and the next ready candidate tried, subject to a bounded pass and at most one successful logical publication for the slot.
+- An uncertain send, successful publication, or shared Telegram outage/access failure stops the pass. A possibly published item is not automatically sent again.
+- **Move to end** remains an explicit audited action and is distinct from skipping an ineligible item.
+- An item manually deleted in Telegram is removed when absence is proven during an ordinary transfer attempt.
 
 ## 13. Telegram content and attribution matrix
 
@@ -490,23 +495,24 @@ Telegram limits ordinary text to 4096 characters and media captions to 1024 char
 
 Evaluate the semantic origin saved at initial ingestion:
 
-| Semantic origin | Current policy lookup | Destination operation | Added byline |
+| Semantic origin | Captured preparation policy | Queue representation and publication transfer | Generated credit |
 | --- | --- | --- | --- |
-| Channel | Channel ID currently whitelisted | Forward current physical source | No |
-| Channel | Channel ID not currently whitelisted | Copy current physical source | No |
-| Known user | Alias exists for stable user ID | Copy, then add `by <alias>` | Yes |
-| Known user | No alias | Copy, then add `by <first_name> <last_name?>` | Yes |
-| Hidden user | No stable lookup possible | Copy, then add `by <sender_user_name>` | Yes |
-| Chat/group/anonymous admin | No v1 whitelist support | Copy | No |
-| No forward origin | None | Copy | No |
-| Unknown future origin variant | None | Block for review | No automatic publication |
+| Channel | Captured mode is `forward` | Prepared forward is transferred as recorded | No |
+| Channel | Captured mode is `copy` | Prepared copy is transferred as recorded | No |
+| Known user | Alias exists when preparation runs | Prepared copy plus generated credit member | Yes |
+| Known user | No alias when preparation runs | Prepared copy plus display-name credit member | Yes |
+| Hidden user | Exact-name nickname exists when preparation runs | Prepared copy plus generated credit member | Yes |
+| Hidden user | No exact-name nickname | Prepared copy plus sender-name credit member | Yes |
+| Chat/group/anonymous admin | No v1 whitelist support | Prepared copy | No |
+| No forward origin | None | Prepared copy | No |
+| Unknown future origin variant | None | Held for review | No automatic publication |
 
 Additional rules:
 
 - Whitelisting is only for `MessageOriginChannel`. A group, supergroup, or anonymous `MessageOriginChat` never qualifies accidentally.
 - The canonical whitelist comparison is exact signed numeric channel ID. Handles and titles are display metadata only.
 - The original channel's `author_signature` is not a user identity and does not invoke user alias behavior.
-- If messages inside one album have inconsistent semantic origins, mark the whole item `needs_review`; do not apply the first message's policy to the rest.
+- Whitelist mode and initial nickname resolution are captured into prepared work; later publication does not consult the current whitelist or append another byline.
 - A changed or removed channel handle does not affect an existing whitelist entry.
 - A changed user username does not detach an alias because aliases are keyed by stable user ID.
 
@@ -595,11 +601,11 @@ For captionless user-origin content, the separate byline message is part of the 
 
 1. Materialize a unique `schedule_runs` row for the UTC slot occurrence.
 2. Acquire the global publication lease. If another manual/scheduled publication owns it, leave the run pending briefly; never run two publications concurrently.
-3. Select the lowest `logical_sequence` source-bearing item.
-4. If none exists, mark the run `empty`.
-5. If the head is blocked, uncertain, collecting, or before `retry_not_before`, mark the run `blocked` with the item ID; do not select a later item.
-6. Claim the head using a random operation token and capture `content_version`, source generation, source IDs, and policy inputs.
-7. Execute the content-specific Telegram calls.
+3. Select the earliest ready candidate in `logical_sequence` order; exclude collecting, unresolved, unprepared, and retry-delayed items without moving them.
+4. If no ready candidate exists, mark the run `empty` or `blocked` with a concise no-candidate reason.
+5. Claim a candidate using a random operation token and capture `content_version`, source generation, source IDs, and its frozen preparation contract.
+6. Transfer the prepared members and their roles/groups without recalculating aliases, whitelist policy, or appending another byline.
+7. After a definite no-output failure, continue through a bounded candidate pass. Stop after one logical post publishes, output is uncertain, or a shared failure occurs.
 8. Persist every known destination ID immediately in `operation_outputs`, then move to cleanup.
 9. Recheck operation token, source generation, and content version.
 10. Delete current physical sources. If deletion succeeds or reports already absent, mark the item `done` and the schedule run `published`.
@@ -607,9 +613,9 @@ For captionless user-origin content, the separate byline message is part of the 
 
 ### 14.6 Manual publish
 
-- Uses the same publication algorithm and global lease but creates a `manual` operation rather than a `schedule_runs` occurrence.
+- Uses the same earliest-ready selection, bounded fallback, and global lease but creates a `manual` operation rather than a `schedule_runs` occurrence.
 - Does not mark any scheduled occurrence handled and does not change the next UTC slot.
-- Requires an inline confirmation showing the head item, chosen origin policy, and whether attribution will be preserved, removed, or appended.
+- Requires an inline confirmation showing the selected ready item and its already-prepared representation.
 - Repeated button presses are idempotent through a one-time callback token and the global lease.
 
 ### 14.7 Renewal
@@ -646,17 +652,17 @@ If a source is older than 48 hours after downtime, still attempt to create a fre
 
 Recovery is explicit because the bot cannot enumerate channel history.
 
-1. Admin supplies one private queue message link/ID, or an ordered list/range for a known album.
+1. Admin supplies one private queue message link/ID or an ordered selection/range of up to 10 queue message IDs. Unknown messages default to as-shown recovery.
 2. Parse a link locally. For a private-channel `t.me/c/...` link, verify its internal channel component matches the configured queue channel; otherwise reject it.
 3. Reject duplicate IDs, non-increasing album IDs, more than 10 album members, or any ID already active in SQLite.
 4. Forward each source ID individually to the admin chat. Individual `forwardMessage` calls return full `Message` objects, unlike the bulk methods that return only message IDs; these temporary previews provide content/origin snapshots for recovery.
 5. Durably record every temporary preview ID as it arrives so a crash can clean it up later.
-6. Validate that all recovered members exist, have compatible content for one album, and have the same semantic origin.
+6. Validate that selected members exist and retain their recorded transfer mode and real Telegram album grouping. A selected ordered bundle may contain multiple groups or a separate credit when explicitly requested; do not infer a single album from adjacent IDs.
 7. Derive semantic origin carefully:
    - an external channel/user/hidden-user origin remains that origin;
    - an origin channel equal to `QUEUE_CHANNEL_ID` means the source was an original queue post or a renewed copy and is stored as semantic origin `absent`;
    - any ambiguity becomes `needs_review` rather than guessing.
-8. Insert the logical item at the end of FIFO with generation `0`, preserving the supplied source IDs and their Telegram dates.
+8. Insert the logical item at the end of FIFO with generation `0`, preserving the supplied source IDs and their Telegram dates. Keep it ready to publish as shown, without adding a credit or inferring an author. An explicit **Apply preparation rules** action may prepare eligible recovered content; `--credit-last` records the final standalone text message as an explicit separate credit.
 9. Delete all temporary admin previews. Preview cleanup failure creates an orphan cleanup record but does not invalidate the recovered queue item.
 
 Recovery cannot prove that the admin supplied every missed post, nor can it infer an album's missing member IDs. The UI must say this explicitly and show the recovered IDs before confirmation.
@@ -886,8 +892,9 @@ Telegram documents that missing members may be skipped by `forwardMessages`/`cop
 ### 18.4 Admin alert policy
 
 - Immediate alerts: uncertain send, permissions lost, renewal source >=46h, database/migration failure, singleton conflict, corrupt state.
-- Normal alerts: head blocked, byline overflow, unsupported content, external deletion detected.
-- Deduplicate on `(category, item_id or subsystem)`. Repeat unresolved immediate alerts at most every six hours; normal alerts at most daily.
+- Normal alerts: item-specific content/preparation issues, unsupported content, and actionable deletion or cleanup issues.
+- Item issue alerts are on-change: send once per material condition, send again after a material change or recurrence, and durably retry failed deliveries without repeating an unchanged issue.
+- Keep periodic repeat windows for operational alarms that still need them; do not apply those windows to on-change item alerts.
 - Send a resolution message when an immediate condition clears.
 
 ## 19. Admin interaction specification
@@ -914,7 +921,7 @@ Show:
 - scheduling enabled/paused and sorted UTC slots;
 - next slot and whether an overdue recovery run exists;
 - active queue count, blocked count, uncertain count;
-- head item summary and intended attribution policy;
+- next-ready item summary, outstanding issue count, and the selected item's already-prepared representation;
 - oldest logical age and oldest physical source age;
 - renewal warning/critical count and orphan cleanup count;
 - last successful poll/update, publication, renewal, and database backup;
@@ -950,8 +957,8 @@ Prefer editing one dashboard message. If edit fails because it is too old/delete
 - Browse observed known users by last seen, display name, username, stable ID, and existing alias.
 - Entering `@username` resolves only against `known_authors`; it never claims to query all Telegram users.
 - Confirm the resolved stable ID before saving an alias.
-- Alias update/removal affects waiting items immediately.
-- Hidden-user origins are shown as non-aliasable. Two hidden users with the same display string are never merged.
+- Identifiable-user alias updates/removal refresh untouched generated credits on waiting items.
+- Hidden-user names can be selected and assigned exact-string nicknames, separate from user-ID aliases. Two distinct people with the same forwarded name intentionally share a nickname; case, spaces, and Unicode sequences remain exact.
 
 ### 19.7 Prompt and callback safety
 
@@ -1151,7 +1158,7 @@ Exit criteria: all supported synthetic updates produce deterministic logical ite
 
 ### Gate D — publication and cleanup
 
-Deliver policy-driven forward/copy/byline paths, operation/output records, strict FIFO, partial cleanup, retries, uncertain-state UX, and manual publish/delete.
+Deliver receipt-time policy capture, prepared output, versioned operation/output records, earliest-ready selection with bounded fallback, partial cleanup, retries, uncertain-state UX, and manual publish/delete.
 
 Exit criteria: crash-matrix service tests pass and no known failure path deletes a source prematurely.
 
@@ -1207,7 +1214,7 @@ Rules:
 `QueueRepository`
 
 - ingest single/member, finalize album, update snapshot;
-- select/claim FIFO head with compare-and-swap;
+- select/claim the earliest ready candidate in stable sequence order with compare-and-swap;
 - claim renewal candidates;
 - install new source generation;
 - record outputs and state transitions;
@@ -1223,7 +1230,7 @@ Rules:
 
 `PolicyRepository`
 
-- resolve current whitelist membership;
+- resolve whitelist membership when new input enters ingestion;
 - list/add/remove channels;
 - observe user identity;
 - resolve/set/remove alias.
@@ -1240,8 +1247,8 @@ Repositories accept an optional transaction object so multi-table invariants com
 ### 25.3 Service contracts
 
 - `IngestionService`: Telegram update DTO -> durable logical queue mutation.
-- `OriginPolicyService`: immutable snapshot + current policy -> pure publication plan.
-- `PublicationService`: claim -> Telegram calls -> durable output -> cleanup.
+- `PreparationService`: captured receipt-time policy + nickname revision -> durable prepared queue representation.
+- `PublicationService`: earliest-ready prepared candidate -> claim -> transfer recorded members/groups -> durable output -> cleanup; no policy recalculation or byline regeneration.
 - `RenewalService`: age scan -> generation replacement -> old-generation cleanup.
 - `SchedulerService`: UTC clock + slots -> idempotent run -> one publication request.
 - `AdminService`: authorized intent -> validated mutation/confirmation -> rendered view model.
