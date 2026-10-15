@@ -149,6 +149,11 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     if (!/^[0-9a-f]{64}$/u.test(contentFingerprint)) throw new StoredDataValidationError("contentFingerprint must be a SHA-256 hex digest");
     result.contentFingerprint = contentFingerprint;
   }
+  const mediaFingerprint = optionalString(candidate.mediaFingerprint, "mediaFingerprint");
+  if (mediaFingerprint !== undefined) {
+    if (!/^[0-9a-f]{64}$/u.test(mediaFingerprint)) throw new StoredDataValidationError("mediaFingerprint must be a SHA-256 hex digest");
+    result.mediaFingerprint = mediaFingerprint;
+  }
   if (candidate.linkPreviewOptions !== undefined) {
     const options = record(candidate.linkPreviewOptions);
     const linkOptions: NonNullable<StoredMessageSnapshot["linkPreviewOptions"]> = {};

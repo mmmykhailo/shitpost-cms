@@ -317,8 +317,8 @@ const migrations: readonly Migration[] = [
       `ALTER TABLE queue_messages ADD COLUMN member_delivery_mode TEXT CHECK (member_delivery_mode IN ('copy','forward'))`,
       `UPDATE queue_messages
        SET member_delivery_mode = CASE
-         WHEN COALESCE(json_extract(snapshot_json, '$.nativeOrigin.kind'), json_extract(snapshot_json, '$.origin.kind')) = 'channel' THEN 'forward'
-         ELSE 'copy' END`,
+         WHEN COALESCE(json_extract(snapshot_json, '$.nativeOrigin.kind'), json_extract(snapshot_json, '$.origin.kind')) = 'absent' THEN 'copy'
+         ELSE 'forward' END`,
       `ALTER TABLE queue_messages ADD COLUMN album_key TEXT`,
       `ALTER TABLE queue_messages ADD COLUMN removed_at INTEGER`,
       `ALTER TABLE queue_messages ADD COLUMN removal_reason TEXT`,

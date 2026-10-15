@@ -101,8 +101,23 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     database.raw.query(`INSERT INTO queue_preparation_outputs (operation_id, chat_id, telegram_message_id, ordinal, output_key, step_key, source_member_key, role, snapshot_json, recorded_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id, chat_id, telegram_message_id) DO NOTHING`)
       .run(operationId, output.chatId, output.messageId, output.ordinal, output.outputKey, output.stepKey, output.sourceMemberKey ?? null, output.role, snapshotJson, now);
+    const expectedPost = database.raw.query("SELECT 1 FROM queue_generated_events WHERE operation_family = 'preparation' AND operation_id = ? AND chat_id = ? AND message_id = ? AND event_kind = 'post' AND state = 'pending' LIMIT 1").get(operationId, output.chatId, output.messageId);
+    if (!expectedPost) database.raw.query(`INSERT INTO queue_generated_events (id, operation_family, operation_id, chat_id, message_id, event_kind, expected_fingerprint, expected_snapshot_json, state, created_at)
+      VALUES (?, 'preparation', ?, ?, ?, 'post', NULL, ?, 'pending', ?)`)
+      .run(randomUUID(), operationId, output.chatId, output.messageId, snapshotJson, now);
     database.raw.query("UPDATE queue_preparation_operations SET state = 'outputs_recorded', updated_at = ? WHERE id = ? AND state = 'running'").run(now, operationId);
     void row;
+  });
+
+  const expectEdit = (operationId: string, chatId: number, messageId: number, snapshotValue: unknown, now: number): void => database.transaction(() => {
+    assertOwner(operationId);
+    const snapshot = validateStoredMessageSnapshot(snapshotValue);
+    if (Number(snapshot.chatId) !== chatId || Number(snapshot.messageId) !== messageId || !snapshot.contentFingerprint) throw new Error("Expected edit snapshot identity or fingerprint is invalid");
+    const duplicate = database.raw.query("SELECT 1 FROM queue_generated_events WHERE operation_family = 'preparation' AND operation_id = ? AND chat_id = ? AND message_id = ? AND event_kind = 'edit' AND expected_fingerprint = ? AND state = 'pending'").get(operationId, chatId, messageId, snapshot.contentFingerprint);
+    if (duplicate) return;
+    database.raw.query(`INSERT INTO queue_generated_events (id, operation_family, operation_id, chat_id, message_id, event_kind, expected_fingerprint, expected_snapshot_json, state, created_at)
+      VALUES (?, 'preparation', ?, ?, ?, 'edit', ?, ?, 'pending', ?)`)
+      .run(randomUUID(), operationId, chatId, messageId, snapshot.contentFingerprint, asJson(snapshot), now);
   });
 
   const recordCompleteResult = (operationId: string, result: PreparationResult, now: number): void => database.transaction(() => {
@@ -142,12 +157,31 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     }
     const nextPreparationState = result.attribution.ownership === "bot" && result.nicknameRevisionApplied !== item.nickname_revision_wanted ? "refresh_pending" : "ready";
     const primary = members.find((member) => member.role === "content") ?? members[0]!;
-    const installed = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = ?, content_type = ?, representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`)
-      .run(generation, primary.messageId, primary.snapshot.contentType, nextPreparationState, asJson(validateAttributionDescriptor(result.attribution)), result.nicknameRevisionApplied, now, row.item_id, operationId, progress.effectiveContentVersion, row.captured_source_generation);
+    const installed = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = ?, content_type = ?, physical_created_at = ?, representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`)
+      .run(generation, primary.messageId, primary.snapshot.contentType, now, nextPreparationState, asJson(validateAttributionDescriptor(result.attribution)), result.nicknameRevisionApplied, now, row.item_id, operationId, progress.effectiveContentVersion, row.captured_source_generation);
     if (Number(installed.changes) !== 1) throw conflict("Prepared generation lost its guarded install");
     const oldSourceIds = JSON.parse(row.source_ids_json) as MessageId[];
     database.raw.query("UPDATE queue_preparation_operations SET state = 'cleanup_pending', phase = 'source_cleanup_pending', target_source_generation = ?, updated_at = ? WHERE id = ?").run(generation, now, operationId);
     return { itemId: row.item_id, oldSourceIds, preparationState: nextPreparationState };
+  });
+
+  const completeInPlacePreparation = (guard: PreparedExecutionGuard, preparedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number): void => database.transaction(() => {
+    const row = assertOwner(guard.operationId);
+    const progress = validateExecutionProgress(JSON.parse(row.progress_json) as unknown);
+    const item = database.raw.query("SELECT queue_chat_id, nickname_revision_wanted, content_version, source_generation FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(guard.itemId, guard.operationId) as { queue_chat_id: number; nickname_revision_wanted: number; content_version: number; source_generation: number } | null;
+    if (!item || row.kind !== "prepare" || item.content_version !== guard.expectedContentVersion || progress.effectiveContentVersion !== guard.expectedContentVersion || item.source_generation !== guard.capturedSourceGeneration) throw conflict("In-place preparation guard conflict");
+    const capturedKeys = progress.members.map((member) => member.memberKey).sort();
+    const preparedKeys = preparedMembers.map((member) => member.memberKey).sort();
+    if (capturedKeys.length !== preparedKeys.length || capturedKeys.some((key, index) => key !== preparedKeys[index])) throw conflict("In-place preparation must preserve every captured member");
+    for (const member of preparedMembers) {
+      const snapshot = validateStoredMessageSnapshot(member.snapshot);
+      const changed = database.raw.query("UPDATE queue_messages SET member_role = ?, member_delivery_mode = ?, album_key = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND member_key = ? AND telegram_message_id = ? AND removed_at IS NULL").run(member.role, member.deliveryMode, member.albumKey ?? null, asJson(snapshot), guard.itemId, guard.capturedSourceGeneration, member.memberKey, member.messageId);
+      if (Number(changed.changes) !== 1) throw conflict("In-place prepared member changed");
+    }
+    const nextState = attribution.ownership === "bot" && revision !== item.nickname_revision_wanted ? "refresh_pending" : "ready";
+    const installed = database.raw.query("UPDATE queue_items SET representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?").run(nextState, asJson(validateAttributionDescriptor(attribution)), revision, now, guard.itemId, guard.operationId, guard.expectedContentVersion, guard.capturedSourceGeneration);
+    if (Number(installed.changes) !== 1) throw conflict("In-place prepared installation lost its guard");
+    database.raw.query("UPDATE queue_preparation_operations SET state = 'done', phase = 'completed', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded')").run(asJson({ members: preparedMembers, attribution, nicknameRevisionApplied: revision }), now, guard.operationId);
   });
 
   const completeInPlaceRefresh = (guard: PreparedExecutionGuard, updatedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number): void => database.transaction(() => {
@@ -172,7 +206,11 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
   });
 
   const markUncertain = (operationId: string, code: string, description: string, now: number): void => database.transaction(() => {
-    const row = assertOwner(operationId);
+    const row = operation(operationId);
+    if (!row) throw conflict("Preparation operation no longer exists");
+    // A differing admin edit can advance content_version while this operation
+    // is in flight. Preserve that edit and release the lease into review rather
+    // than letting a stale completion overwrite it or leaving the item owned.
     database.raw.query("UPDATE queue_items SET status = 'needs_review', preparation_state = 'uncertain', preparation_operation_id = NULL, last_error_code = ?, last_error = ? WHERE id = ? AND preparation_operation_id = ?").run(code, description, row.item_id, operationId);
     database.raw.query("UPDATE queue_preparation_operations SET state = 'uncertain', phase = 'uncertain', error_code = ?, error_json = ?, updated_at = ? WHERE id = ?").run(code, asJson({ description }), now, operationId);
   });
@@ -264,5 +302,5 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     database.raw.query("UPDATE queue_preparation_operations SET state = ?, phase = ?, updated_at = ? WHERE id = ? AND state = 'uncertain'").run(retry ? "failed" : "done", retry ? "failed" : "completed", now, operationId);
   });
 
-  return { claimNextPreparation, persistContract, setPhase, recordOutput, recordCompleteResult, installPreparedGeneration, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
+  return { claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
 };

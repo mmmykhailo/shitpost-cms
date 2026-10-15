@@ -4,11 +4,12 @@ import { classifyPublicationPlan } from "../domain/origin-policy";
 import type { QueueRepository, PolicyRepository } from "../db/repositories";
 import type { Logger } from "../logger";
 import { classifyTelegramError } from "../errors";
-import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PublicationContract, PublicationPlan, QueueItemStatus, StoredMessageSnapshot } from "../types";
+import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedPublicationContractV2, PublicationContract, PublicationPlan, QueueItemStatus, StoredMessageSnapshot, TransferStep } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
 import type { ChatId } from "../types";
 import type { OperationTracker } from "./task-supervisor";
+import { transferPreparedStep } from "./prepared-transfer";
 
 export type PublicationOutcome =
   | { kind: "empty" }
@@ -26,6 +27,26 @@ type PreparedPublication = {
   sourceIds: MessageId[];
   plan: PublicationPlan;
   contract: PublicationContract;
+};
+
+const deliverySteps = (members: readonly PreparedMember[]): TransferStep[] => {
+  const steps: TransferStep[] = [];
+  for (let index = 0; index < members.length;) {
+    const member = members[index]!;
+    if (member.albumKey !== undefined) {
+      let end = index + 1;
+      while (end < members.length && members[end]!.albumKey === member.albumKey && members[end]!.deliveryMode === member.deliveryMode) end += 1;
+      if (end - index > 1) {
+        steps.push({ stepKey: `album:${steps.length}`, mode: member.deliveryMode, grouped: true, members: members.slice(index, end) });
+        index = end;
+        continue;
+      }
+    }
+    const { albumKey: _albumKey, ...standalone } = member;
+    steps.push({ stepKey: `member:${steps.length}`, mode: member.deliveryMode, grouped: false, members: [standalone] });
+    index += 1;
+  }
+  return steps;
 };
 
 const retryAtFor = (error: NormalizedTelegramError, now: number, cooldown?: TelegramCooldown): number => {
@@ -52,6 +73,7 @@ export const createPublicationService = (input: {
   cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
+  onSharedFailure?: (error: NormalizedTelegramError) => Promise<void> | void;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
 
@@ -197,7 +219,7 @@ export const createPublicationService = (input: {
     return { kind: "failed", itemId: claimed.item.id, status, error: error.description, operationId: claimed.operationId };
   };
 
-  const publishClaimed = async (claimed: Claimed, prepared?: PreparedPublication): Promise<PublicationOutcome> => {
+  const publishClaimedLegacy = async (claimed: Claimed, prepared?: PreparedPublication): Promise<PublicationOutcome> => {
     const preparation = prepared ?? prepare(claimed.item);
     if ("blockedStatus" in preparation) {
       const now = input.clock.now();
@@ -288,6 +310,101 @@ export const createPublicationService = (input: {
     }
   };
 
+  const publishPreparedClaimed = async (claimed: Claimed): Promise<PublicationOutcome> => {
+    const item = claimed.item;
+    const guard = guardFor(claimed);
+    const members = input.queue.getCurrentMembers(item.id);
+    const sourceIds = members.map((member) => member.messageId);
+    if (members.length === 0 || sourceIds.length === 0) {
+      input.queue.transition(item.id, "publishing", "needs_review", input.clock.now(), "empty_prepared_representation", "Prepared queue item has no current messages");
+      input.queue.setOperationState(claimed.operationId, "failed", input.clock.now(), "empty_prepared_representation");
+      input.queue.setOperationPhase(claimed.operationId, "failed", input.clock.now(), "empty_prepared_representation");
+      return { kind: "failed", itemId: item.id, status: "needs_review", error: "Prepared queue item has no current messages", operationId: claimed.operationId };
+    }
+    const steps = deliverySteps(members);
+    const contract: PreparedPublicationContractV2 = {
+      version: 2,
+      kind: "prepared_delivery",
+      capturedContentVersion: claimed.capturedContentVersion,
+      capturedSourceGeneration: claimed.capturedSourceGeneration,
+      sourceIds,
+      steps,
+      expectedOutputMessageCount: members.length,
+    };
+    const destinationIds: MessageId[] = [];
+    try {
+      input.queue.persistPreparedPublicationContract(claimed.operationId, contract, input.clock.now());
+      input.queue.beginPublicationTransfer(guard, input.clock.now());
+      let offset = 0;
+      for (const step of steps) {
+        const baseOrdinal = offset;
+        await transferPreparedStep({
+          gateway: input.gateway,
+          targetChatId: input.targetChannelId,
+          sourceChatId: input.queueChannelId,
+          step,
+          beforeRequest: () => input.queue.setOperationPhase(claimed.operationId, "transfer_pending", input.clock.now()),
+          recordOutput: (output) => {
+            input.queue.recordOutput(claimed.operationId, "transferred", input.targetChannelId, output.messageId, baseOrdinal + output.ordinal, input.clock.now());
+            destinationIds.push(output.messageId);
+          },
+        });
+        offset += step.members.length;
+      }
+      if (destinationIds.length !== members.length) throw { kind: "ambiguous_send_result", method: "preparedDelivery", description: `Expected ${members.length} destination messages, received ${destinationIds.length}`, knownOutputs: destinationIds, requestMayHaveSucceeded: true };
+      input.queue.recordCompleteBaseOutputs(guard, destinationIds.map((messageId, ordinal) => ({ chatId: input.targetChannelId, messageId, ordinal })), input.clock.now());
+      input.queue.markPublicationOutputComplete(guard, destinationIds, input.clock.now());
+      input.queue.markSourceCleanupPending(guard, input.clock.now());
+    } catch (error) {
+      const normalized = classifyTelegramError(error);
+      if (normalized.kind === "source_missing" && members.length === 1 && destinationIds.length === 0) {
+        input.queue.markMissing(item.id, claimed.operationId, input.clock.now());
+        return { kind: "deleted_external", itemId: item.id, operationId: claimed.operationId };
+      }
+      if (destinationIds.length > 0 || normalized.kind === "ambiguous_send_result" || normalized.kind === "transient_network" || normalized.kind === "transient_server") {
+        input.queue.transition(item.id, "publishing", "uncertain_publish", input.clock.now(), normalized.kind, normalized.description);
+        input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), normalized.kind, JSON.stringify({ description: normalized.description }));
+        input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), normalized.kind, JSON.stringify({ description: normalized.description, knownDestinationIds: destinationIds }));
+        logUncertainty(claimed, normalized, { phase: "uncertain", expectedOutputCount: members.length, knownOutputCount: destinationIds.length });
+        return { kind: "uncertain", itemId: item.id, operationId: claimed.operationId };
+      }
+      if (normalized.kind === "permission_denied" || normalized.kind === "destination_unavailable") {
+        const retryAt = input.clock.now() + 6 * 60 * 60_000;
+        input.queue.setRetry(item.id, claimed.operationId, input.clock.now(), retryAt, normalized.kind, normalized.description);
+        try { await input.onSharedFailure?.(normalized); }
+        catch (alertError) { input.logger.error("publication_shared_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
+        return { kind: "failed", itemId: item.id, status: "shared_failure", error: normalized.description, operationId: claimed.operationId };
+      }
+      if (normalized.kind === "source_missing") {
+        input.queue.transition(item.id, "publishing", "needs_review", input.clock.now(), "source_missing_unmapped", normalized.description);
+        input.queue.setOperationState(claimed.operationId, "failed", input.clock.now(), "source_missing_unmapped", JSON.stringify({ description: normalized.description }));
+        input.queue.setOperationPhase(claimed.operationId, "failed", input.clock.now(), "source_missing_unmapped");
+        return { kind: "failed", itemId: item.id, status: "needs_review", error: normalized.description, operationId: claimed.operationId };
+      }
+      return failClaim(claimed, normalized, { expectedOutputCount: members.length, knownOutputCount: destinationIds.length });
+    }
+
+    try {
+      await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
+      input.queue.markCompleted(item.id, claimed.operationId, input.clock.now());
+      return { kind: "published", itemId: item.id, destinationMessageIds: destinationIds, operationId: claimed.operationId };
+    } catch (error) {
+      const normalized = classifyTelegramError(error, "deleteMessages");
+      if (normalized.kind === "source_missing") {
+        input.queue.markMissing(item.id, claimed.operationId, input.clock.now());
+        return { kind: "published", itemId: item.id, destinationMessageIds: destinationIds, operationId: claimed.operationId };
+      }
+      input.queue.setOperationState(claimed.operationId, "cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
+      input.queue.setOperationPhase(claimed.operationId, "source_cleanup_pending", input.clock.now(), normalized.kind, JSON.stringify({ description: normalized.description }));
+      return { kind: "cleanup_pending", itemId: item.id, operationId: claimed.operationId };
+    }
+  };
+
+  const publishClaimed = async (claimed: Claimed, prepared?: PreparedPublication): Promise<PublicationOutcome> =>
+    claimed.item.representationKind === "prepared"
+      ? publishPreparedClaimed(claimed)
+      : publishClaimedLegacy(claimed, prepared);
+
   const cleanupPending = async (itemId: number): Promise<PublicationOutcome> => {
     const operation = input.queue.operationForItem(itemId);
     if (!operation) return { kind: "failed", itemId, status: "published_cleanup_pending", error: "Missing publication operation" };
@@ -311,22 +428,34 @@ export const createPublicationService = (input: {
     });
   };
 
-  const publishNext = async (type: "publish" | "manual_publish" = "publish"): Promise<PublicationOutcome> => {
-    const head = input.queue.getHead();
-    if (!head) return { kind: "empty" };
-    if (head.status === "published_cleanup_pending") return cleanupPending(head.id);
-    if (head.status !== "queued" || head.maintenanceStatus !== "idle" || (head.retryNotBefore !== undefined && head.retryNotBefore > input.clock.now())) {
-      return { kind: "blocked", itemId: head.id, status: head.status, reason: head.maintenanceStatus !== "idle" ? "maintenance_pending" : "head_not_ready" };
+  const publishNext = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }): Promise<PublicationOutcome> => {
+    const now = input.clock.now();
+    const first = input.queue.peekNextReady(now);
+    if (!first) return expected ? { kind: "blocked", itemId: expected.itemId, status: "stale_candidate", reason: "No prepared item is currently ready; reopen the queue." } : { kind: "empty" };
+    if (expected && (first.id !== expected.itemId || first.contentVersion !== expected.contentVersion || first.sourceGeneration !== expected.sourceGeneration)) {
+      return { kind: "blocked", itemId: expected.itemId, status: "stale_candidate", reason: "The ready queue changed; reopen the queue before publishing." };
     }
-    const preparation = prepare(head);
-    if ("blockedStatus" in preparation) {
-      input.queue.transition(head.id, "queued", preparation.blockedStatus, input.clock.now(), preparation.reason, preparation.reason);
-      return { kind: "failed", itemId: head.id, status: preparation.blockedStatus, error: preparation.reason };
+    const candidates: Array<{ itemId: number; contentVersion: number; sourceGeneration: number }> = [];
+    const excluded: number[] = [];
+    for (let count = 0; count < 500; count += 1) {
+      const candidate = input.queue.peekNextReady(now, excluded);
+      if (!candidate) break;
+      candidates.push({ itemId: candidate.id, contentVersion: candidate.contentVersion, sourceGeneration: candidate.sourceGeneration });
+      excluded.push(candidate.id);
     }
-    const operationId = newOperationId();
-    const claimed = input.queue.claimPublication(operationId, type, input.clock.now());
-    if (!claimed) return { kind: "blocked", itemId: head.id, status: "claimed_elsewhere", reason: "concurrent_claim" };
-    return tracked(operationId, () => publishClaimed(claimed, preparation));
+    let lastDefinite: PublicationOutcome | undefined;
+    const attempted: number[] = [];
+    for (const candidate of candidates) {
+      const operationId = newOperationId();
+      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted);
+      attempted.push(candidate.itemId);
+      if (!claimed) continue;
+      const outcome = await tracked(operationId, () => publishPreparedClaimed(claimed));
+      if (outcome.kind === "published" || outcome.kind === "cleanup_pending" || outcome.kind === "uncertain" || outcome.kind === "retry_scheduled") return outcome;
+      if (outcome.kind === "failed" && outcome.status === "shared_failure") return outcome;
+      lastDefinite = outcome;
+    }
+    return lastDefinite ?? { kind: "empty" };
   };
 
   return { publishNext, cleanupPending, publishClaimed };

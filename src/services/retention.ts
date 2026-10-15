@@ -2,6 +2,7 @@ import type { AdminRepository } from "../db/admin-repository";
 import type { AlertRepository } from "../db/alert-repository";
 import type { GeneratedMessageRepository, QueueRepository } from "../db/repositories";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
+import type { createGeneratedEventRepository } from "../db/generated-event-repository";
 import type { Clock } from "../types";
 import type { Logger } from "../logger";
 
@@ -10,6 +11,7 @@ export type RetentionService = ReturnType<typeof createRetentionService>;
 export const createRetentionService = (input: {
   queue: QueueRepository;
   generated: GeneratedMessageRepository;
+  generatedEvents?: ReturnType<typeof createGeneratedEventRepository>;
   pending: PendingUpdateRepository;
   admin: AdminRepository;
   alerts: AlertRepository;
@@ -20,6 +22,7 @@ export const createRetentionService = (input: {
     const now = input.clock.now();
     const result = input.queue.redactCompletedBefore(now - 30 * 86_400_000, now);
     input.generated.purge(now - 7 * 86_400_000);
+    input.generatedEvents?.purge(now - 7 * 86_400_000);
     input.pending.purge(now - 7 * 86_400_000);
     input.admin.purgeExpiredTokensAndPrompts(now);
     input.alerts.purgeResolved(now - 90 * 86_400_000);

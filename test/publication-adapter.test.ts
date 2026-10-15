@@ -11,8 +11,9 @@ import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import { asChatId, asMessageId } from "../src/types";
 import { snapshotFixture } from "./fixtures";
+import { markQueueItemPrepared } from "./support";
 
-type TransferCall = { method: "copyMessages" | "forwardMessages"; sourceIds: number[] };
+type TransferCall = { method: "copyMessage" | "forwardMessage" | "copyMessages" | "forwardMessages"; sourceIds: number[] };
 type Harness = { directory: string; close(): void };
 
 const resources: Harness[] = [];
@@ -39,6 +40,10 @@ describe("publication service through the grammY adapter", () => {
     resources.push({ directory, close: database.close });
     const transferCalls: TransferCall[] = [];
     const deleted: number[][] = [];
+    const singleTransfer = async (method: "copyMessage" | "forwardMessage", sourceId: number) => {
+      transferCalls.push({ method, sourceIds: [sourceId] });
+      return variant.destinationIds[0]!;
+    };
     const transfer = async (method: "copyMessages" | "forwardMessages", sourceIds: number[]) => {
       transferCalls.push({ method, sourceIds: [...sourceIds] });
       return variant.destinationIds.map((messageId) => ({ message_id: messageId }));
@@ -46,6 +51,8 @@ describe("publication service through the grammY adapter", () => {
     const api = {
       copyMessages: async (_target: unknown, _source: unknown, sourceIds: number[]) => transfer("copyMessages", sourceIds),
       forwardMessages: async (_target: unknown, _source: unknown, sourceIds: number[]) => transfer("forwardMessages", sourceIds),
+      copyMessage: async (_target: unknown, _source: unknown, sourceId: number) => ({ message_id: await singleTransfer("copyMessage", sourceId) }),
+      forwardMessage: async (_target: unknown, _source: unknown, sourceId: number) => ({ message_id: await singleTransfer("forwardMessage", sourceId), chat: { id: -200, type: "channel", title: "Target" }, date: 10 }),
       deleteMessages: async (_chatId: unknown, messageIds: number[]) => { deleted.push([...messageIds]); return true; },
     } as unknown as Api;
     const gateway = createTelegramGateway(api, asChatId(999));
@@ -70,11 +77,13 @@ describe("publication service through the grammY adapter", () => {
       queue.addAlbumMember(1, snapshotFixture({ messageId: asMessageId(variant.sourceIds[1]!), ordinal: 1, mediaGroupId: `album-${variant.name}`, origin: variant.origin }), 1_001);
       queue.finalizeAlbums(12_000);
     }
+    markQueueItemPrepared(database, 1, variant.origin.kind === "channel" ? "forward" : "copy", clock.now());
 
     const result = await service.publishNext("manual_publish");
 
     expect(result.kind).toBe("published");
-    expect(transferCalls).toEqual([{ method: variant.method, sourceIds: [...variant.sourceIds] }]);
+    const expectedMethod = variant.album ? variant.method : variant.method === "copyMessages" ? "copyMessage" : "forwardMessage";
+    expect(transferCalls).toEqual([{ method: expectedMethod, sourceIds: [...variant.sourceIds] }]);
     expect(deleted).toEqual([[...variant.sourceIds]]);
     expect(queue.findItemById(1)?.status).toBe("done");
     expect(queue.findItemById(1)?.destinationMessageIds).toEqual(variant.destinationIds.map(asMessageId));

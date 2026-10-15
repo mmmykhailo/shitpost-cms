@@ -96,10 +96,32 @@ const contentPayload = (message: Message): Record<string, unknown> => {
   return payload;
 };
 
+const mediaKeys = ["photo", "video", "animation", "audio", "document", "voice", "sticker", "video_note", "contact", "location", "venue", "dice", "poll", "game", "paid_media", "giveaway", "giveaway_winners"] as const;
+const volatilePayloadKeys = new Set(["views", "forwards", "forward_count", "reaction_count", "reactions", "total_voter_count", "voter_count"]);
+const withoutVolatilePayload = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(withoutVolatilePayload);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !volatilePayloadKeys.has(key)).map(([key, child]) => [key, withoutVolatilePayload(child)]));
+};
+
+export const fingerprintSnapshotContent = (snapshot: StoredMessageSnapshot): string => createHash("sha256").update(stableJson({
+  contentType: snapshot.contentType,
+  text: snapshot.text,
+  entities: snapshot.entities,
+  caption: snapshot.caption,
+  captionEntities: snapshot.captionEntities,
+  showCaptionAboveMedia: snapshot.showCaptionAboveMedia,
+  mediaFingerprint: snapshot.mediaFingerprint,
+  linkPreviewOptions: snapshot.linkPreviewOptions,
+  replyMarkup: snapshot.replyMarkup,
+})).digest("hex");
+
 export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdateId?: number): StoredMessageSnapshot => {
   const contentType = contentTypeFromMessage(message);
   const origin = originFromMessage(message);
   const payload = contentPayload(message);
+  const mediaPayload: Record<string, unknown> = {};
+  for (const key of mediaKeys) if (key in message) mediaPayload[key] = (message as unknown as Record<string, unknown>)[key];
   const result: StoredMessageSnapshot = {
     schemaVersion: 2,
     chatId: asChatId(message.chat.id),
@@ -108,7 +130,6 @@ export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdat
     contentType,
     origin,
     nativeOrigin: origin,
-    contentFingerprint: createHash("sha256").update(stableJson(payload)).digest("hex"),
     telegramDate: message.date * 1000,
     hasReplyMarkup: message.reply_markup !== undefined,
   };
@@ -137,5 +158,7 @@ export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdat
     if (options.show_above_text !== undefined) normalized.showAboveText = options.show_above_text;
     result.linkPreviewOptions = normalized;
   }
+  result.mediaFingerprint = createHash("sha256").update(stableJson(withoutVolatilePayload(mediaPayload))).digest("hex");
+  result.contentFingerprint = fingerprintSnapshotContent(result);
   return result;
 };

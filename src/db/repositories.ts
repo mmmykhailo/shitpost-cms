@@ -1,9 +1,10 @@
 import type { AppDatabase } from "./database";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
-import { validateOrderedMessageIds, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
+import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedPublicationContractV2, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
+import { inspectInlineCreditEdit } from "../domain/attribution";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
-import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -33,6 +34,15 @@ type QueueRow = {
   album_max_deadline: number | null;
   published_at: number | null;
   completed_at: number | null;
+  preparation_state: "unprepared" | "preparing" | "ready" | "refresh_pending" | "refreshing" | "failed" | "uncertain";
+  representation_kind: "raw" | "prepared";
+  delivery_mode: DeliveryMode | null;
+  policy_captured_at: number | null;
+  prepared_at: number | null;
+  preparation_operation_id: string | null;
+  nickname_revision_wanted: number;
+  nickname_revision_applied: number;
+  attribution_json: string | null;
 };
 
 type QueueMessageRow = {
@@ -115,6 +125,15 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
   for (const [key, value] of stringFields) if (value !== undefined) item[key as keyof QueueItemRecord] = value as never;
   const maintenanceOperationId = optionalString(row.maintenance_operation_id);
   if (maintenanceOperationId !== undefined) item.maintenanceOperationId = maintenanceOperationId;
+  if (row.preparation_state !== "unprepared") item.preparationState = row.preparation_state;
+  if (row.representation_kind !== "raw") item.representationKind = row.representation_kind;
+  if (row.delivery_mode !== null) item.deliveryMode = row.delivery_mode;
+  if (row.policy_captured_at !== null) item.policyCapturedAt = row.policy_captured_at;
+  if (row.prepared_at !== null) item.preparedAt = row.prepared_at;
+  if (row.preparation_operation_id !== null) item.preparationOperationId = row.preparation_operation_id;
+  if (row.nickname_revision_wanted > 0) item.nicknameRevisionWanted = row.nickname_revision_wanted;
+  if (row.nickname_revision_applied > 0) item.nicknameRevisionApplied = row.nickname_revision_applied;
+  if (row.attribution_json !== null) item.attribution = validateAttributionDescriptor(JSON.parse(row.attribution_json) as unknown);
   return item;
 };
 
@@ -362,8 +381,33 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     }
     const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
     if (stableJson(current.snapshot) === stableJson(persistedSnapshot)) return item;
+    let attribution = item.attribution ?? { ownership: "none" as const };
+    if (attribution.ownership === "bot" && attribution.memberKey === current.memberKey) {
+      if (attribution.placement === "separate") {
+        if (persistedSnapshot.text !== attribution.generatedText) attribution = { ownership: "admin", previousMemberKey: attribution.memberKey };
+      } else {
+        const latest = attribution.placement === "inline_text" ? persistedSnapshot.text : persistedSnapshot.caption;
+        const inspected = inspectInlineCreditEdit(attribution, latest);
+        const generatedStart = (latest?.length ?? 0) - attribution.generatedText.length;
+        const entities = attribution.placement === "inline_text" ? persistedSnapshot.entities : persistedSnapshot.captionEntities;
+        const generatedFormattingChanged = inspected.decision === "preserve_bot_ownership" && entities?.some((entity) => entity.offset + entity.length > generatedStart);
+        attribution = generatedFormattingChanged ? { ownership: "admin", previousMemberKey: attribution.memberKey } : inspected.attribution;
+      }
+    }
     database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);
-    database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ? WHERE id = ?").run(persistedSnapshot.contentType, item.id);
+    let nextStatus = item.status;
+    let nextPreparationState = item.preparationState ?? "unprepared";
+    if (item.preparationOperationId === undefined) {
+      if (["blocked", "needs_edit", "needs_review"].includes(item.status)) {
+        nextStatus = "queued";
+        nextPreparationState = item.representationKind === "prepared"
+          ? (attribution.ownership === "bot" ? "refresh_pending" : "ready")
+          : "unprepared";
+      } else if (item.representationKind === "prepared" && nextPreparationState === "failed") {
+        nextPreparationState = attribution.ownership === "bot" ? "refresh_pending" : "ready";
+      }
+    }
+    database.raw.query("UPDATE queue_items SET content_version = content_version + 1, content_type = ?, status = ?, preparation_state = ?, attribution_json = ?, retry_not_before = NULL, last_error_code = NULL, last_error = NULL WHERE id = ?").run(persistedSnapshot.contentType, nextStatus, nextPreparationState, JSON.stringify(attribution), item.id);
     return findItemById(item.id);
     });
   };
@@ -377,6 +421,48 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external') ORDER BY logical_sequence LIMIT 1").get() as QueueRow | null;
     return row ? rowToItem(row) : undefined;
   };
+
+  const readyPublicationQuery = (now: number, excludedIds: readonly number[] = []): { sql: string; args: number[] } => {
+    const excluded = excludedIds.length > 0 ? ` AND qi.id NOT IN (${excludedIds.map(() => "?").join(",")})` : "";
+    return {
+      sql: `SELECT qi.* FROM queue_items qi
+        WHERE qi.status = 'queued' AND qi.preparation_state = 'ready' AND qi.representation_kind = 'prepared'
+          AND qi.preparation_operation_id IS NULL AND qi.maintenance_status = 'idle'
+          AND (qi.retry_not_before IS NULL OR qi.retry_not_before <= ?)
+          AND (COALESCE(json_extract(qi.attribution_json, '$.ownership'), 'none') <> 'bot' OR qi.nickname_revision_applied = qi.nickname_revision_wanted)
+          AND EXISTS (SELECT 1 FROM queue_messages qm WHERE qm.item_id = qi.id AND qm.source_generation = qi.source_generation AND qm.removed_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = qi.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
+          AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations po WHERE po.item_id = qi.id AND po.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))${excluded}
+        ORDER BY qi.logical_sequence LIMIT 1`,
+      args: [now, ...excludedIds],
+    };
+  };
+
+  const peekNextReady = (now: number, excludedIds: readonly number[] = []): QueueItemRecord | undefined => {
+    const query = readyPublicationQuery(now, excludedIds);
+    const row = database.raw.query(query.sql).get(...query.args) as QueueRow | null;
+    return row ? rowToItem(row) : undefined;
+  };
+
+  const claimReadyPublication = (operationId: string, type: "publish" | "manual_publish", now: number, expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, bootId?: string, excludedIds: readonly number[] = []): ClaimedItem | undefined => database.transaction(() => {
+    const query = readyPublicationQuery(now, excludedIds);
+    const candidate = database.raw.query(query.sql).get(...query.args) as QueueRow | null;
+    if (!candidate) return undefined;
+    const ready = rowToItem(candidate);
+    if (expected && (ready.id !== expected.itemId || ready.contentVersion !== expected.contentVersion || ready.sourceGeneration !== expected.sourceGeneration)) return undefined;
+    const changed = database.raw.query(`UPDATE queue_items SET status = 'publishing', claimed_operation_id = ?, claimed_at = ?, attempts = attempts + 1
+      WHERE id = ? AND status = 'queued' AND preparation_state = 'ready' AND representation_kind = 'prepared'
+        AND preparation_operation_id IS NULL AND maintenance_status = 'idle' AND content_version = ? AND source_generation = ?
+        AND (retry_not_before IS NULL OR retry_not_before <= ?)
+        AND (COALESCE(json_extract(attribution_json, '$.ownership'), 'none') <> 'bot' OR nickname_revision_applied = nickname_revision_wanted)
+        AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
+        AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations po WHERE po.item_id = queue_items.id AND po.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`).run(operationId, now, ready.id, ready.contentVersion, ready.sourceGeneration, now);
+    if (Number(changed.changes) !== 1) return undefined;
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'claimed', ?, 'queued', ?, ?, ?, ?, ?, ?)").run(operationId, type, ready.id, currentBootId ?? bootId ?? operationId, ready.contentVersion, ready.sourceGeneration, operationId, now + 300_000, now, now);
+    const claimed = findItemById(ready.id);
+    if (!claimed) throw new Error("Queue item disappeared during prepared publication claim");
+    return { item: claimed, operationId, capturedContentVersion: ready.contentVersion, capturedSourceGeneration: ready.sourceGeneration };
+  });
 
   const claimPublication = (operationId: string, type: "publish" | "manual_publish", now: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
     const head = getHead();
@@ -575,6 +661,18 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       validated.capturedSourceGeneration,
     );
     if (Number(result.changes) !== 1) throw conflict("Publication contract guard conflict");
+  });
+
+  const persistPreparedPublicationContract = (operationId: string, contract: PreparedPublicationContractV2, now: number): void => database.transaction(() => {
+    const validated = validatePreparedPublicationContractV2(contract);
+    const item = database.raw.query("SELECT id, queue_chat_id, status, content_version, source_generation FROM queue_items WHERE claimed_operation_id = ? AND status = 'publishing'").get(operationId) as { id: number; queue_chat_id: number; status: QueueItemStatus; content_version: number; source_generation: number } | null;
+    if (!item || item.content_version !== validated.capturedContentVersion || item.source_generation !== validated.capturedSourceGeneration) throw conflict("Prepared publication contract guard conflict");
+    const currentIds = currentSourceIds(item.id);
+    if (currentIds.join(",") !== validated.sourceIds.join(",")) throw conflict("Prepared publication sources changed after claim");
+    const result = database.raw.query(`UPDATE operations SET return_item_status = 'queued', expected_source_count = ?, expected_output_count = ?, source_ids_json = ?, plan_json = ?, phase = 'claimed', updated_at = ?
+      WHERE id = ? AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND phase = 'claimed'`)
+      .run(validated.sourceIds.length, validated.expectedOutputMessageCount, JSON.stringify(validated.sourceIds), JSON.stringify(validated), now, operationId, item.id, validated.capturedContentVersion, validated.capturedSourceGeneration);
+    if (Number(result.changes) !== 1) throw conflict("Prepared publication operation changed before its contract was persisted");
   });
 
   const beginPublicationTransfer = (guard: OperationGuard, now: number): void => {
@@ -902,6 +1000,23 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
   };
 
+  const preparationOutputOperation = (queueChatId: number, messageId: number): { operationId: string; itemId: number } | undefined => {
+    const row = database.raw.query("SELECT po.operation_id, qpo.item_id FROM queue_preparation_outputs po JOIN queue_preparation_operations qpo ON qpo.id = po.operation_id WHERE po.chat_id = ? AND po.telegram_message_id = ?").get(queueChatId, messageId) as { operation_id: string; item_id: number } | null;
+    return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
+  };
+
+  const preparationCandidateOperation = (queueChatId: number): { operationId: string; itemId: number } | undefined => {
+    const row = database.raw.query(`SELECT qpo.id AS operation_id, qi.id AS item_id FROM queue_preparation_operations qpo JOIN queue_items qi ON qi.id = qpo.item_id
+      WHERE qi.queue_chat_id = ? AND qpo.state IN ('running','outputs_recorded') AND qpo.phase IN ('transfer_pending','attribution_pending')
+      ORDER BY qpo.updated_at LIMIT 1`).get(queueChatId) as { operation_id: string; item_id: number } | null;
+    return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
+  };
+
+  const preparationOperationState = (operationId: string): string | undefined => {
+    const row = database.raw.query("SELECT state FROM queue_preparation_operations WHERE id = ?").get(operationId) as { state: string } | null;
+    return row?.state;
+  };
+
   const redactCompletedBefore = (before: number, now: number): { items: number; messages: number } => database.transaction(() => {
     const rows = database.raw.query("SELECT id FROM queue_items WHERE status IN ('done','deleted','deleted_external') AND completed_at IS NOT NULL AND completed_at < ? AND NOT EXISTS (SELECT 1 FROM orphaned_sources os WHERE os.item_id = queue_items.id AND os.resolved_at IS NULL) AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state NOT IN ('done','failed')) AND NOT EXISTS (SELECT 1 FROM admin_alerts aa WHERE aa.resolved_at IS NULL AND (aa.dedupe_key = 'uncertain_publish:' || queue_items.id OR aa.dedupe_key = 'uncertain_renewal:' || queue_items.id OR aa.dedupe_key = 'renewal_warning:' || queue_items.id OR aa.dedupe_key = 'renewal_critical:' || queue_items.id))").all(before) as Array<{ id: number }>;
     let messages = 0;
@@ -940,6 +1055,8 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     updateSnapshot,
     listActive,
     getHead,
+    peekNextReady,
+    claimReadyPublication,
     claimPublication,
     claimRenewal,
     transition,
@@ -954,6 +1071,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     recordOutput,
     recordReplacementOutput,
     persistPublicationContract,
+    persistPreparedPublicationContract,
     beginPublicationTransfer,
     markPartialCleanupPending,
     recordCompleteBaseOutputs,
@@ -983,6 +1101,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     listRenewalAges,
     listRecentlyDeletedExternal,
     renewalCandidateOperation,
+    preparationOutputOperation,
+    preparationCandidateOperation,
+    preparationOperationState,
     setBootId,
     heartbeatOperations,
     redactCompletedBefore,
@@ -1050,6 +1171,18 @@ export const createPolicyRepository = (database: AppDatabase) => {
     if (!origin.username) return undefined;
     const byUsername = database.raw.query("SELECT aa.nickname FROM author_aliases aa JOIN known_authors ka ON ka.user_id = aa.user_id WHERE ka.normalized_username = ?").get(origin.username.toLowerCase()) as { nickname: string } | null;
     return byUsername?.nickname;
+  };
+
+  const aliasRevisionForOrigin = (origin: SemanticOrigin): number => {
+    if (origin.kind === "user") {
+      const row = database.raw.query("SELECT alias_revision FROM known_authors WHERE user_id = ?").get(origin.userId) as { alias_revision: number } | null;
+      return row?.alias_revision ?? 0;
+    }
+    if (origin.kind === "hidden_user") {
+      const row = database.raw.query("SELECT alias_revision FROM known_hidden_authors WHERE sender_name = ? COLLATE BINARY").get(origin.senderUserName) as { alias_revision: number } | null;
+      return row?.alias_revision ?? 0;
+    }
+    return 0;
   };
 
   const updateIdentifiableAuthorItems = (userId: number, revision: number): void => {
@@ -1148,7 +1281,7 @@ export const createPolicyRepository = (database: AppDatabase) => {
     database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('hidden_author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ hiddenAuthorId, senderName: row.sender_name, revision }), now);
   });
 
-  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, aliasForOrigin, setAlias, removeAlias, listAuthors, listHiddenAuthors, getHiddenAuthor, countHiddenAuthors, setHiddenAlias, removeHiddenAlias };
+  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, aliasForOrigin, aliasRevisionForOrigin, setAlias, removeAlias, listAuthors, listHiddenAuthors, getHiddenAuthor, countHiddenAuthors, setHiddenAlias, removeHiddenAlias };
 };
 
 export type GeneratedMessageRepository = ReturnType<typeof createGeneratedMessageRepository>;

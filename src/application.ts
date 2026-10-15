@@ -9,6 +9,8 @@ import { createAdminRepository } from "./db/admin-repository";
 import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
 import { createPendingUpdateRepository } from "./db/pending-update-repository";
+import { createPreparationRepository } from "./db/preparation-repository";
+import { createGeneratedEventRepository } from "./db/generated-event-repository";
 import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
 import { createTelegramCooldownRepository } from "./db/telegram-cooldown-repository";
@@ -18,6 +20,8 @@ import { createIngestionService } from "./services/ingestion";
 import { createPublicationService } from "./services/publisher";
 import { createRenewalService } from "./services/renewal";
 import { createRenewalWorker } from "./services/renewal-worker";
+import { createPreparationService } from "./services/preparation";
+import { createPreparationWorker } from "./services/preparation-worker";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
 import { createAlertService, resolutionTextForDedupeKey } from "./services/alerts";
@@ -103,6 +107,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const schedule = createScheduleRepository(database);
   const admin = createAdminRepository(database);
   const generated = createGeneratedMessageRepository(database);
+  const generatedEvents = createGeneratedEventRepository(database);
+  const preparationRepository = createPreparationRepository(database);
   const pending = createPendingUpdateRepository(database);
   const recoveryRepository = createRecoveryRepository(database);
   const orphanRepository = createOrphanRepository(database);
@@ -133,6 +139,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   database.raw.query("UPDATE app_state SET current_boot_id = ? WHERE id = 1").run(bootId);
   const recoveredOperations = queue.recoverExpiredOperations(clock.now(), bootId);
   if (recoveredOperations.length > 0) logger.warn("prior_boot_operations_recovered", { count: recoveredOperations.length });
+  const recoveredPreparations = preparationRepository.recoverExpiredOperations(clock.now(), bootId);
+  if (recoveredPreparations.requeued + recoveredPreparations.uncertain + recoveredPreparations.cleanupPending > 0) logger.warn("prior_boot_preparations_recovered", recoveredPreparations);
   const interruptedRuns = schedule.recoverInterruptedRuns(clock.now());
   if (interruptedRuns > 0) logger.warn("interrupted_schedule_runs_recovered", { count: interruptedRuns });
 
@@ -238,8 +246,13 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     return;
   }
 
-  const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, pending, logger, now: clock.now });
-  const publisher = createPublicationService({ queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, events: generatedEvents, pending, logger, now: clock.now });
+  const preparation = createPreparationService({ queue, preparation: preparationRepository, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
+  const publisher = createPublicationService({
+    queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
+    onSharedFailure: async (error) => alerts.raise("publication_access", "immediate", "Prepared publication stopped because Telegram rejected access: " + error.description, clock.now()),
+  });
   const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
@@ -255,7 +268,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, clock.now()),
   });
   const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights, cooldown: telegramCooldown });
-  const retention = createRetentionService({ queue, generated, pending, admin, alerts: alertRepository, clock, logger });
+  const retention = createRetentionService({ queue, generated, generatedEvents, pending, admin, alerts: alertRepository, clock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: clock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
   registerAdminHandlers(bot, {
@@ -281,6 +294,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
 
   const startBackgroundWork = (): void => {
     supervisor.start("renewal", (signal) => renewalWorker.run(signal));
+    supervisor.start("preparation", (signal) => preparationWorker.run(signal));
     supervisor.start("pending_updates", async (signal) => {
     while (!signal.aborted && !stopped) {
       try { ingestion.finalizeAlbums(); }
@@ -305,6 +319,9 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
         queue.heartbeatOperations(now, bootId);
         const recovered = queue.recoverExpiredOperations(now, bootId);
         if (recovered.length > 0) logger.warn("expired_operations_recovered", { count: recovered.length });
+        preparationRepository.heartbeatOperations(now, bootId);
+        const recoveredPreparations = preparationRepository.recoverExpiredOperations(now, bootId);
+        if (recoveredPreparations.requeued + recoveredPreparations.uncertain + recoveredPreparations.cleanupPending > 0) logger.warn("expired_preparations_recovered", recoveredPreparations);
       } catch (error) {
         logger.error("operation_recovery_worker_failed", { error: safeErrorDescription(error) });
       }

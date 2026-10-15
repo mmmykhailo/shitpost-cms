@@ -1,6 +1,7 @@
 import type { Message } from "@grammyjs/types";
 import type { Logger } from "../logger";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
+import type { createGeneratedEventRepository } from "../db/generated-event-repository";
 import { snapshotFromMessage } from "../domain/message";
 import type { GeneratedMessageRepository, PolicyRepository, QueueRepository } from "../db/repositories";
 import type { ChatId, DeliveryMode, StoredMessageSnapshot } from "../types";
@@ -19,6 +20,7 @@ export const createIngestionService = (input: {
   policy: PolicyRepository;
   generated: GeneratedMessageRepository;
   pending?: PendingUpdateRepository;
+  events?: ReturnType<typeof createGeneratedEventRepository>;
   logger: Logger;
   now: () => number;
 }) => {
@@ -49,6 +51,11 @@ export const createIngestionService = (input: {
   };
 
   const observe = (snapshot: StoredMessageSnapshot, now: number): IngestionResult => {
+    const expected = input.events?.consume(snapshot.chatId, snapshot.messageId, "post", snapshot.contentFingerprint, now);
+    if (expected) {
+      input.logger.debug("expected_generated_post_matched", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: expected.operationId, family: expected.family });
+      return { accepted: false, ignoredReason: "generated_message" };
+    }
     const generated = input.generated.consume(snapshot.chatId, snapshot.messageId);
     if (generated) {
       input.logger.debug("generated_queue_message_suppressed", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: generated.operationId, kind: generated.kind });
@@ -70,6 +77,11 @@ export const createIngestionService = (input: {
   const handleEditedChannelPost = (message: Message, telegramUpdateId?: number): IngestionResult => {
     if (message.chat.id !== input.queueChannelId) return { accepted: false, ignoredReason: "wrong_chat" };
     const snapshot = snapshotFromMessage(message, 0, telegramUpdateId);
+    const expected = input.events?.consume(snapshot.chatId, snapshot.messageId, "edit", snapshot.contentFingerprint, input.now());
+    if (expected) {
+      input.logger.debug("expected_generated_edit_matched", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: expected.operationId, family: expected.family });
+      return { accepted: false, ignoredReason: "generated_message" };
+    }
     const existing = input.queue.findBySource(snapshot.chatId, snapshot.messageId);
     if (!input.pending) {
       if (!existing) {
@@ -95,16 +107,34 @@ export const createIngestionService = (input: {
     const now = input.now();
     const ingested: number[] = [];
     for (const pending of input.pending.due(now)) {
+      const event = input.events?.consume(pending.queueChatId, pending.telegramMessageId, pending.updateKind === "edit" ? "edit" : "post", pending.snapshot.contentFingerprint, now);
+      if (event) {
+        input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, event.operationId);
+        input.logger.debug("expected_generated_update_matched", { chatId: pending.queueChatId, messageId: pending.telegramMessageId, operationId: event.operationId, family: event.family });
+        continue;
+      }
       const generated = input.generated.consume(pending.queueChatId, pending.telegramMessageId);
       if (generated) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, generated.operationId);
         input.logger.debug("generated_queue_message_suppressed", { chatId: pending.queueChatId, messageId: pending.telegramMessageId, operationId: generated.operationId, kind: generated.kind });
         continue;
       }
+      const preparationOutput = input.queue.preparationOutputOperation(pending.queueChatId, pending.telegramMessageId);
+      if (preparationOutput) {
+        input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, preparationOutput.operationId);
+        continue;
+      }
+      if (pending.candidateOperationId && input.queue.preparationOperationState(pending.candidateOperationId) === "uncertain") continue;
       const candidate = input.queue.renewalCandidateOperation(pending.queueChatId);
       if (candidate) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "quarantined_renewal_candidate", now, candidate.operationId, "A renewal operation may have created this update");
         input.logger.warn("renewal_candidate_quarantined", { operationId: candidate.operationId, itemId: candidate.itemId, messageId: pending.telegramMessageId });
+        continue;
+      }
+      const preparationCandidate = input.queue.preparationCandidateOperation(pending.queueChatId);
+      if (preparationCandidate) {
+        input.pending.markState(pending.queueChatId, pending.telegramMessageId, "quarantined_renewal_candidate", now, preparationCandidate.operationId, "A preparation operation may have created this update");
+        input.logger.warn("preparation_candidate_quarantined", { operationId: preparationCandidate.operationId, itemId: preparationCandidate.itemId, messageId: pending.telegramMessageId });
         continue;
       }
       const existing = input.queue.findBySource(pending.queueChatId, pending.telegramMessageId);

@@ -86,6 +86,7 @@ export type StoredMessageSnapshot = {
   nativeOrigin?: SemanticOrigin;
   /** Stable payload fingerprint; excludes view and reaction counters. */
   contentFingerprint?: string;
+  mediaFingerprint?: string;
   linkPreviewOptions?: { isDisabled?: boolean; url?: string; preferSmallMedia?: boolean; preferLargeMedia?: boolean; showAboveText?: boolean };
   replyMarkup?: Record<string, unknown>;
 };

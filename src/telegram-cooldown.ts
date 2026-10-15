@@ -29,6 +29,7 @@ const MUTATION_METHODS = new Set([
   "sendMessage",
   "forwardMessage",
   "forwardMessages",
+  "copyMessage",
   "copyMessages",
   "editMessageText",
   "editMessageCaption",

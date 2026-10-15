@@ -64,9 +64,12 @@ export const transferPreparedStep = async (input: {
       }
       await accept(outputId, index, member);
     } catch (error) {
-      throw classifyTelegramError(error, step.mode === "copy" ? "copyMessage" : "forwardMessage");
+      const normalized = classifyTelegramError(error, step.mode === "copy" ? "copyMessage" : "forwardMessage");
+      for (const [knownIndex, id] of (normalized.knownOutputs ?? []).entries()) {
+        if (Number.isSafeInteger(id) && id > 0) await accept(id, knownIndex);
+      }
+      throw normalized;
     }
   }
   return outputs;
 };
-

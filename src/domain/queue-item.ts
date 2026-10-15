@@ -1,4 +1,4 @@
-import type { MaintenanceStatus, MessageId, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { AttributionDescriptor, DeliveryMode, MaintenanceStatus, MessageId, PreparationState, QueueItemStatus, RepresentationKind, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 export type QueueItemRecord = {
   id: number;
@@ -14,6 +14,15 @@ export type QueueItemRecord = {
   maintenanceRetryNotBefore?: number;
   contentVersion: number;
   sourceGeneration: number;
+  preparationState?: PreparationState;
+  representationKind?: RepresentationKind;
+  deliveryMode?: DeliveryMode;
+  policyCapturedAt?: number;
+  preparedAt?: number;
+  preparationOperationId?: string;
+  nicknameRevisionWanted?: number;
+  nicknameRevisionApplied?: number;
+  attribution?: AttributionDescriptor;
   attempts: number;
   enqueuedAt: number;
   physicalCreatedAt: number;
