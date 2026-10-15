@@ -946,6 +946,12 @@ export const createPolicyRepository = (database: AppDatabase) => {
   };
 
   const observeAuthor = (origin: SemanticOrigin, now: number): void => {
+    if (origin.kind === "hidden_user") {
+      database.raw.query(`INSERT INTO known_hidden_authors (sender_name, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?) ON CONFLICT(sender_name) DO UPDATE SET last_seen_at = MAX(known_hidden_authors.last_seen_at, excluded.last_seen_at)`)
+        .run(origin.senderUserName, now, now);
+      return;
+    }
     if (origin.kind !== "user") return;
     const normalizedUsername = origin.username?.toLowerCase();
     database.transaction(() => {
@@ -965,6 +971,10 @@ export const createPolicyRepository = (database: AppDatabase) => {
   };
 
   const aliasForOrigin = (origin: SemanticOrigin): string | undefined => {
+    if (origin.kind === "hidden_user") {
+      const row = database.raw.query("SELECT haa.nickname FROM hidden_author_aliases haa JOIN known_hidden_authors kha ON kha.id = haa.hidden_author_id WHERE kha.sender_name = ? COLLATE BINARY").get(origin.senderUserName) as { nickname: string } | null;
+      return row?.nickname;
+    }
     if (origin.kind !== "user") return undefined;
     const byId = database.raw.query("SELECT nickname FROM author_aliases WHERE user_id = ?").get(origin.userId) as { nickname: string } | null;
     if (byId) return byId.nickname;
@@ -973,10 +983,26 @@ export const createPolicyRepository = (database: AppDatabase) => {
     return byUsername?.nickname;
   };
 
+  const updateIdentifiableAuthorItems = (userId: number, revision: number): void => {
+    database.raw.query(`UPDATE queue_items
+      SET nickname_revision_wanted = ?,
+          preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
+      WHERE status NOT IN ('done','deleted','deleted_external')
+        AND json_extract(origin_json, '$.kind') = 'user'
+        AND (json_extract(origin_json, '$.userId') = ? OR lower(json_extract(origin_json, '$.username')) = (SELECT normalized_username FROM known_authors WHERE user_id = ?))`)
+      .run(revision, userId, userId);
+  };
+
   const setAlias = (userIdOrUsername: number | string, nickname: string, adminId: number, now: number): void => database.transaction(() => {
     const userId = resolveAuthorId(userIdOrUsername);
     if (userId === undefined) throw new Error("Author must be observed before an alias can be set");
+    const previous = database.raw.query("SELECT nickname FROM author_aliases WHERE user_id = ?").get(userId) as { nickname: string } | null;
     database.raw.query("INSERT INTO author_aliases (user_id, nickname, updated_at, updated_by_admin_id) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET nickname = excluded.nickname, updated_at = excluded.updated_at, updated_by_admin_id = excluded.updated_by_admin_id").run(userId, nickname, now, adminId);
+    if (previous?.nickname !== nickname) {
+      const revision = (database.raw.query("SELECT alias_revision FROM known_authors WHERE user_id = ?").get(userId) as { alias_revision: number }).alias_revision + 1;
+      database.raw.query("UPDATE known_authors SET alias_revision = ? WHERE user_id = ?").run(revision, userId);
+      updateIdentifiableAuthorItems(userId, revision);
+    }
     database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('author_alias_set', ?, ?, ?)").run(String(adminId), JSON.stringify({ userId, nickname }), now);
   });
 
@@ -984,7 +1010,12 @@ export const createPolicyRepository = (database: AppDatabase) => {
     const userId = resolveAuthorId(userIdOrUsername);
     if (userId === undefined) return;
     const result = database.raw.query("DELETE FROM author_aliases WHERE user_id = ?").run(userId);
-    if (Number(result.changes) === 1) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ userId }), now);
+    if (Number(result.changes) === 1) {
+      const revision = (database.raw.query("SELECT alias_revision FROM known_authors WHERE user_id = ?").get(userId) as { alias_revision: number }).alias_revision + 1;
+      database.raw.query("UPDATE known_authors SET alias_revision = ? WHERE user_id = ?").run(revision, userId);
+      updateIdentifiableAuthorItems(userId, revision);
+      database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ userId, revision }), now);
+    }
   });
 
   const listAuthors = (): Array<{ userId: number; username?: string; displayName: string; alias?: string; lastSeenAt: number }> => {
@@ -997,7 +1028,58 @@ export const createPolicyRepository = (database: AppDatabase) => {
     });
   };
 
-  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, aliasForOrigin, setAlias, removeAlias, listAuthors };
+  const listHiddenAuthors = (limit = 20, offset = 0): Array<{ hiddenAuthorId: number; senderName: string; alias?: string; lastSeenAt: number; aliasRevision: number }> => {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid hidden-author page");
+    const rows = database.raw.query(`SELECT kha.id, kha.sender_name, kha.last_seen_at, kha.alias_revision, haa.nickname
+      FROM known_hidden_authors kha LEFT JOIN hidden_author_aliases haa ON haa.hidden_author_id = kha.id
+      ORDER BY kha.last_seen_at DESC, kha.id LIMIT ? OFFSET ?`).all(limit, offset) as Array<{ id: number; sender_name: string; last_seen_at: number; alias_revision: number; nickname: string | null }>;
+    return rows.map((row) => ({ hiddenAuthorId: row.id, senderName: row.sender_name, lastSeenAt: row.last_seen_at, aliasRevision: row.alias_revision, ...(row.nickname === null ? {} : { alias: row.nickname }) }));
+  };
+
+  const getHiddenAuthor = (hiddenAuthorId: number): { hiddenAuthorId: number; senderName: string; alias?: string; lastSeenAt: number; aliasRevision: number } | undefined => {
+    const row = database.raw.query(`SELECT kha.id, kha.sender_name, kha.last_seen_at, kha.alias_revision, haa.nickname
+      FROM known_hidden_authors kha LEFT JOIN hidden_author_aliases haa ON haa.hidden_author_id = kha.id WHERE kha.id = ?`).get(hiddenAuthorId) as { id: number; sender_name: string; last_seen_at: number; alias_revision: number; nickname: string | null } | null;
+    return row ? { hiddenAuthorId: row.id, senderName: row.sender_name, lastSeenAt: row.last_seen_at, aliasRevision: row.alias_revision, ...(row.nickname === null ? {} : { alias: row.nickname }) } : undefined;
+  };
+
+  const countHiddenAuthors = (): number => (database.raw.query("SELECT COUNT(*) AS count FROM known_hidden_authors").get() as { count: number }).count;
+
+  const updateHiddenAuthorItems = (hiddenAuthorId: number, revision: number): void => {
+    database.raw.query(`UPDATE queue_items
+      SET nickname_revision_wanted = ?,
+          preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
+      WHERE status NOT IN ('done','deleted','deleted_external')
+        AND json_extract(origin_json, '$.kind') = 'hidden_user'
+        AND json_extract(origin_json, '$.senderUserName') = (SELECT sender_name FROM known_hidden_authors WHERE id = ?)`)
+      .run(revision, hiddenAuthorId);
+  };
+
+  const setHiddenAlias = (hiddenAuthorId: number, nickname: string, adminId: number, now: number): void => database.transaction(() => {
+    const row = database.raw.query("SELECT id, sender_name, alias_revision FROM known_hidden_authors WHERE id = ?").get(hiddenAuthorId) as { id: number; sender_name: string; alias_revision: number } | null;
+    if (!row) throw new Error("Hidden sender must be observed before a nickname can be set");
+    const previous = database.raw.query("SELECT nickname FROM hidden_author_aliases WHERE hidden_author_id = ?").get(hiddenAuthorId) as { nickname: string } | null;
+    database.raw.query(`INSERT INTO hidden_author_aliases (hidden_author_id, nickname, updated_at, updated_by_admin_id)
+      VALUES (?, ?, ?, ?) ON CONFLICT(hidden_author_id) DO UPDATE SET nickname = excluded.nickname, updated_at = excluded.updated_at, updated_by_admin_id = excluded.updated_by_admin_id`)
+      .run(hiddenAuthorId, nickname, now, adminId);
+    if (previous?.nickname === nickname) return;
+    const revision = row.alias_revision + 1;
+    database.raw.query("UPDATE known_hidden_authors SET alias_revision = ? WHERE id = ?").run(revision, hiddenAuthorId);
+    updateHiddenAuthorItems(hiddenAuthorId, revision);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('hidden_author_alias_set', ?, ?, ?)").run(String(adminId), JSON.stringify({ hiddenAuthorId, senderName: row.sender_name, nickname, revision }), now);
+  });
+
+  const removeHiddenAlias = (hiddenAuthorId: number, adminId: number, now: number): void => database.transaction(() => {
+    const row = database.raw.query("SELECT id, sender_name, alias_revision FROM known_hidden_authors WHERE id = ?").get(hiddenAuthorId) as { id: number; sender_name: string; alias_revision: number } | null;
+    if (!row) return;
+    const result = database.raw.query("DELETE FROM hidden_author_aliases WHERE hidden_author_id = ?").run(hiddenAuthorId);
+    if (Number(result.changes) === 0) return;
+    const revision = row.alias_revision + 1;
+    database.raw.query("UPDATE known_hidden_authors SET alias_revision = ? WHERE id = ?").run(revision, hiddenAuthorId);
+    updateHiddenAuthorItems(hiddenAuthorId, revision);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('hidden_author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ hiddenAuthorId, senderName: row.sender_name, revision }), now);
+  });
+
+  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, aliasForOrigin, setAlias, removeAlias, listAuthors, listHiddenAuthors, getHiddenAuthor, countHiddenAuthors, setHiddenAlias, removeHiddenAlias };
 };
 
 export type GeneratedMessageRepository = ReturnType<typeof createGeneratedMessageRepository>;

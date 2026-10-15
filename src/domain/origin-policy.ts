@@ -27,7 +27,7 @@ export const isSeparateBylineContent = (contentType: ContentType): boolean => se
 export const displayNameForOrigin = (origin: SemanticOrigin, alias?: string): string | undefined => {
   switch (origin.kind) {
     case "user": return safeDisplayName(alias ?? origin.displayName);
-    case "hidden_user": return safeDisplayName(origin.senderUserName);
+    case "hidden_user": return safeDisplayName(alias ?? origin.senderUserName);
     case "channel":
     case "chat":
     case "absent":

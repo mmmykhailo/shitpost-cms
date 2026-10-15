@@ -65,7 +65,7 @@ export type MessageEntity = {
 };
 
 export type StoredMessageSnapshot = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   chatId: ChatId;
   messageId: MessageId;
   ordinal: number;
@@ -80,7 +80,69 @@ export type StoredMessageSnapshot = {
   telegramDate: number;
   editDate?: number;
   hasReplyMarkup: boolean;
+  /** Bot API update order disambiguates edits with the same edit_date. */
+  telegramUpdateId?: number;
+  /** Native origin as observed on the current Telegram representation. */
+  nativeOrigin?: SemanticOrigin;
+  /** Stable payload fingerprint; excludes view and reaction counters. */
+  contentFingerprint?: string;
+  linkPreviewOptions?: { isDisabled?: boolean; url?: string; preferSmallMedia?: boolean; preferLargeMedia?: boolean; showAboveText?: boolean };
+  replyMarkup?: Record<string, unknown>;
 };
+
+export type DeliveryMode = "copy" | "forward";
+export type PreparationState = "unprepared" | "preparing" | "ready" | "refresh_pending" | "refreshing" | "failed" | "uncertain";
+export type RepresentationKind = "raw" | "prepared";
+export type MemberRole = "content" | "credit";
+
+export type PreparedMember = {
+  memberKey: string;
+  messageId: MessageId;
+  role: MemberRole;
+  deliveryMode: DeliveryMode;
+  albumKey?: string;
+  snapshot: StoredMessageSnapshot;
+};
+
+export type AttributionDescriptor =
+  | { ownership: "none" }
+  | { ownership: "admin"; previousMemberKey?: string }
+  | { ownership: "bot"; placement: "inline_text" | "inline_caption" | "separate"; memberKey: string; generatedText: string; generatedStartUtf16: number; generatedLengthUtf16: number; appliedNicknameRevision: number };
+
+export type TransferStep = { stepKey: string; mode: DeliveryMode; grouped: boolean; members: readonly PreparedMember[] };
+
+export type PreparationContractV1 = {
+  version: 1;
+  kind: "prepare" | "refresh";
+  itemId: number;
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+  originalOrigin: SemanticOrigin;
+  deliveryMode: DeliveryMode;
+  capturedMembers: readonly PreparedMember[];
+  steps: readonly TransferStep[];
+  targetNicknameRevision: number;
+  targetName?: string;
+  attribution: AttributionDescriptor;
+};
+
+export type PreparedPublicationContractV2 = {
+  version: 2;
+  kind: "prepared_delivery";
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+  sourceIds: readonly MessageId[];
+  steps: readonly TransferStep[];
+  expectedOutputMessageCount: number;
+};
+
+export type ExecutionProgress = {
+  version: 1;
+  effectiveContentVersion: number;
+  members: readonly { memberKey: string; outcome: "pending" | "sent" | "confirmed_missing"; outputIds: readonly MessageId[]; missingEvidence?: { method: string; code?: number; description: string } }[];
+};
+
+export type PreparedExecutionGuard = { operationId: string; itemId: number; capturedContentVersion: number; capturedSourceGeneration: number; expectedContentVersion: number };
 
 export type QueueItemStatus =
   | "collecting"

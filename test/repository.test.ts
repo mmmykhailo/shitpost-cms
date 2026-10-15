@@ -231,6 +231,32 @@ describe("policy repository", () => {
     policy.removeChannel(-1009, 1, 5);
     expect((database.raw.query("SELECT event_type FROM audit_events WHERE actor = '1' ORDER BY id").all() as Array<{ event_type: string }>).map((row) => row.event_type)).toEqual(["whitelist_channel_upserted", "author_alias_set", "author_alias_removed", "whitelist_channel_removed"]);
   });
+
+  test("stores hidden sender nicknames by exact name and invalidates only their bot-owned items", () => {
+    const { database, policy, queue } = open();
+    const hidden = { kind: "hidden_user" as const, senderUserName: " Alex " };
+    policy.observeAuthor(hidden, 10);
+    policy.observeAuthor({ kind: "hidden_user", senderUserName: "Alex" }, 11);
+    const first = queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(70), origin: hidden }), 12).item;
+    database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared', attribution_json = ? WHERE id = ?").run(JSON.stringify({ ownership: "bot" }), first.id);
+    const author = policy.listHiddenAuthors(20, 0).find((entry) => entry.senderName === " Alex ")!;
+    policy.setHiddenAlias(author.hiddenAuthorId, "Professor", 1, 20);
+    expect(policy.aliasForOrigin(hidden)).toBe("Professor");
+    expect(policy.aliasForOrigin({ kind: "hidden_user", senderUserName: "Alex" })).toBeUndefined();
+    expect((database.raw.query("SELECT preparation_state, nickname_revision_wanted FROM queue_items WHERE id = ?").get(first.id) as { preparation_state: string; nickname_revision_wanted: number })).toEqual({ preparation_state: "refresh_pending", nickname_revision_wanted: 1 });
+    policy.removeHiddenAlias(author.hiddenAuthorId, 1, 30);
+    expect(policy.aliasForOrigin(hidden)).toBeUndefined();
+    expect((database.raw.query("SELECT nickname_revision_wanted FROM queue_items WHERE id = ?").get(first.id) as { nickname_revision_wanted: number }).nickname_revision_wanted).toBe(2);
+  });
+
+  test("paginates more than twenty hidden names without normalizing their keys", () => {
+    const { policy } = open();
+    for (let index = 0; index < 25; index += 1) policy.observeAuthor({ kind: "hidden_user", senderUserName: `Hidden ${index}` }, index);
+    expect(policy.countHiddenAuthors()).toBe(25);
+    expect(policy.listHiddenAuthors(20, 0)).toHaveLength(20);
+    expect(policy.listHiddenAuthors(20, 20)).toHaveLength(5);
+    expect(policy.getHiddenAuthor(policy.listHiddenAuthors(20, 20)[0]!.hiddenAuthorId)?.senderName).toStartWith("Hidden ");
+  });
 });
 
 describe("schedule repository", () => {

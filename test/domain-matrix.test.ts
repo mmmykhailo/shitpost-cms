@@ -25,6 +25,8 @@ import { classifyTelegramError } from "../src/errors";
 import { safeErrorDescription } from "../src/logger";
 import { asChatId, asMessageId, asUserId, type ContentType, type MessageEntity, type QueueItemStatus, type SemanticOrigin, type StoredMessageSnapshot } from "../src/types";
 import { snapshotFixture } from "./fixtures";
+import { attributionNeedsRefresh, botInlineAttribution, hiddenSenderKey, inspectInlineCreditEdit } from "../src/domain/attribution";
+import { assertPreparedMembers, isPreparedPostReady } from "../src/domain/prepared-post";
 
 const message = (extra: Record<string, unknown> = {}): unknown => ({
   message_id: 10,
@@ -212,6 +214,31 @@ describe("queue state and schedule boundaries", () => {
     expect(() => validateSlotCount([], true)).toThrow(/Enabled/);
     expect(() => validateSlotCount(Array.from({ length: 97 }, (_, index) => index), false)).toThrow(/96/);
     expect(parseUtcSlot(" 23:59 ")).toBe(1439);
+  });
+});
+
+describe("prepared posts and attribution ownership", () => {
+  test("only publishes a current, owned, fully prepared representation", () => {
+    const member = { memberKey: "body:1", messageId: asMessageId(10), role: "content" as const, deliveryMode: "copy" as const, snapshot: snapshotFixture() };
+    const ready = { status: "queued" as const, preparationState: "ready" as const, representationKind: "prepared" as const, maintenanceStatus: "idle", nicknameRevisionWanted: 2, nicknameRevisionApplied: 2, attributionOwnership: "bot" as const, currentMembers: [member], hasConflictingOwner: false };
+    expect(isPreparedPostReady(ready, 10)).toBe(true);
+    expect(isPreparedPostReady({ ...ready, nicknameRevisionApplied: 1 }, 10)).toBe(false);
+    expect(isPreparedPostReady({ ...ready, hasConflictingOwner: true }, 10)).toBe(false);
+    expect(isPreparedPostReady({ ...ready, representationKind: "raw" }, 10)).toBe(false);
+    assertPreparedMembers([member]);
+    expect(() => assertPreparedMembers([member, member])).toThrow(/unique/);
+  });
+
+  test("preserves exact untouched UTF-16 credit suffixes and records admin overrides", () => {
+    const attribution = botInlineAttribution("Body 😀", "\n\nby Professor", "body:1", "inline_text", 4);
+    expect(attribution.generatedStartUtf16).toBe("Body 😀".length);
+    expect(attributionNeedsRefresh(attribution, 5)).toBe(true);
+    const preserved = inspectInlineCreditEdit(attribution, "Edited body 😀\n\nby Professor");
+    expect(preserved.decision).toBe("preserve_bot_ownership");
+    expect(preserved.attribution.ownership === "bot" ? preserved.attribution.generatedStartUtf16 : -1).toBe("Edited body 😀".length);
+    expect(inspectInlineCreditEdit(attribution, "Edited body\n\nby Someone")).toMatchObject({ decision: "admin_override", attribution: { ownership: "admin", previousMemberKey: "body:1" } });
+    expect(hiddenSenderKey(" Alex ")).not.toBe(hiddenSenderKey("Alex"));
+    expect(hiddenSenderKey("alex")).not.toBe(hiddenSenderKey("Alex"));
   });
 });
 

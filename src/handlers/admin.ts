@@ -1,7 +1,7 @@
 import type { Bot, Context } from "grammy";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { classifyTelegramError } from "../errors";
-import { validateAlias } from "../domain/byline";
+import { safeDisplayName, validateAlias } from "../domain/byline";
 import { formatAge } from "../domain/age";
 import { formatUtcSlot, parseUtcSlot } from "../domain/schedule";
 import { buildQueueMessageLink } from "../domain/telegram-message-link";
@@ -277,12 +277,43 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await ctx.reply(text, { reply_markup: keyboard(rows) });
   };
 
-  const sendAuthors = async (ctx: Context, notice?: string): Promise<void> => {
+  const sendAuthors = async (ctx: Context, notice?: string, offset = 0): Promise<void> => {
     const authors = deps.policy.listAuthors();
-    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set alias", "alias_add")]];
-    for (const author of authors.filter((entry) => entry.alias).slice(0, 20)) rows.push([await button(deps, `Remove alias ${author.userId}`, "alias_remove", { userId: author.userId })]);
+    const page = authors.slice(offset, offset + 20);
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set alias", "alias_add"), await button(deps, "Hidden sender names", "hidden_authors", { offset: 0 })]];
+    for (const author of page.filter((entry) => entry.alias)) rows.push([await button(deps, `Remove alias ${author.userId}`, "alias_remove", { userId: author.userId })]);
+    if (offset > 0 || offset + 20 < authors.length) rows.push([
+      ...(offset > 0 ? [await button(deps, "Previous", "authors_page", { offset: Math.max(0, offset - 20) })] : []),
+      ...(offset + 20 < authors.length ? [await button(deps, "Next", "authors_page", { offset: offset + 20 })] : []),
+    ]);
     rows.push([await button(deps, "Back", "dashboard")]);
-    const lines = ["Observed authors", ...authors.slice(0, 20).map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
+    const lines = [`Observed user authors (${authors.length === 0 ? 0 : offset + 1}–${Math.min(offset + 20, authors.length)} of ${authors.length})`, ...page.map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
+    if (notice !== undefined) lines.unshift(notice);
+    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+  };
+
+  const sendHiddenAuthors = async (ctx: Context, offset = 0, notice?: string): Promise<void> => {
+    const authors = deps.policy.listHiddenAuthors(20, offset);
+    const count = deps.policy.countHiddenAuthors();
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
+    for (const author of authors) rows.push([await button(deps, `${safeDisplayName(author.senderName)}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`, "hidden_author_select", { hiddenAuthorId: author.hiddenAuthorId })]);
+    if (offset > 0 || offset + authors.length < count) rows.push([
+      ...(offset > 0 ? [await button(deps, "Previous", "hidden_authors", { offset: Math.max(0, offset - 20) })] : []),
+      ...(offset + authors.length < count ? [await button(deps, "Next", "hidden_authors", { offset: offset + 20 })] : []),
+    ]);
+    rows.push([await button(deps, "Back to users", "authors"), await button(deps, "Dashboard", "dashboard")]);
+    const lines = [`Hidden sender names (${count === 0 ? 0 : offset + 1}–${Math.min(offset + authors.length, count)} of ${count})`, ...authors.map((author) => `${safeDisplayName(author.senderName)}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
+    if (notice !== undefined) lines.unshift(notice);
+    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+  };
+
+  const sendHiddenAuthor = async (ctx: Context, hiddenAuthorId: number, notice?: string): Promise<void> => {
+    const author = deps.policy.listHiddenAuthors(100, 0).find((entry) => entry.hiddenAuthorId === hiddenAuthorId);
+    if (!author) { await sendHiddenAuthors(ctx, 0, "That hidden sender is no longer available."); return; }
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set or replace nickname", "hidden_alias_set", { hiddenAuthorId })]];
+    if (author.alias) rows.push([await button(deps, "Remove nickname", "hidden_alias_remove", { hiddenAuthorId })]);
+    rows.push([await button(deps, "Back", "hidden_authors", { offset: 0 })]);
+    const lines = [safeDisplayName(author.senderName), "A nickname is shared by queue posts with this exact hidden sender name.", `Current nickname: ${author.alias ? cleanDisplay(author.alias) : "none"}`];
     if (notice !== undefined) lines.unshift(notice);
     await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
   };
@@ -349,6 +380,19 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         await sendAuthors(ctx, "Author alias saved.");
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Could not save alias. Observe the user in a queue post first.");
+      }
+      return true;
+    }
+    if (prompt.kind === "hidden_alias") {
+      const state = prompt.state && typeof prompt.state === "object" ? prompt.state as Record<string, unknown> : {};
+      const hiddenAuthorId = typeof state.hiddenAuthorId === "number" ? state.hiddenAuthorId : undefined;
+      if (hiddenAuthorId === undefined) { deps.admin.clearPrompt(deps.config.adminUserId); await ctx.reply("The selected hidden sender has expired."); return true; }
+      try {
+        deps.policy.setHiddenAlias(hiddenAuthorId, validateAlias(text), deps.config.adminUserId, deps.now());
+        deps.admin.clearPrompt(deps.config.adminUserId);
+        await sendHiddenAuthor(ctx, hiddenAuthorId, "Hidden sender nickname saved.");
+      } catch (error) {
+        await ctx.reply(error instanceof Error ? error.message : "Could not save nickname.");
       }
       return true;
     }
@@ -432,6 +476,18 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "schedule": return sendSchedule(ctx);
       case "whitelist": return sendWhitelist(ctx);
       case "authors": return sendAuthors(ctx);
+      case "authors_page": return sendAuthors(ctx, undefined, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
+      case "hidden_authors": return sendHiddenAuthors(ctx, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
+      case "hidden_author_select": return typeof payload.hiddenAuthorId === "number" ? sendHiddenAuthor(ctx, payload.hiddenAuthorId) : ctx.reply("Invalid hidden sender selection.");
+      case "hidden_alias_set": {
+        if (typeof payload.hiddenAuthorId !== "number" || !deps.policy.getHiddenAuthor(payload.hiddenAuthorId)) return ctx.reply("This hidden sender is no longer available.");
+        return beginPrompt(ctx, { kind: "hidden_alias", state: { hiddenAuthorId: payload.hiddenAuthorId }, text: "Reply with the nickname for this exact hidden sender name.", placeholder: "Nickname" });
+      }
+      case "hidden_alias_remove": {
+        if (typeof payload.hiddenAuthorId !== "number") return ctx.reply("Invalid hidden sender.");
+        deps.policy.removeHiddenAlias(payload.hiddenAuthorId, deps.config.adminUserId, deps.now());
+        return sendHiddenAuthor(ctx, payload.hiddenAuthorId, "Hidden sender nickname removed.");
+      }
       case "health": return sendHealth(ctx);
       case "safety": return sendSafety(ctx, typeof payload.offset === "number" ? payload.offset : 0);
       case "publish": {

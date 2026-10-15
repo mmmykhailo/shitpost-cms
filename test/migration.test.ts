@@ -16,22 +16,45 @@ afterEach(() => {
   }
 });
 
-describe("schema migration 3", () => {
-  test("creates the durable operation, quarantine, recovery, and schedule structures", () => {
+describe("schema migration 4", () => {
+  test("creates the durable operation, preparation, hidden-author, quarantine, recovery, and schedule structures", () => {
     const directory = mkdtempSync(join(tmpdir(), "queuebot-migration-"));
     const database = createDatabase(join(directory, "bot.sqlite"));
     resources.push({ directory, close: database.close });
 
-    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(3);
+    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(4);
     const columns = (table: string): string[] => (database.raw.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
-    expect(columns("queue_items")).toEqual(expect.arrayContaining(["maintenance_status", "maintenance_operation_id", "maintenance_retry_not_before"]));
+    expect(columns("queue_items")).toEqual(expect.arrayContaining(["maintenance_status", "maintenance_operation_id", "maintenance_retry_not_before", "preparation_state", "representation_kind", "delivery_mode", "attribution_json"]));
     expect(columns("operations")).toEqual(expect.arrayContaining(["boot_id", "phase", "return_item_status", "expected_source_count", "expected_output_count", "source_ids_json", "plan_json"]));
     expect(columns("operation_outputs")).toContain("role");
+    expect(columns("queue_messages")).toEqual(expect.arrayContaining(["member_key", "member_role", "member_delivery_mode", "album_key", "removed_at"]));
+    expect(columns("pending_queue_updates")).toEqual(expect.arrayContaining(["update_kind", "telegram_update_id", "captured_delivery_mode", "policy_captured_at"]));
     expect(columns("schedule_slots")).toContain("effective_at");
     const tableExists = (table: string): boolean => Boolean(database.raw.query("SELECT 1 AS value FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
     expect(tableExists("pending_queue_updates")).toBe(true);
     expect(tableExists("recovery_sessions")).toBe(true);
     expect(tableExists("recovery_previews")).toBe(true);
+    expect(tableExists("known_hidden_authors")).toBe(true);
+    expect(tableExists("hidden_author_aliases")).toBe(true);
+    expect(tableExists("queue_preparation_operations")).toBe(true);
+    expect(tableExists("queue_preparation_outputs")).toBe(true);
+    expect(tableExists("queue_generated_events")).toBe(true);
+    expect((database.raw.query("PRAGMA foreign_key_check").all() as unknown[])).toHaveLength(0);
+  });
+
+  test("backfills stable member keys and exact hidden sender identities", () => {
+    const directory = mkdtempSync(join(tmpdir(), "queuebot-migration-v3-"));
+    const path = join(directory, "bot.sqlite");
+    const legacy = new Database(path, { create: true, strict: true });
+    applyMigrations(legacy, 3);
+    legacy.query("INSERT INTO queue_items (logical_sequence, queue_chat_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at) VALUES (1, -100, 77, 'text', ?, 'queued', 100, 100)").run(JSON.stringify({ kind: "hidden_user", senderUserName: " Alex " }));
+    legacy.query("INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, snapshot_json) VALUES (1, 0, -100, 77, 0, 100, ?)").run(JSON.stringify({ schemaVersion: 1, chatId: -100, messageId: 77, ordinal: 0, contentType: "text", origin: { kind: "hidden_user", senderUserName: " Alex " }, telegramDate: 100, hasReplyMarkup: false }));
+    applyMigrations(legacy);
+    expect((legacy.query("SELECT member_key FROM queue_messages WHERE item_id = 1").get() as { member_key: string }).member_key).toBe("legacy:77");
+    expect((legacy.query("SELECT sender_name FROM known_hidden_authors").get() as { sender_name: string }).sender_name).toBe(" Alex ");
+    expect((legacy.query("PRAGMA foreign_key_check").all() as unknown[])).toHaveLength(0);
+    legacy.close();
+    rmSync(directory, { recursive: true, force: true });
   });
 
   test("quarantines legacy renewal states from a version-2 database", () => {

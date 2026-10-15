@@ -18,9 +18,10 @@ describe("origin policy", () => {
     expect(classifyPublicationPlan({ origin, contentType: "text", channelIsWhitelisted: false })).toEqual({ kind: "copy", reason: "unlisted_channel" });
   });
 
-  test("uses aliases for user content and never aliases hidden users", () => {
+  test("uses independent aliases for identifiable and exact-name hidden users", () => {
     expect(classifyPublicationPlan({ origin: userOrigin, contentType: "text", channelIsWhitelisted: false, alias: "The Analyst" })).toEqual({ kind: "copy_with_inline_byline", name: "The Analyst" });
-    expect(classifyPublicationPlan({ origin: { kind: "hidden_user", senderUserName: "Secret Sender" }, contentType: "text", channelIsWhitelisted: false, alias: "Wrong person" })).toEqual({ kind: "copy_with_inline_byline", name: "Secret Sender" });
+    expect(classifyPublicationPlan({ origin: { kind: "hidden_user", senderUserName: "Secret Sender" }, contentType: "text", channelIsWhitelisted: false, alias: "Professor" })).toEqual({ kind: "copy_with_inline_byline", name: "Professor" });
+    expect(classifyPublicationPlan({ origin: { kind: "hidden_user", senderUserName: "Secret Sender" }, contentType: "text", channelIsWhitelisted: false })).toEqual({ kind: "copy_with_inline_byline", name: "Secret Sender" });
   });
 
   test("uses a separate byline for captionless user content", () => {
