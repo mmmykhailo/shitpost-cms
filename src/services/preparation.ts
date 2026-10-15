@@ -26,10 +26,12 @@ const buildPreparedMetadataSteps = (members: readonly PreparedMember[]): Transfe
   for (let index = 0; index < members.length;) {
     const member = members[index]!;
     if (member.albumKey !== undefined) {
-      const group = members.slice(index).filter((candidate) => candidate.albumKey === member.albumKey && candidate.deliveryMode === member.deliveryMode);
+      let end = index + 1;
+      while (end < members.length && members[end]!.albumKey === member.albumKey && members[end]!.deliveryMode === member.deliveryMode) end += 1;
+      const group = members.slice(index, end);
       if (group.length > 1) {
         result.push({ stepKey: `album:${result.length}`, mode: member.deliveryMode, grouped: true, members: group });
-        index += group.length;
+        index = end;
         continue;
       }
     }
@@ -59,20 +61,29 @@ export const createPreparationService = (input: {
     : now + 60_000;
 
   const buildSteps = (members: readonly PreparedMember[], mode: DeliveryMode): TransferStep[] => {
-    if (members.length > 1) {
-      const albumKey = members[0]?.albumKey;
-      if (!albumKey || members.some((member) => member.albumKey !== albumKey)) throw new Error("Multi-message queue item has no consistent album grouping");
-      return [{ stepKey: "album:0", mode, grouped: true, members: members.map((member) => ({ ...member, deliveryMode: mode })) }];
+    const steps: TransferStep[] = [];
+    for (let index = 0; index < members.length;) {
+      const source = members[index]!;
+      const memberMode = source.role === "credit" ? "copy" : mode;
+      let end = index + 1;
+      if (source.albumKey !== undefined) {
+        while (end < members.length && members[end]!.albumKey === source.albumKey && (members[end]!.role === "credit" ? "copy" : mode) === memberMode) end += 1;
+      }
+      const group = members.slice(index, end).map((member) => ({ ...member, deliveryMode: member.role === "credit" ? "copy" as const : mode }));
+      if (source.albumKey !== undefined && group.length > 1) {
+        steps.push({ stepKey: `album:${steps.length}`, mode: memberMode, grouped: true, members: group });
+      } else {
+        const { albumKey: _albumKey, ...standalone } = group[0]!;
+        steps.push({ stepKey: `member:${steps.length}`, mode: memberMode, grouped: false, members: [standalone] });
+      }
+      index = end;
     }
-    return members.map((member, index) => {
-      const { albumKey: _albumKey, ...standalone } = member;
-      return { stepKey: `member:${index}`, mode, grouped: false, members: [{ ...standalone, deliveryMode: mode }] };
-    });
+    return steps;
   };
 
   const inPlacePreparedMembers = (members: readonly PreparedMember[], mode: DeliveryMode): PreparedMember[] => members.map((member) => {
     const { albumKey, ...base } = member;
-    return { ...base, deliveryMode: mode, role: "content", ...(members.length > 1 && albumKey !== undefined ? { albumKey } : {}) };
+    return { ...base, deliveryMode: member.role === "credit" ? "copy" : mode, ...(members.length > 1 && albumKey !== undefined ? { albumKey } : {}) };
   });
 
   const snapshotForOutput = (source: PreparedMember, output: PreparedTransferOutput, ordinal: number, mode: DeliveryMode, now: number): PreparedMember => {
@@ -241,7 +252,9 @@ export const createPreparationService = (input: {
         return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "missing_captured_policy", operationId: claim.operationId };
       }
       const alias = input.policy.aliasForOrigin(item.origin);
-      const plan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
+      const classifiedPlan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
+      const hasAdminCredit = members.some((member) => member.role === "credit") && item.attribution?.ownership === "admin";
+      const plan = hasAdminCredit ? (deliveryMode === "forward" ? { kind: "forward" as const } : { kind: "copy" as const }) : classifiedPlan;
       const revision = Math.max(item.nicknameRevisionWanted ?? 0, input.policy.aliasRevisionForOrigin(item.origin));
       if (plan.kind === "blocked") {
         const status = plan.reason === "unsupported_content" ? "blocked" : "needs_review";
@@ -289,10 +302,6 @@ export const createPreparationService = (input: {
         const description = error instanceof Error ? error.message : "Queue member grouping requires review";
         input.preparation.markFailed(claim.operationId, "needs_review", "invalid_member_grouping", description, input.clock.now());
         return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "invalid_member_grouping", operationId: claim.operationId };
-      }
-      if (!transformsSource && members.length > 1 && !members[0]?.albumKey) {
-        input.preparation.markFailed(claim.operationId, "needs_review", "missing_album_group", "Multi-message item has no recorded album grouping", input.clock.now());
-        return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "missing_album_group", operationId: claim.operationId };
       }
       const contractSteps = contentSteps.length > 0 ? contentSteps : buildSteps(members, capturedPolicyMode);
       const contract: PreparationContractV1 = {
@@ -370,7 +379,9 @@ export const createPreparationService = (input: {
         }
         const source = inputByKey.get(output.sourceMemberKey);
         if (!source) throw new Error("Prepared transfer output references an unknown source member");
-        outputMembers.push(snapshotForOutput(source, output, ordinal, transferMode, input.clock.now()));
+        const sourceStep = contentSteps.find((step) => step.stepKey === output.stepKey);
+        if (!sourceStep) throw new Error("Prepared transfer output references an unknown step");
+        outputMembers.push(snapshotForOutput(source, output, ordinal, sourceStep.mode, input.clock.now()));
       }
 
       if (inline) {

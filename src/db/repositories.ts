@@ -336,20 +336,42 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     });
   };
 
-  const insertRecoveredSnapshots = (snapshots: readonly StoredMessageSnapshot[], now: number): QueueItemRecord => database.transaction(() => {
+  const insertRecoveredSnapshots = (snapshots: readonly StoredMessageSnapshot[], now: number, options: { creditLast?: boolean } = {}): QueueItemRecord => database.transaction(() => {
     snapshots = snapshots.map((snapshot) => validateStoredMessageSnapshot(snapshot));
     if (snapshots.length < 1 || snapshots.length > 10) throw new Error("Recovered item must contain 1–10 snapshots");
     const first = snapshots[0]!;
-    if (snapshots.some((snapshot, ordinal) => snapshot.chatId !== first.chatId || snapshot.ordinal !== ordinal || originKey(snapshot.origin) !== originKey(first.origin))) throw new Error("Recovered snapshots are not a compatible ordered album");
+    if (snapshots.some((snapshot, ordinal) => snapshot.chatId !== first.chatId || snapshot.ordinal !== ordinal)) throw new Error("Recovered snapshots are not an ordered queue bundle");
+    if (options.creditLast && (snapshots.length < 2 || snapshots.at(-1)?.contentType !== "text" || snapshots.at(-1)?.text === undefined || snapshots.at(-1)?.mediaGroupId !== undefined)) throw new Error("A separate recovered credit must be a standalone text message after its content");
     for (const snapshot of snapshots) if (findBySource(snapshot.chatId, snapshot.messageId)) throw new Error(`Queue message ${snapshot.messageId} is already known`);
     const lastSequence = database.raw.query("SELECT COALESCE(MAX(logical_sequence), 0) AS value FROM queue_items").get() as { value: number };
-    const mediaGroupId = snapshots.length > 1 ? first.mediaGroupId ?? `recovery:${first.messageId}` : undefined;
-    const result = database.raw.query("INSERT INTO queue_items (logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)").run(lastSequence.value + 1, first.chatId, mediaGroupId ?? null, first.messageId, first.contentType, JSON.stringify(first.origin), now, first.telegramDate);
+    const sameOrigin = snapshots.every((snapshot) => originKey(snapshot.origin) === originKey(first.origin));
+    const itemOrigin = sameOrigin ? first.origin : { kind: "absent" as const };
+    const sharedAlbum = snapshots.length > 1 && first.mediaGroupId !== undefined && snapshots.every((snapshot) => snapshot.mediaGroupId === first.mediaGroupId);
+    const mediaGroupId = sharedAlbum ? first.mediaGroupId : undefined;
+    const preparedMembers = options.creditLast ? snapshots.slice(0, -1) : snapshots;
+    const result = database.raw.query(`INSERT INTO queue_items (logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at, preparation_state, representation_kind, delivery_mode, policy_captured_at, prepared_at, attribution_json)
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, 'ready', 'prepared', 'copy', ?, ?, '{"ownership":"none"}')`)
+      .run(lastSequence.value + 1, first.chatId, mediaGroupId ?? null, preparedMembers[0]!.messageId, preparedMembers[0]!.contentType, JSON.stringify(itemOrigin), now, first.telegramDate, now, now);
     const itemId = Number(result.lastInsertRowid);
     for (const snapshot of snapshots) insertSnapshot(itemId, 0, snapshot);
+    if (options.creditLast) {
+      const credit = snapshots.at(-1)!;
+      database.raw.query("UPDATE queue_messages SET member_role = 'credit', member_delivery_mode = 'copy', album_key = NULL WHERE item_id = ? AND source_generation = 0 AND telegram_message_id = ?").run(itemId, credit.messageId);
+      database.raw.query("UPDATE queue_items SET attribution_json = ? WHERE id = ?").run(JSON.stringify({ ownership: "admin", previousMemberKey: `legacy:${credit.messageId}` }), itemId);
+    }
     const item = findItemById(itemId);
     if (!item) throw new Error("Recovered queue item disappeared after insert");
     return item;
+  });
+
+  const reprocessRecoveredItem = (itemId: number, deliveryMode: DeliveryMode, policyCapturedAt: number, now: number): void => database.transaction(() => {
+    const result = database.raw.query(`UPDATE queue_items SET representation_kind = 'raw', preparation_state = 'unprepared', delivery_mode = ?, policy_captured_at = ?, prepared_at = NULL,
+      content_version = content_version + 1, last_error_code = NULL, last_error = NULL
+      WHERE id = ? AND status = 'queued' AND representation_kind = 'prepared' AND preparation_operation_id IS NULL AND claimed_operation_id IS NULL AND maintenance_status = 'idle'
+        AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`)
+      .run(deliveryMode, policyCapturedAt, itemId);
+    if (Number(result.changes) !== 1) throw conflict("Recovered item changed or is currently owned by another operation");
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, metadata_json, created_at) VALUES ('recovered_item_preparation_requested', 'admin', ?, ?, ?)").run(itemId, JSON.stringify({ deliveryMode, policyCapturedAt }), now);
   });
 
   const finalizeAlbums = (now: number): QueueItemRecord[] => database.transaction(() => {
@@ -1224,6 +1246,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     addAlbumMember,
     addLateAlbumMember,
     insertRecoveredSnapshots,
+    reprocessRecoveredItem,
     finalizeAlbums,
     updateSnapshot,
     listActive,

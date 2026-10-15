@@ -58,8 +58,9 @@ const open = (gateway: TelegramGateway, withRepository = true) => {
   const database = createDatabase(join(directory, "bot.sqlite"));
   const recoveryRepository = withRepository ? createRecoveryRepository(database) : undefined;
   const { logger, events } = loggerSpy();
+  const queue = createQueueRepository(database);
   const recovery = createRecoveryService({
-    queue: createQueueRepository(database),
+    queue,
     policy: createPolicyRepository(database),
     gateway,
     ...(recoveryRepository === undefined ? {} : { recovery: recoveryRepository }),
@@ -69,7 +70,7 @@ const open = (gateway: TelegramGateway, withRepository = true) => {
     logger,
     operationId: (() => { let count = 0; return () => `matrix-recovery-${++count}`; })(),
   });
-  return { database, recovery, recoveryRepository, events };
+  return { database, recovery, recoveryRepository, queue, events };
 };
 
 afterEach(() => {
@@ -112,6 +113,60 @@ describe("recovery reference and recovery lifecycle matrix", () => {
     expect(result.sourceIds).toEqual([asMessageId(88), asMessageId(89)]);
     expect(current.database.raw.query("SELECT COUNT(*) AS count FROM queue_messages WHERE item_id = ?").get(result.itemId)).toEqual({ count: 2 });
     expect(current.recoveryRepository?.session("matrix-recovery-1")?.phase).toBe("completed");
+  });
+
+  test("recovers mixed standalone messages ready as shown and offers an explicit preparation transition", async () => {
+    const gateway = baseGateway(async (id) => preview(id + 720, {
+      origin: id === 88
+        ? { type: "channel", date: 1, chat: { id: -300, type: "channel", title: "Source" }, message_id: id }
+        : undefined,
+    }));
+    const current = open(gateway);
+    const result = await current.recovery.recover("88 89");
+    expect(result.canApplyPreparationRules).toBe(false);
+    expect(current.database.raw.query("SELECT preparation_state, representation_kind, delivery_mode FROM queue_items WHERE id = ?").get(result.itemId)).toEqual({
+      preparation_state: "ready",
+      representation_kind: "prepared",
+      delivery_mode: "copy",
+    });
+    expect(current.database.raw.query("SELECT member_delivery_mode FROM queue_messages WHERE item_id = ? ORDER BY ordinal").all(result.itemId)).toEqual([
+      { member_delivery_mode: "forward" },
+      { member_delivery_mode: "copy" },
+    ]);
+
+    current.queue.reprocessRecoveredItem(result.itemId, "copy", 11_000, 11_000);
+    expect(current.database.raw.query("SELECT preparation_state, representation_kind, delivery_mode FROM queue_items WHERE id = ?").get(result.itemId)).toEqual({
+      preparation_state: "unprepared",
+      representation_kind: "raw",
+      delivery_mode: "copy",
+    });
+  });
+
+  test("records an explicitly selected trailing credit and reuses an already tracked bundle", async () => {
+    const forwarded: number[] = [];
+    const gateway = baseGateway(async (id) => {
+      forwarded.push(id);
+      return preview(id + 730, id === 88
+        ? { origin: { type: "user", date: 1, sender_user: { id: 55, is_bot: false, first_name: "A" } } }
+        : {});
+    });
+    const current = open(gateway);
+    const first = await current.recovery.recover("88-89 --credit-last");
+    expect(first.creditLast).toBe(true);
+    expect(first.canApplyPreparationRules).toBe(false);
+    expect(current.database.raw.query("SELECT member_role, member_delivery_mode FROM queue_messages WHERE item_id = ? ORDER BY ordinal").all(first.itemId)).toEqual([
+      { member_role: "content", member_delivery_mode: "forward" },
+      { member_role: "credit", member_delivery_mode: "copy" },
+    ]);
+    expect(current.database.raw.query("SELECT attribution_json FROM queue_items WHERE id = ?").get(first.itemId)).toEqual({
+      attribution_json: JSON.stringify({ ownership: "admin", previousMemberKey: "legacy:89" }),
+    });
+
+    const reused = await current.recovery.recover("88-89");
+    expect(reused.reused).toBe(true);
+    expect(reused.itemId).toBe(first.itemId);
+    expect(forwarded).toEqual([88, 89]);
+    expect(current.database.raw.query("SELECT COUNT(*) AS count FROM queue_items").get()).toEqual({ count: 1 });
   });
 
   test("fails incompatible albums and forward calls while cleaning any known previews", async () => {

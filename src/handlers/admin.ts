@@ -308,7 +308,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendHiddenAuthor = async (ctx: Context, hiddenAuthorId: number, notice?: string): Promise<void> => {
-    const author = deps.policy.listHiddenAuthors(100, 0).find((entry) => entry.hiddenAuthorId === hiddenAuthorId);
+    const author = deps.policy.getHiddenAuthor(hiddenAuthorId);
     if (!author) { await sendHiddenAuthors(ctx, 0, "That hidden sender is no longer available."); return; }
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[await button(deps, "Set or replace nickname", "hidden_alias_set", { hiddenAuthorId })]];
     if (author.alias) rows.push([await button(deps, "Remove nickname", "hidden_alias_remove", { hiddenAuthorId })]);
@@ -400,9 +400,17 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       try {
         const recovered = await deps.recovery.recover(text);
         deps.admin.clearPrompt(deps.config.adminUserId);
-        deps.admin.audit("recovery_completed", String(deps.config.adminUserId), deps.now(), recovered.itemId, undefined, { sourceIds: recovered.sourceIds });
-        await ctx.reply(`Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}. Telegram history remains explicit; verify the supplied IDs covered the intended post.`);
-        await sendQueue(ctx);
+        deps.admin.audit(recovered.reused ? "recovery_existing_item_reused" : "recovery_completed", String(deps.config.adminUserId), deps.now(), recovered.itemId, undefined, { sourceIds: recovered.sourceIds, creditLast: recovered.creditLast ?? false });
+        if (recovered.reused) {
+          await ctx.reply(`Those messages already belong to queue item #${recovered.itemId}; I reused that item and did not create a duplicate.`);
+          await sendQueue(ctx);
+          return true;
+        }
+        const markup = recovered.canApplyPreparationRules
+          ? keyboard([[await button(deps, "Apply preparation rules", "recovery_apply_preparation", { itemId: recovered.itemId }, deps.queue.findItemById(recovered.itemId)?.contentVersion)], [await button(deps, "Queue", "queue")]])
+          : keyboard([[await button(deps, "Queue", "queue")]]);
+        const suffix = recovered.creditLast ? " The final message was recorded as an admin selected separate credit." : " It is ready to publish as shown; no author was inferred from its text.";
+        await ctx.reply(`Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}.${suffix}`, { reply_markup: markup });
       } catch (error) {
         await ctx.reply(error instanceof Error ? error.message : "Recovery failed; no queue item was confirmed.");
       }
@@ -489,6 +497,20 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         return sendHiddenAuthor(ctx, payload.hiddenAuthorId, "Hidden sender nickname removed.");
       }
       case "health": return sendHealth(ctx);
+      case "recovery_apply_preparation": {
+        if (itemId === undefined) return ctx.reply("Invalid recovered item.");
+        const item = deps.queue.findItemById(itemId);
+        if (!item) return ctx.reply("This recovered item no longer exists.");
+        const deliveryMode = item.origin.kind === "channel" && deps.policy.isChannelWhitelisted(item.origin.chatId) ? "forward" : "copy";
+        try {
+          deps.queue.reprocessRecoveredItem(itemId, deliveryMode, deps.now(), deps.now());
+          deps.admin.audit("recovery_preparation_requested", String(deps.config.adminUserId), deps.now(), itemId, undefined, { deliveryMode });
+          await ctx.reply(`Preparation rules were requested for queue item #${itemId}. It will remain unscheduled until preparation finishes.`);
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Could not schedule preparation for this recovered item.");
+        }
+      }
       case "safety": return sendSafety(ctx, typeof payload.offset === "number" ? payload.offset : 0);
       case "publish": {
         const head = deps.queue.getHead();
@@ -734,8 +756,8 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await beginPrompt(ctx, {
       kind: "recover",
       state: {},
-      text: "Recovery accepts a configured queue-channel message link or explicit message ID. This flow is intentionally explicit because Telegram cannot enumerate missed history.",
-      placeholder: "queue link or message ID",
+      text: "Recover one queue-channel message or enter an ordered bundle of message IDs. Recovery keeps each selected message's shown forwarding mode and is ready to publish as shown. For a content bundle with one standalone text credit, append --credit-last. Telegram cannot enumerate missed history.",
+      placeholder: "message IDs [--credit-last]",
     });
   });
   command("cancel", async (ctx) => { deps.admin.clearPrompt(deps.config.adminUserId); await ctx.reply("Pending admin prompt cancelled."); });
