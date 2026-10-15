@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { appendInlineByline, CAPTION_LIMIT, TEXT_LIMIT } from "../domain/byline";
-import { classifyPublicationPlan } from "../domain/origin-policy";
-import type { QueueRepository, PolicyRepository } from "../db/repositories";
+import type { QueueRepository } from "../db/repositories";
 import type { Logger } from "../logger";
 import { classifyTelegramError } from "../errors";
-import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedPublicationContractV2, PublicationContract, PublicationPlan, QueueItemStatus, StoredMessageSnapshot, TransferStep } from "../types";
+import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedPublicationContractV2, TransferStep } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
 import type { ChatId } from "../types";
@@ -21,14 +19,7 @@ export type PublicationOutcome =
   | { kind: "deleted_external"; itemId: number; operationId?: string }
   | { kind: "failed"; itemId: number; status: string; error: string; operationId?: string };
 
-type Claimed = NonNullable<ReturnType<QueueRepository["claimPublication"]>>;
-type PreparedPublication = {
-  snapshots: StoredMessageSnapshot[];
-  sourceIds: MessageId[];
-  plan: PublicationPlan;
-  contract: PublicationContract;
-};
-
+type Claimed = NonNullable<ReturnType<QueueRepository["claimReadyPublication"]>>;
 const deliverySteps = (members: readonly PreparedMember[]): TransferStep[] => {
   const steps: TransferStep[] = [];
   for (let index = 0; index < members.length;) {
@@ -57,14 +48,12 @@ const retryAtFor = (error: NormalizedTelegramError, now: number, cooldown?: Tele
   return now + 60_000;
 };
 
-const classifyPlanError = (error: NormalizedTelegramError): "blocked" | "needs_edit" =>
-  error.kind === "invalid_content_or_entities" ? "needs_edit" : "blocked";
+const numericOutputCount = (ids: readonly unknown[]): number => ids.filter((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0).length;
 
 export type PublicationService = ReturnType<typeof createPublicationService>;
 
 export const createPublicationService = (input: {
   queue: QueueRepository;
-  policy: PolicyRepository;
   gateway: TelegramGateway;
   queueChannelId: ChatId;
   targetChannelId: ChatId;
@@ -94,8 +83,6 @@ export const createPublicationService = (input: {
     finally { finish?.(); }
   };
 
-  const numericOutputCount = (ids: readonly unknown[]): number => ids.filter((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0).length;
-
   const logUncertainty = (claimed: Claimed, error: NormalizedTelegramError, context: { phase?: string; expectedOutputCount?: number; knownOutputCount?: number } = {}): void => {
     let evidence: ReturnType<QueueRepository["operationEvidence"]>;
     try { evidence = input.queue.operationEvidence(claimed.item.id); }
@@ -109,93 +96,6 @@ export const createPublicationService = (input: {
       errorKind: error.kind,
       telegramMethod: error.method,
     });
-  };
-
-  const cleanupDestination = async (ids: readonly MessageId[]): Promise<{ ok: true } | { ok: false; error: NormalizedTelegramError }> => {
-    if (ids.length === 0) return { ok: true };
-    try {
-      await input.gateway.deleteMessages(input.targetChannelId, ids);
-      return { ok: true };
-    } catch (error) {
-      const normalized = classifyTelegramError(error);
-      // A destination message that is already absent is a confirmed cleanup.
-      if (normalized.kind === "source_missing") return { ok: true };
-      input.logger.error("destination_partial_cleanup_failed", { error: normalized.kind, count: ids.length });
-      return { ok: false, error: normalized };
-    }
-  };
-
-  const editInlineByline = async (snapshots: readonly StoredMessageSnapshot[], destinationIds: readonly MessageId[], name: string): Promise<void> => {
-    if (snapshots.length !== destinationIds.length) throw new Error("Destination count does not match snapshots");
-    const captionMembers = snapshots.filter((snapshot) => snapshot.caption !== undefined && snapshot.caption.length > 0);
-    if (snapshots.length > 1 && captionMembers.length > 1) throw new Error("Album has multiple caption-bearing members");
-    if (snapshots.length === 1 && snapshots[0]?.contentType === "text") {
-      const snapshot = snapshots[0]!;
-      const result = appendInlineByline(snapshot.text, name, TEXT_LIMIT, snapshot.entities);
-      const editInput = { chatId: input.targetChannelId, messageId: destinationIds[0]!, text: result.text } as Parameters<TelegramGateway["editText"]>[0];
-      if (result.entities !== undefined) editInput.entities = result.entities;
-      await input.gateway.editText(editInput);
-      return;
-    }
-    const targetIndex = captionMembers.length > 0 ? snapshots.indexOf(captionMembers[0]!) : 0;
-    const snapshot = snapshots[targetIndex]!;
-    const result = appendInlineByline(snapshot.caption, name, CAPTION_LIMIT, snapshot.captionEntities);
-    const editInput = { chatId: input.targetChannelId, messageId: destinationIds[targetIndex]!, caption: result.text } as Parameters<TelegramGateway["editCaption"]>[0];
-    if (result.entities !== undefined) editInput.captionEntities = result.entities;
-    if (snapshot.showCaptionAboveMedia !== undefined) editInput.showCaptionAboveMedia = snapshot.showCaptionAboveMedia;
-    await input.gateway.editCaption(editInput);
-  };
-
-  const preflightInlineByline = (snapshots: readonly StoredMessageSnapshot[], name: string): void => {
-    if (snapshots.length === 0) throw new Error("No source snapshots are available for byline editing");
-    const captionMembers = snapshots.filter((snapshot) => snapshot.caption !== undefined && snapshot.caption.length > 0);
-    if (snapshots.length > 1 && captionMembers.length > 1) throw new Error("Album has multiple caption-bearing members");
-    if (snapshots.length === 1 && snapshots[0]?.contentType === "text") {
-      const snapshot = snapshots[0]!;
-      appendInlineByline(snapshot.text, name, TEXT_LIMIT, snapshot.entities);
-      return;
-    }
-    const snapshot = captionMembers[0] ?? snapshots[0]!;
-    appendInlineByline(snapshot.caption, name, CAPTION_LIMIT, snapshot.captionEntities);
-  };
-
-  const prepare = (item: Claimed["item"]): PreparedPublication | { blockedStatus: "blocked" | "needs_edit" | "needs_review"; reason: string } => {
-    const snapshots = input.queue.getCurrentSnapshotSet(item.id);
-    const sourceIds = input.queue.currentSourceIds(item.id);
-    const policyInput = {
-      origin: item.origin,
-      contentType: item.contentType,
-      channelIsWhitelisted: item.origin.kind === "channel" && input.policy.isChannelWhitelisted(item.origin.chatId),
-    } as Parameters<typeof classifyPublicationPlan>[0];
-    const alias = input.policy.aliasForOrigin(item.origin);
-    if (alias !== undefined) policyInput.alias = alias;
-    const plan = classifyPublicationPlan(policyInput);
-    if (plan.kind === "blocked") return { blockedStatus: plan.reason === "unsupported_content" ? "blocked" : "needs_review", reason: plan.reason };
-    if ((plan.kind === "copy_with_inline_byline" || plan.kind === "copy_with_separate_byline") && snapshots.some((snapshot) => snapshot.contentType === "unknown" || snapshot.contentType === "service")) {
-      return { blockedStatus: "blocked", reason: "unsupported_content" };
-    }
-    if (plan.kind === "copy_with_inline_byline") {
-      try {
-        preflightInlineByline(snapshots, plan.name);
-      } catch (error) {
-        const description = error instanceof Error ? error.message : "Album caption requires review";
-        return { blockedStatus: description.includes("multiple caption") ? "needs_review" : "needs_edit", reason: description };
-      }
-    }
-    const requiresSeparateByline = plan.kind === "copy_with_separate_byline";
-    const contract: PublicationContract = {
-      capturedLogicalStatus: item.status,
-      capturedContentVersion: item.contentVersion,
-      capturedSourceGeneration: item.sourceGeneration,
-      sourceIds,
-      policy: plan,
-      expectedTransferredMessageCount: sourceIds.length,
-      expectedOutputMessageCount: sourceIds.length + (requiresSeparateByline ? 1 : 0),
-      requiresInlineEdit: plan.kind === "copy_with_inline_byline",
-      requiresSeparateByline,
-    };
-    if (plan.kind === "copy_with_inline_byline" || plan.kind === "copy_with_separate_byline") contract.bylineText = `by ${plan.name}`;
-    return { snapshots, sourceIds, plan, contract };
   };
 
   const guardFor = (claimed: Claimed): OperationGuard => ({
@@ -224,103 +124,11 @@ export const createPublicationService = (input: {
       logUncertainty(claimed, error, { ...context, phase: "uncertain" });
       return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
     }
-    const status = classifyPlanError(error);
+    const status = error.kind === "invalid_content_or_entities" ? "needs_edit" : "blocked";
     input.queue.transition(claimed.item.id, "publishing", status, now, error.kind, error.description);
     input.queue.setOperationState(claimed.operationId, "failed", now, error.kind, JSON.stringify({ description: error.description }));
     input.queue.setOperationPhase(claimed.operationId, "failed", now, error.kind, JSON.stringify({ description: error.description }));
     return { kind: "failed", itemId: claimed.item.id, status, error: error.description, operationId: claimed.operationId };
-  };
-
-  const publishClaimedLegacy = async (claimed: Claimed, prepared?: PreparedPublication): Promise<PublicationOutcome> => {
-    const preparation = prepared ?? prepare(claimed.item);
-    if ("blockedStatus" in preparation) {
-      const now = input.clock.now();
-      input.queue.transition(claimed.item.id, "publishing", preparation.blockedStatus, now, preparation.reason, preparation.reason);
-      input.queue.setOperationState(claimed.operationId, "failed", now, preparation.reason);
-      input.queue.setOperationPhase(claimed.operationId, "failed", now, preparation.reason);
-      return { kind: "blocked", itemId: claimed.item.id, status: preparation.blockedStatus, reason: preparation.reason, operationId: claimed.operationId };
-    }
-    const { snapshots, sourceIds, plan, contract } = preparation;
-    const guard = guardFor(claimed);
-    try {
-      input.queue.persistPublicationContract(claimed.operationId, contract, input.clock.now());
-      input.queue.beginPublicationTransfer(guard, input.clock.now());
-    } catch (error) {
-      return failClaim(claimed, classifyTelegramError(error));
-    }
-
-    let destinationIds: MessageId[] = [];
-    try {
-      const transferInput = { targetChatId: input.targetChannelId, sourceChatId: input.queueChannelId, messageIds: sourceIds };
-      const result = plan.kind === "forward" ? await input.gateway.forwardMessages(transferInput) : await input.gateway.copyMessages(transferInput);
-      destinationIds = [...result];
-      for (const [ordinal, id] of destinationIds.entries()) input.queue.recordOutput(claimed.operationId, "transferred", input.targetChannelId, id, ordinal, input.clock.now());
-      if (destinationIds.length !== sourceIds.length) {
-        input.queue.markPartialCleanupPending(guard, input.clock.now(), "partial_result", "Telegram returned fewer destination messages than the immutable output contract requires");
-        const cleaned = await cleanupDestination(destinationIds);
-        if (!cleaned.ok) {
-          input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", "Known partial destination output could not be confirmed deleted");
-          input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          logUncertainty(claimed, cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
-          return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
-        }
-        input.queue.transition(claimed.item.id, "publishing", "needs_review", input.clock.now(), "partial_result", "Telegram returned fewer destination messages than the source contract requires");
-        input.queue.setOperationState(claimed.operationId, "failed", input.clock.now(), "partial_result");
-        input.queue.setOperationPhase(claimed.operationId, "failed", input.clock.now(), "partial_result");
-        return { kind: "blocked", itemId: claimed.item.id, status: "needs_review", reason: "partial_result", operationId: claimed.operationId };
-      }
-      input.queue.recordCompleteBaseOutputs(guard, destinationIds.map((messageId, ordinal) => ({ chatId: input.targetChannelId, messageId, ordinal })), input.clock.now());
-
-      if (plan.kind === "copy_with_inline_byline") {
-        input.queue.markAttributionPending(guard, input.clock.now());
-        await editInlineByline(snapshots, destinationIds, plan.name);
-      } else if (plan.kind === "copy_with_separate_byline") {
-        input.queue.markAttributionPending(guard, input.clock.now());
-        const bylineId = await input.gateway.sendText({ chatId: input.targetChannelId, text: `by ${plan.name}` });
-        input.queue.recordOutput(claimed.operationId, "separate_byline", input.targetChannelId, bylineId, destinationIds.length, input.clock.now());
-        destinationIds = [...destinationIds, bylineId];
-      }
-      input.queue.markPublicationOutputComplete(guard, destinationIds, input.clock.now());
-      input.queue.markSourceCleanupPending(guard, input.clock.now());
-      await reportSharedRecovery();
-    } catch (error) {
-      const normalized = classifyTelegramError(error);
-      const attributionWasSeparate = plan.kind === "copy_with_separate_byline";
-      if (destinationIds.length > 0) {
-        const cleaned = await cleanupDestination(destinationIds);
-        if (!cleaned.ok || attributionWasSeparate && normalized.kind === "ambiguous_send_result") {
-          input.queue.transition(claimed.item.id, "publishing", "uncertain_publish", input.clock.now(), "partial_output_cleanup", normalized.description);
-          input.queue.setOperationState(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          input.queue.setOperationPhase(claimed.operationId, "uncertain", input.clock.now(), "partial_output_cleanup");
-          logUncertainty(claimed, cleaned.ok ? normalized : cleaned.error, { phase: "uncertain", expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
-          return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
-        }
-        // An edit failure after the known base messages were removed is safe to
-        // retry. A separate-byline ambiguity is intentionally never retried.
-        if (!attributionWasSeparate && normalized.kind === "ambiguous_send_result") {
-          const retryAt = input.clock.now();
-          input.queue.setRetry(claimed.item.id, claimed.operationId, retryAt, retryAt, "attribution_retry", normalized.description);
-          return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
-        }
-      }
-      return failClaim(claimed, normalized, { expectedOutputCount: contract.expectedOutputMessageCount, knownOutputCount: numericOutputCount(destinationIds) });
-    }
-
-    try {
-      await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
-      input.queue.markCompleted(claimed.item.id, claimed.operationId, input.clock.now());
-      return { kind: "published", itemId: claimed.item.id, destinationMessageIds: destinationIds, operationId: claimed.operationId };
-    } catch (error) {
-      const normalized = classifyTelegramError(error);
-      if (normalized.kind === "source_missing") {
-        input.queue.markMissing(claimed.item.id, claimed.operationId, input.clock.now());
-        return { kind: "published", itemId: claimed.item.id, destinationMessageIds: destinationIds, operationId: claimed.operationId };
-      }
-      input.queue.setOperationState(claimed.operationId, "cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
-      input.queue.setOperationPhase(claimed.operationId, "source_cleanup_pending", input.clock.now(), normalized.kind, normalized.description);
-      return { kind: "cleanup_pending", itemId: claimed.item.id, operationId: claimed.operationId };
-    }
   };
 
   const publishPreparedClaimed = async (claimed: Claimed): Promise<PublicationOutcome> => {
@@ -413,11 +221,6 @@ export const createPublicationService = (input: {
     }
   };
 
-  const publishClaimed = async (claimed: Claimed, prepared?: PreparedPublication): Promise<PublicationOutcome> =>
-    claimed.item.representationKind === "prepared"
-      ? publishPreparedClaimed(claimed)
-      : publishClaimedLegacy(claimed, prepared);
-
   const cleanupPending = async (itemId: number): Promise<PublicationOutcome> => {
     const operation = input.queue.operationForItem(itemId);
     if (!operation) return { kind: "failed", itemId, status: "published_cleanup_pending", error: "Missing publication operation" };
@@ -471,5 +274,5 @@ export const createPublicationService = (input: {
     return lastDefinite ?? { kind: "empty" };
   };
 
-  return { publishNext, cleanupPending, publishClaimed };
+  return { publishNext, cleanupPending };
 };

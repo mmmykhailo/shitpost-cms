@@ -258,7 +258,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const preparation = createPreparationService({ queue, preparation: preparationRepository, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
   const publisher = createPublicationService({
-    queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
+    queue, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
     onSharedFailure: async (error, context) => {
       const key = error.kind === "rate_limited" ? "shared_issue:flood_wait" : `shared_issue:${error.kind}`;
       const fingerprint = createHash("sha256").update(JSON.stringify({ kind: error.kind })).digest("hex");

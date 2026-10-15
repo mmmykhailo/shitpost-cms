@@ -51,7 +51,7 @@ const open = (gateway: TelegramGateway) => {
   const policy = createPolicyRepository(database);
   const clock = createFakeClock(10_000);
   const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
-  const service = createPublicationService({ queue, policy, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
+  const service = createPublicationService({ queue, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
   resources.push({ directory, close: database.close });
   return { database, queue, policy, service, clock, cooldown };
 };
@@ -136,6 +136,87 @@ describe("publication service", () => {
     expect((await run.service.publishNext()).kind).toBe("uncertain");
     expect(run.queue.findItemById(1)?.status).toBe("uncertain_publish");
     expect(run.queue.findItemById(2)?.status).toBe("queued");
+  });
+
+  test("sends a prepared album as one grouped transfer and reviews an unmappable missing member", async () => {
+    const fake = fakeGateway();
+    const run = open(fake.gateway);
+    const first = snapshotFixture({ messageId: asMessageId(134), mediaGroupId: "prepared-album", contentType: "photo", ordinal: 0 });
+    const second = snapshotFixture({ messageId: asMessageId(135), mediaGroupId: "prepared-album", contentType: "photo", ordinal: 1 });
+    const item = run.queue.observeQueueSnapshot(first, 1_000).item;
+    run.queue.addAlbumMember(item.id, second, 1_001);
+    run.queue.finalizeAlbums(20_000);
+    ready(run);
+    expect((await run.service.publishNext()).kind).toBe("published");
+    expect(fake.calls.filter((call) => call === "copy")).toHaveLength(1);
+
+    const missing = fakeGateway({ transferFailure: { kind: "source_missing", description: "album source unavailable" } });
+    const missingRun = open(missing.gateway);
+    const missingFirst = snapshotFixture({ messageId: asMessageId(136), mediaGroupId: "missing-album", contentType: "photo", ordinal: 0 });
+    const missingSecond = snapshotFixture({ messageId: asMessageId(137), mediaGroupId: "missing-album", contentType: "photo", ordinal: 1 });
+    const missingItem = missingRun.queue.observeQueueSnapshot(missingFirst, 1_000).item;
+    missingRun.queue.addAlbumMember(missingItem.id, missingSecond, 1_001);
+    missingRun.queue.finalizeAlbums(20_000);
+    ready(missingRun);
+    expect(await missingRun.service.publishNext()).toMatchObject({ kind: "failed", status: "needs_review" });
+    expect(missingRun.queue.currentSourceIds(1)).toEqual([asMessageId(136), asMessageId(137)]);
+  });
+
+  test("reports shared failures and recovery callbacks without losing publication progress", async () => {
+    const limited = fakeGateway({ transferFailure: { kind: "rate_limited", description: "slow down" } });
+    const run = open(limited.gateway);
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(138) }), 1_000);
+    ready(run);
+    const failures: string[] = [];
+    const service = createPublicationService({
+      queue: run.queue, gateway: limited.gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock: run.clock,
+      logger: createLogger("error"), cooldown: run.cooldown,
+      onSharedFailure: (error, context) => { failures.push(`${error.kind}:${context?.itemId}`); },
+    });
+    expect((await service.publishNext()).kind).toBe("retry_scheduled");
+    expect(failures).toEqual(["rate_limited:1"]);
+
+    const success = fakeGateway();
+    const recovered = open(success.gateway);
+    recovered.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(139) }), 1_000);
+    ready(recovered);
+    let recoveries = 0;
+    const withRecovery = createPublicationService({
+      queue: recovered.queue, gateway: success.gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock: recovered.clock,
+      logger: createLogger("error"), onSharedRecovery: () => { recoveries += 1; },
+    });
+    expect((await withRecovery.publishNext()).kind).toBe("published");
+    expect(recoveries).toBe(1);
+  });
+
+  test("returns actionable outcomes for malformed prepared state and stale manual confirmations", async () => {
+    const fake = fakeGateway();
+    const empty = open(fake.gateway);
+    empty.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(140) }), 1_000);
+    ready(empty);
+    const claimReadyPublication = empty.queue.claimReadyPublication.bind(empty.queue);
+    empty.queue.claimReadyPublication = (...args) => {
+      const claimed = claimReadyPublication(...args);
+      if (claimed) empty.database.raw.query("DELETE FROM queue_messages WHERE item_id = 1 AND source_generation = 0").run();
+      return claimed;
+    };
+    expect(await empty.service.publishNext()).toMatchObject({ kind: "failed", status: "needs_review" });
+
+    const stale = open(fake.gateway);
+    stale.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(141) }), 1_000);
+    ready(stale);
+    expect(await stale.service.publishNext("manual_publish", { itemId: 99, contentVersion: 1, sourceGeneration: 0 })).toMatchObject({ kind: "blocked", status: "stale_candidate" });
+    expect(await stale.service.publishNext("manual_publish", { itemId: 1, contentVersion: 99, sourceGeneration: 0 })).toMatchObject({ kind: "blocked", status: "stale_candidate" });
+  });
+
+  test("keeps invalid destination content as an edit issue", async () => {
+    const fake = fakeGateway({ transferFailure: { kind: "invalid_content_or_entities", description: "entities invalid" } });
+    const run = open(fake.gateway);
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(142) }), 1_000);
+    ready(run);
+
+    expect(await run.service.publishNext()).toMatchObject({ kind: "failed", status: "needs_edit" });
+    expect(run.queue.findItemById(1)?.status).toBe("needs_edit");
   });
 
   test("persists the full Telegram flood wait for publication retries", async () => {

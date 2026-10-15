@@ -38,12 +38,21 @@ const createGateway = (hooks: GatewayHooks = {}) => {
       if (hooks.copy) return hooks.copy(messageIds);
       return messageIds.map(() => asMessageId(nextMessageId++));
     },
+    copyMessage: async ({ messageId }) => {
+      copies.push([Number(messageId)]);
+      if (hooks.copy) return (await hooks.copy([messageId]))[0]!;
+      return asMessageId(nextMessageId++);
+    },
     forwardMessages: async ({ messageIds }) => {
       forwards.push(messageIds.map(Number));
       if (hooks.forward) return hooks.forward(messageIds);
       return messageIds.map(() => asMessageId(nextMessageId++));
     },
-    forwardMessage: async () => { throw new Error("unused"); },
+    forwardMessage: async ({ messageId }) => {
+      forwards.push([Number(messageId)]);
+      if (hooks.forward) return { message_id: Number((await hooks.forward([messageId]))[0]!) } as never;
+      return { message_id: Number(asMessageId(nextMessageId++)) } as never;
+    },
     editText: async () => {},
     editCaption: async () => {},
     sendText: async () => asMessageId(nextMessageId++),

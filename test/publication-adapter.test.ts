@@ -62,7 +62,6 @@ describe("publication service through the grammY adapter", () => {
     const clock = createFakeClock(10_000);
     const service = createPublicationService({
       queue,
-      policy,
       gateway,
       queueChannelId: asChatId(-100),
       targetChannelId: asChatId(-200),

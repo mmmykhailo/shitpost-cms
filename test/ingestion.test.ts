@@ -140,6 +140,14 @@ describe("ingestion service", () => {
         expect(current!.pending.find(-100, replacementId)).toMatchObject({ state: "quarantined_renewal_candidate", candidateOperationId: "earlier-uncertain-renewal" });
         return [replacementId];
       },
+      copyMessage: async () => {
+        const replacementId = asMessageId(902);
+        current!.pending.upsert(snapshotFixture({ chatId: asChatId(-100), messageId: replacementId, telegramDate: current!.clock.now() }), current!.clock.now());
+        current!.advance(2_000);
+        expect(current!.service.finalizePendingUpdates()).toEqual([]);
+        expect(current!.pending.find(-100, replacementId)).toMatchObject({ state: "quarantined_renewal_candidate", candidateOperationId: "earlier-uncertain-renewal" });
+        return replacementId;
+      },
       forwardMessage: async () => { throw new Error("unused"); },
       editText: async () => {},
       editCaption: async () => {},
