@@ -269,6 +269,10 @@ export type NormalizedTelegramError = {
   description: string;
   retryAfterSeconds?: number;
   method?: string;
+  /** Outputs safely parsed from an invalid/short creation response. */
+  knownOutputs?: readonly MessageId[];
+  /** True when a creation request may have reached Telegram. */
+  requestMayHaveSucceeded?: boolean;
   cause?: unknown;
 };
 

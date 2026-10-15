@@ -3,7 +3,7 @@ import type { Logger } from "../logger";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import { snapshotFromMessage } from "../domain/message";
 import type { GeneratedMessageRepository, PolicyRepository, QueueRepository } from "../db/repositories";
-import type { ChatId, StoredMessageSnapshot } from "../types";
+import type { ChatId, DeliveryMode, StoredMessageSnapshot } from "../types";
 
 export type IngestionResult = {
   accepted: boolean;
@@ -22,7 +22,10 @@ export const createIngestionService = (input: {
   logger: Logger;
   now: () => number;
 }) => {
-  const ingestLogicalSnapshot = (snapshot: StoredMessageSnapshot, now: number): IngestionResult => {
+  const captureDeliveryMode = (snapshot: StoredMessageSnapshot): DeliveryMode =>
+    snapshot.origin.kind === "channel" && input.policy.isChannelWhitelisted(snapshot.origin.chatId) ? "forward" : "copy";
+
+  const ingestLogicalSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode = captureDeliveryMode(snapshot), policyCapturedAt = now): IngestionResult => {
     input.policy.observeAuthor(snapshot.origin, now);
     if (snapshot.mediaGroupId !== undefined) {
       const existing = input.queue.findBySource(snapshot.chatId, snapshot.messageId);
@@ -39,7 +42,7 @@ export const createIngestionService = (input: {
         return { accepted: true, itemId: item.id };
       }
     }
-    const result = input.queue.observeQueueSnapshot(snapshot, now);
+    const result = input.queue.observeQueueSnapshot(snapshot, now, deliveryMode, policyCapturedAt);
     return result.inserted
       ? { accepted: true, itemId: result.item.id }
       : { accepted: false, itemId: result.item.id, ignoredReason: "duplicate" };
@@ -54,17 +57,19 @@ export const createIngestionService = (input: {
     return ingestLogicalSnapshot(snapshot, now);
   };
 
-  const handleChannelPost = (message: Message): IngestionResult => {
+  const handleChannelPost = (message: Message, telegramUpdateId?: number): IngestionResult => {
     if (message.chat.id !== input.queueChannelId) return { accepted: false, ignoredReason: "wrong_chat" };
-    const snapshot = snapshotFromMessage(message);
+    const snapshot = snapshotFromMessage(message, 0, telegramUpdateId);
+    const receivedAt = input.now();
+    const deliveryMode = captureDeliveryMode(snapshot);
     if (!input.pending) return observe(snapshot, input.now());
-    input.pending.upsert(snapshot, input.now());
+    input.pending.upsert(snapshot, receivedAt, receivedAt + 2_000, { updateKind: "post", ...(telegramUpdateId === undefined ? {} : { telegramUpdateId }), deliveryMode, policyCapturedAt: receivedAt });
     return { accepted: false, ignoredReason: "pending_update" };
   };
 
-  const handleEditedChannelPost = (message: Message): IngestionResult => {
+  const handleEditedChannelPost = (message: Message, telegramUpdateId?: number): IngestionResult => {
     if (message.chat.id !== input.queueChannelId) return { accepted: false, ignoredReason: "wrong_chat" };
-    const snapshot = snapshotFromMessage(message);
+    const snapshot = snapshotFromMessage(message, 0, telegramUpdateId);
     const existing = input.queue.findBySource(snapshot.chatId, snapshot.messageId);
     if (!input.pending) {
       if (!existing) {
@@ -77,7 +82,7 @@ export const createIngestionService = (input: {
     }
     // Persist first. If the process stops after this write, the finalizer can
     // replay the edit from SQLite without relying on Telegram update replay.
-    input.pending.upsert(snapshot, input.now(), input.now());
+    input.pending.upsert(snapshot, input.now(), input.now(), { updateKind: "edit", ...(telegramUpdateId === undefined ? {} : { telegramUpdateId }) });
     if (!existing) return { accepted: false, ignoredReason: "pending_update" };
     input.policy.observeAuthor(snapshot.origin, input.now());
     const updated = input.queue.updateSnapshot(snapshot.chatId, snapshot.messageId, snapshot);
@@ -103,9 +108,13 @@ export const createIngestionService = (input: {
         continue;
       }
       const existing = input.queue.findBySource(pending.queueChatId, pending.telegramMessageId);
+      if (!existing && pending.updateKind === "edit") {
+        input.pending.markState(pending.queueChatId, pending.telegramMessageId, "discarded", now, undefined, "Edited channel post is not a new queue submission");
+        continue;
+      }
       const result = existing
         ? (input.policy.observeAuthor(pending.snapshot.origin, now), input.queue.updateSnapshot(pending.queueChatId, pending.telegramMessageId, pending.snapshot), { accepted: true, itemId: existing.id })
-        : ingestLogicalSnapshot(pending.snapshot, now);
+        : ingestLogicalSnapshot(pending.snapshot, now, pending.capturedDeliveryMode, pending.policyCapturedAt ?? pending.receivedAt);
       input.pending.markState(pending.queueChatId, pending.telegramMessageId, "ingested", now);
       if (result.itemId !== undefined) ingested.push(result.itemId);
     }

@@ -3,7 +3,7 @@ import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from ".
 import { validateSlotCount } from "../domain/schedule";
 import { validateOrderedMessageIds, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
-import type { MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -181,7 +181,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     );
   };
 
-  const observeQueueSnapshot = (snapshot: StoredMessageSnapshot, now: number): { item: QueueItemRecord; inserted: boolean } => {
+  const observeQueueSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode?: DeliveryMode, policyCapturedAt?: number): { item: QueueItemRecord; inserted: boolean } => {
     snapshot = validateStoredMessageSnapshot(snapshot);
     return database.transaction(() => {
       const existing = findBySource(snapshot.chatId, snapshot.messageId);
@@ -197,7 +197,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       const status: QueueItemStatus = isAlbum ? "collecting" : "queued";
       const quietDeadline = isAlbum ? now + 2_000 : null;
       const maxDeadline = isAlbum ? now + 10_000 : null;
-      const result = database.raw.query(`INSERT INTO queue_items (logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at, album_quiet_deadline, album_max_deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      const result = database.raw.query(`INSERT INTO queue_items (logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at, album_quiet_deadline, album_max_deadline, delivery_mode, policy_captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         lastSequence.value + 1,
         snapshot.chatId,
         snapshot.mediaGroupId ?? null,
@@ -209,6 +209,8 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         snapshot.telegramDate,
         quietDeadline,
         maxDeadline,
+        deliveryMode ?? null,
+        deliveryMode === undefined ? null : (policyCapturedAt ?? now),
       );
       const itemId = Number(result.lastInsertRowid);
       insertSnapshot(itemId, 0, snapshot);
@@ -293,7 +295,11 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     }
     const current = getMessages(item.id).find((message) => message.telegramMessageId === messageId);
     if (!current) return item;
-    if (current.editDate !== undefined && snapshot.editDate !== undefined && snapshot.editDate <= current.editDate) return item;
+    if (current.editDate !== undefined && snapshot.editDate !== undefined) {
+      if (snapshot.editDate < current.editDate) return item;
+      if (snapshot.editDate === current.editDate && current.snapshot.telegramUpdateId !== undefined && snapshot.telegramUpdateId !== undefined && snapshot.telegramUpdateId <= current.snapshot.telegramUpdateId) return item;
+      if (snapshot.editDate === current.editDate && (current.snapshot.telegramUpdateId === undefined || snapshot.telegramUpdateId === undefined)) return item;
+    }
     const persistedSnapshot = { ...snapshot, origin: current.snapshot.origin };
     if (stableJson(current.snapshot) === stableJson(persistedSnapshot)) return item;
     database.raw.query("UPDATE queue_messages SET telegram_date = ?, edit_date = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(persistedSnapshot.telegramDate, persistedSnapshot.editDate ?? null, JSON.stringify(persistedSnapshot), item.id, item.sourceGeneration, messageId);

@@ -1,6 +1,8 @@
 import type { AppDatabase } from "./database";
 import { parseStoredMessageSnapshot } from "../domain/validation";
-import type { ChatId, MessageId, PendingQueueUpdateState, StoredMessageSnapshot } from "../types";
+import type { ChatId, DeliveryMode, MessageId, PendingQueueUpdateState, StoredMessageSnapshot } from "../types";
+
+export type PendingUpdateCapture = { updateKind?: "post" | "edit"; telegramUpdateId?: number; deliveryMode?: DeliveryMode; policyCapturedAt?: number };
 
 export type PendingQueueUpdateRecord = {
   queueChatId: ChatId;
@@ -12,6 +14,10 @@ export type PendingQueueUpdateRecord = {
   state: PendingQueueUpdateState;
   candidateOperationId?: string;
   lastError?: string;
+  updateKind?: "post" | "edit";
+  telegramUpdateId?: number;
+  capturedDeliveryMode?: DeliveryMode;
+  policyCapturedAt?: number;
 };
 
 type PendingRow = {
@@ -24,6 +30,10 @@ type PendingRow = {
   state: PendingQueueUpdateState;
   candidate_operation_id: string | null;
   last_error: string | null;
+  update_kind: "post" | "edit";
+  telegram_update_id: number | null;
+  captured_delivery_mode: DeliveryMode | null;
+  policy_captured_at: number | null;
 };
 
 const rowToRecord = (row: PendingRow): PendingQueueUpdateRecord => {
@@ -38,6 +48,10 @@ const rowToRecord = (row: PendingRow): PendingQueueUpdateRecord => {
   if (row.media_group_id !== null) result.mediaGroupId = row.media_group_id;
   if (row.candidate_operation_id !== null) result.candidateOperationId = row.candidate_operation_id;
   if (row.last_error !== null) result.lastError = row.last_error;
+  result.updateKind = row.update_kind;
+  if (row.telegram_update_id !== null) result.telegramUpdateId = row.telegram_update_id;
+  if (row.captured_delivery_mode !== null) result.capturedDeliveryMode = row.captured_delivery_mode;
+  if (row.policy_captured_at !== null) result.policyCapturedAt = row.policy_captured_at;
   return result;
 };
 
@@ -49,18 +63,22 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
     return row ? rowToRecord(row) : undefined;
   };
 
-  const upsert = (snapshot: StoredMessageSnapshot, receivedAt: number, processAfter = receivedAt + 2_000): PendingQueueUpdateRecord => {
+  const upsert = (snapshot: StoredMessageSnapshot, receivedAt: number, processAfter = receivedAt + 2_000, capture: PendingUpdateCapture = {}): PendingQueueUpdateRecord => {
     database.raw.query(`
-      INSERT INTO pending_queue_updates (queue_chat_id, telegram_message_id, media_group_id, snapshot_json, received_at, process_after, state, candidate_operation_id, last_error)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+      INSERT INTO pending_queue_updates (queue_chat_id, telegram_message_id, media_group_id, snapshot_json, received_at, process_after, state, candidate_operation_id, last_error, update_kind, telegram_update_id, captured_delivery_mode, policy_captured_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?)
       ON CONFLICT(queue_chat_id, telegram_message_id) DO UPDATE SET
         media_group_id = excluded.media_group_id,
         snapshot_json = excluded.snapshot_json,
         received_at = MIN(pending_queue_updates.received_at, excluded.received_at),
         process_after = excluded.process_after,
+        update_kind = CASE WHEN pending_queue_updates.update_kind = 'post' THEN 'post' ELSE excluded.update_kind END,
+        telegram_update_id = COALESCE(excluded.telegram_update_id, pending_queue_updates.telegram_update_id),
+        captured_delivery_mode = COALESCE(pending_queue_updates.captured_delivery_mode, excluded.captured_delivery_mode),
+        policy_captured_at = COALESCE(pending_queue_updates.policy_captured_at, excluded.policy_captured_at),
         state = CASE WHEN pending_queue_updates.state IN ('ingested','consumed_generated','discarded') THEN 'pending' ELSE pending_queue_updates.state END,
         last_error = NULL
-    `).run(snapshot.chatId, snapshot.messageId, snapshot.mediaGroupId ?? null, JSON.stringify(snapshot), receivedAt, processAfter);
+    `).run(snapshot.chatId, snapshot.messageId, snapshot.mediaGroupId ?? null, JSON.stringify(snapshot), receivedAt, processAfter, capture.updateKind ?? "post", capture.telegramUpdateId ?? snapshot.telegramUpdateId ?? null, capture.deliveryMode ?? null, capture.policyCapturedAt ?? null);
     const result = find(snapshot.chatId, snapshot.messageId);
     if (!result) throw new Error("Pending update disappeared after upsert");
     return result;

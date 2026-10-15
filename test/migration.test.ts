@@ -49,9 +49,14 @@ describe("schema migration 4", () => {
     applyMigrations(legacy, 3);
     legacy.query("INSERT INTO queue_items (logical_sequence, queue_chat_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at) VALUES (1, -100, 77, 'text', ?, 'queued', 100, 100)").run(JSON.stringify({ kind: "hidden_user", senderUserName: " Alex " }));
     legacy.query("INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, snapshot_json) VALUES (1, 0, -100, 77, 0, 100, ?)").run(JSON.stringify({ schemaVersion: 1, chatId: -100, messageId: 77, ordinal: 0, contentType: "text", origin: { kind: "hidden_user", senderUserName: " Alex " }, telegramDate: 100, hasReplyMarkup: false }));
+    legacy.query("INSERT INTO channel_whitelist (chat_id, username, title, added_at, added_by_admin_id, updated_at) VALUES (-500, 'source', 'Source', 1, 1, 1)").run();
+    legacy.query("INSERT INTO queue_items (logical_sequence, queue_chat_id, first_message_id, content_type, origin_json, status, enqueued_at, physical_created_at) VALUES (2, -100, 78, 'text', ?, 'queued', 200, 200)").run(JSON.stringify({ kind: "channel", chatId: -500, title: "Source" }));
+    legacy.query("INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, snapshot_json) VALUES (2, 0, -100, 78, 0, 200, ?)").run(JSON.stringify({ schemaVersion: 1, chatId: -100, messageId: 78, ordinal: 0, contentType: "text", origin: { kind: "channel", chatId: -500, title: "Source" }, telegramDate: 200, hasReplyMarkup: false }));
     applyMigrations(legacy);
     expect((legacy.query("SELECT member_key FROM queue_messages WHERE item_id = 1").get() as { member_key: string }).member_key).toBe("legacy:77");
     expect((legacy.query("SELECT sender_name FROM known_hidden_authors").get() as { sender_name: string }).sender_name).toBe(" Alex ");
+    expect((legacy.query("SELECT delivery_mode, enqueued_at FROM queue_items WHERE id = 2").get() as { delivery_mode: string; enqueued_at: number })).toEqual({ delivery_mode: "forward", enqueued_at: 200 });
+    expect((legacy.query("SELECT member_delivery_mode FROM queue_messages WHERE item_id = 2").get() as { member_delivery_mode: string }).member_delivery_mode).toBe("forward");
     expect((legacy.query("PRAGMA foreign_key_check").all() as unknown[])).toHaveLength(0);
     legacy.close();
     rmSync(directory, { recursive: true, force: true });

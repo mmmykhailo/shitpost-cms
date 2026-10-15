@@ -72,6 +72,35 @@ describe("ingestion service", () => {
     expect(current.pending.find(-100, 501)?.state).toBe("ingested");
   });
 
+  test("freezes a whitelisted channel decision at first receipt across the pending delay", () => {
+    current = open();
+    current.policy.upsertChannel(-55, "source", "Source", 1, 9_000);
+    const message = {
+      message_id: 550,
+      date: 9,
+      chat: { id: -100, type: "channel", title: "Queue" },
+      forward_origin: { type: "channel", chat: { id: -55, type: "channel", title: "Source" }, date: 9 },
+      text: "hello",
+    } as never;
+    current.service.handleChannelPost(message, 41);
+    current.policy.removeChannel(-55, 1, 10_001);
+    current.advance(500);
+    current.service.handleChannelPost(message, 42);
+    expect(current.pending.find(-100, 550)).toMatchObject({ capturedDeliveryMode: "forward", policyCapturedAt: 10_000, telegramUpdateId: 42, updateKind: "post" });
+    current.advance(2_000);
+    expect(current.service.finalizePendingUpdates()).toEqual([1]);
+    expect((current.database.raw.query("SELECT delivery_mode, policy_captured_at FROM queue_items WHERE id = 1").get() as { delivery_mode: string; policy_captured_at: number })).toEqual({ delivery_mode: "forward", policy_captured_at: 10_000 });
+  });
+
+  test("does not treat an edit with no known submission as a new queue item", () => {
+    current = open();
+    const edited = { message_id: 551, date: 9, chat: { id: -100, type: "channel", title: "Queue" }, text: "edit only" } as never;
+    current.service.handleEditedChannelPost(edited, 55);
+    expect(current.service.finalizePendingUpdates()).toEqual([]);
+    expect(current.queue.findBySource(-100, 551)).toBeUndefined();
+    expect(current.pending.find(-100, 551)).toMatchObject({ state: "discarded", updateKind: "edit", telegramUpdateId: 55 });
+  });
+
   test("quarantines an update while renewal output is unresolved, then suppresses it when registered", () => {
     current = open();
     current.service.observe(snapshotFixture({ messageId: asMessageId(502), telegramDate: 0 }), 1);

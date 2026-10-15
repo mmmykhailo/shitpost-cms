@@ -73,6 +73,10 @@ describe("error boundaries", () => {
     const cases = [
       [new Error("Too Many Requests: retry later"), "rate_limited"],
       [new Error("Bad Request: message to delete not found"), "source_missing"],
+      [new Error("Bad Request: message to copy not found"), "source_missing"],
+      [new Error("Bad Request: message to forward not found"), "source_missing"],
+      [new Error("Bad Request: message to edit not found"), "source_missing"],
+      [new Error("Bad Request: message_id_invalid"), "unknown_permanent"],
       [new Error("Bad Request: the message can't be forwarded"), "content_protected"],
       [new Error("Forbidden: not enough rights"), "permission_denied"],
       [new Error("Bad Request: chat not found"), "destination_unavailable"],

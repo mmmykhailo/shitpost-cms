@@ -75,6 +75,8 @@ export type TelegramGateway = {
   getBotMembership(chatId: ChatId, botId: UserId): Promise<BotMembership>;
   forwardMessages(input: TransferMessagesInput): Promise<MessageId[]>;
   copyMessages(input: TransferMessagesInput): Promise<MessageId[]>;
+  /** Single-member copy is used when source-specific failure association matters. */
+  copyMessage?(input: { targetChatId: ChatId; sourceChatId: ChatId; messageId: MessageId; disableNotification?: boolean }): Promise<MessageId>;
   forwardMessage(input: { targetChatId: ChatId; sourceChatId: ChatId; messageId: MessageId; disableNotification?: boolean }): Promise<Message>;
   editText(input: EditTextInput): Promise<void>;
   editCaption(input: EditCaptionInput): Promise<void>;
@@ -99,10 +101,12 @@ const assertTransferIds = (messageIds: readonly MessageId[]): number[] => {
   return numericIds;
 };
 
-const ambiguousSendResult = (method: string, reason: string) => ({
+const ambiguousSendResult = (method: string, reason: string, knownOutputs: readonly MessageId[] = []) => ({
   kind: "ambiguous_send_result" as const,
   method,
   description: `Telegram ${method} returned an invalid message ID (${reason})`,
+  knownOutputs,
+  requestMayHaveSucceeded: true,
 });
 
 const returnedMessageId = (value: unknown, method: string, label: string): MessageId => {
@@ -112,11 +116,20 @@ const returnedMessageId = (value: unknown, method: string, label: string): Messa
 
 const normalizeBulkTransferResult = (result: unknown, method: "copyMessages" | "forwardMessages", requestedCount: number): MessageId[] => {
   if (!Array.isArray(result)) throw ambiguousSendResult(method, "response is not an array");
-  if (requestedCount > 0 && result.length === 0) throw ambiguousSendResult(method, "response is empty");
-  return result.map((entry, index) => {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw ambiguousSendResult(method, `response element ${index} is not an object`);
-    return returnedMessageId((entry as { message_id?: unknown }).message_id, method, `response element ${index}`);
+  const outputs: MessageId[] = [];
+  const seen = new Set<number>();
+  const problems: string[] = [];
+  result.forEach((entry, index) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) { problems.push(`response element ${index} is not an object`); return; }
+    const rawId = (entry as { message_id?: unknown }).message_id;
+    if (typeof rawId !== "number" || !Number.isSafeInteger(rawId) || rawId <= 0) { problems.push(`response element ${index} has an invalid message ID`); return; }
+    if (seen.has(rawId)) { problems.push(`response contains duplicate message ID ${rawId}`); return; }
+    seen.add(rawId);
+    outputs.push(asMessageId(rawId));
   });
+  if (result.length !== requestedCount) problems.push(`expected ${requestedCount} outputs, received ${result.length}`);
+  if (problems.length > 0) throw ambiguousSendResult(method, problems.join("; "), outputs);
+  return outputs;
 };
 
 const toTelegramEntities = (entities: readonly MessageEntity[] | undefined): GrammyMessageEntity[] | undefined => entities?.map((entity) => {
@@ -220,6 +233,13 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
     },
     forwardMessages: (input) => transfer("forward", input),
     copyMessages: (input) => transfer("copy", input),
+    copyMessage: async (input) => {
+      const options = input.disableNotification === undefined ? {} : { disable_notification: input.disableNotification };
+      return call("copyMessage", async () => {
+        const message = await api.copyMessage(input.targetChatId, input.sourceChatId, assertOutboundMessageId(input.messageId, "Telegram copy source ID"), options);
+        return returnedMessageId(message.message_id, "copyMessage", "response");
+      });
+    },
     forwardMessage: async (input) => {
       const options = input.disableNotification === undefined ? {} : { disable_notification: input.disableNotification };
       return call("forwardMessage", async () => {

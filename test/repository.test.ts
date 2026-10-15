@@ -49,6 +49,14 @@ describe("queue repository", () => {
     expect(queue.getHead()?.status).toBe("publishing");
   });
 
+  test("accepts later acknowledged edits with the same edit_date", () => {
+    const { queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(24), editDate: 2_000, telegramUpdateId: 8 }), 1_000);
+    expect(queue.updateSnapshot(-100, 24, snapshotFixture({ messageId: asMessageId(24), text: "later edit", editDate: 2_000, telegramUpdateId: 9 }))?.contentVersion).toBe(2);
+    expect(queue.updateSnapshot(-100, 24, snapshotFixture({ messageId: asMessageId(24), text: "older edit", editDate: 2_000, telegramUpdateId: 8 }))?.contentVersion).toBe(2);
+    expect(queue.getCurrentSnapshotSet(1)[0]?.text).toBe("later edit");
+  });
+
   test("edits never replace the semantic origin captured at ingestion", () => {
     const { queue } = open();
     const origin = { kind: "channel" as const, chatId: asChatId(-300), title: "Source" };

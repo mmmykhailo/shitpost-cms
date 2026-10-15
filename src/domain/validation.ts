@@ -106,12 +106,12 @@ const validateEntities = (value: unknown, field: string): readonly MessageEntity
 
 export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnapshot => {
   const candidate = record(value);
-  if (candidate.schemaVersion !== 1) throw new StoredDataValidationError("Unsupported snapshot schema version");
+  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) throw new StoredDataValidationError("Unsupported snapshot schema version");
   const contentType = candidate.contentType;
   if (typeof contentType !== "string" || !contentTypes.has(contentType as ContentType)) throw new StoredDataValidationError("Invalid snapshot content type");
   if (typeof candidate.hasReplyMarkup !== "boolean") throw new StoredDataValidationError("hasReplyMarkup must be boolean");
   const result: StoredMessageSnapshot = {
-    schemaVersion: 1,
+    schemaVersion: candidate.schemaVersion,
     chatId: asChatId(integer(candidate.chatId, "chatId")),
     messageId: asMessageId(integer(candidate.messageId, "messageId")),
     ordinal: integer(candidate.ordinal, "ordinal"),
@@ -138,6 +138,31 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     if (typeof candidate.showCaptionAboveMedia !== "boolean") throw new StoredDataValidationError("showCaptionAboveMedia must be boolean");
     result.showCaptionAboveMedia = candidate.showCaptionAboveMedia;
   }
+  if (candidate.telegramUpdateId !== undefined) {
+    const updateId = integer(candidate.telegramUpdateId, "telegramUpdateId");
+    if (updateId < 0) throw new StoredDataValidationError("telegramUpdateId must be non-negative");
+    result.telegramUpdateId = updateId;
+  }
+  if (candidate.nativeOrigin !== undefined) result.nativeOrigin = validateSemanticOrigin(candidate.nativeOrigin);
+  const contentFingerprint = optionalString(candidate.contentFingerprint, "contentFingerprint");
+  if (contentFingerprint !== undefined) {
+    if (!/^[0-9a-f]{64}$/u.test(contentFingerprint)) throw new StoredDataValidationError("contentFingerprint must be a SHA-256 hex digest");
+    result.contentFingerprint = contentFingerprint;
+  }
+  if (candidate.linkPreviewOptions !== undefined) {
+    const options = record(candidate.linkPreviewOptions);
+    const linkOptions: NonNullable<StoredMessageSnapshot["linkPreviewOptions"]> = {};
+    for (const key of ["isDisabled", "preferSmallMedia", "preferLargeMedia", "showAboveText"] as const) {
+      if (options[key] !== undefined) {
+        if (typeof options[key] !== "boolean") throw new StoredDataValidationError(`linkPreviewOptions.${key} must be boolean`);
+        linkOptions[key] = options[key];
+      }
+    }
+    const url = optionalString(options.url, "linkPreviewOptions.url");
+    if (url !== undefined) linkOptions.url = url;
+    result.linkPreviewOptions = linkOptions;
+  }
+  if (candidate.replyMarkup !== undefined) result.replyMarkup = record(candidate.replyMarkup);
   return result;
 };
 

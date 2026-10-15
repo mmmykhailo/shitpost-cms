@@ -1,4 +1,5 @@
 import type { Message } from "grammy/types";
+import { createHash } from "node:crypto";
 import { asChatId, asMessageId, asUserId, type ContentType, type MessageEntity, type SemanticOrigin, type StoredMessageSnapshot } from "../types";
 
 const entity = (value: { type: string; offset: number; length: number; url?: string; user?: { id: number; first_name: string; last_name?: string }; language?: string; custom_emoji_id?: string }): MessageEntity => {
@@ -77,18 +78,41 @@ export const contentTypeFromMessage = (message: Message): ContentType => {
   return "unknown";
 };
 
-export const snapshotFromMessage = (message: Message, ordinal = 0): StoredMessageSnapshot => {
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+};
+
+const contentPayload = (message: Message): Record<string, unknown> => {
+  const payload: Record<string, unknown> = {};
+  for (const key of ["text", "entities", "caption", "caption_entities", "show_caption_above_media", "photo", "video", "animation", "audio", "document", "voice", "sticker", "video_note", "contact", "location", "venue", "dice", "poll", "game", "paid_media", "giveaway", "giveaway_winners"] as const) {
+    if (key in message) payload[key] = (message as unknown as Record<string, unknown>)[key];
+  }
+  if ("link_preview_options" in message) payload.link_preview_options = message.link_preview_options;
+  if (message.reply_markup !== undefined) payload.reply_markup = message.reply_markup;
+  return payload;
+};
+
+export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdateId?: number): StoredMessageSnapshot => {
   const contentType = contentTypeFromMessage(message);
+  const origin = originFromMessage(message);
+  const payload = contentPayload(message);
   const result: StoredMessageSnapshot = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     chatId: asChatId(message.chat.id),
     messageId: asMessageId(message.message_id),
     ordinal,
     contentType,
-    origin: originFromMessage(message),
+    origin,
+    nativeOrigin: origin,
+    contentFingerprint: createHash("sha256").update(stableJson(payload)).digest("hex"),
     telegramDate: message.date * 1000,
     hasReplyMarkup: message.reply_markup !== undefined,
   };
+  if (telegramUpdateId !== undefined) result.telegramUpdateId = telegramUpdateId;
   if (message.media_group_id !== undefined) result.mediaGroupId = message.media_group_id;
   if ("text" in message) {
     result.text = message.text;
@@ -102,5 +126,16 @@ export const snapshotFromMessage = (message: Message, ordinal = 0): StoredMessag
   }
   if ("show_caption_above_media" in message && message.show_caption_above_media !== undefined) result.showCaptionAboveMedia = message.show_caption_above_media;
   if (message.edit_date !== undefined) result.editDate = message.edit_date * 1000;
+  if (message.reply_markup !== undefined) result.replyMarkup = JSON.parse(JSON.stringify(message.reply_markup)) as Record<string, unknown>;
+  if ("link_preview_options" in message && message.link_preview_options !== undefined) {
+    const options = message.link_preview_options;
+    const normalized: NonNullable<StoredMessageSnapshot["linkPreviewOptions"]> = {};
+    if (options.is_disabled !== undefined) normalized.isDisabled = options.is_disabled;
+    if (options.url !== undefined) normalized.url = options.url;
+    if (options.prefer_small_media !== undefined) normalized.preferSmallMedia = options.prefer_small_media;
+    if (options.prefer_large_media !== undefined) normalized.preferLargeMedia = options.prefer_large_media;
+    if (options.show_above_text !== undefined) normalized.showAboveText = options.show_above_text;
+    result.linkPreviewOptions = normalized;
+  }
   return result;
 };

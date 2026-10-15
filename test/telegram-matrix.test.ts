@@ -23,6 +23,7 @@ const createApi = (overrides: Record<string, unknown> = {}): { api: Api; calls: 
     getChatMember: async () => ({ status: "administrator", can_post_messages: true, can_delete_messages: true, can_edit_messages: true }),
     forwardMessages: async () => [{ message_id: 801 }, { message_id: 802 }],
     copyMessages: async () => [{ message_id: 701 }, { message_id: 702 }],
+    copyMessage: async () => responseMessage,
     forwardMessage: async () => responseMessage,
     sendMessage: async () => responseMessage,
     editMessageText: async () => true,
@@ -50,8 +51,10 @@ describe("Telegram gateway adapter", () => {
     expect(await gateway.getBotMembership(asChatId(-100), asUserId(9001))).toEqual({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true });
     expect(await gateway.forwardMessages({ ...source, disableNotification: true })).toEqual([asMessageId(801), asMessageId(802)]);
     expect(await gateway.copyMessages({ ...source, disableNotification: false })).toEqual([asMessageId(701), asMessageId(702)]);
+    expect(await gateway.copyMessage!({ targetChatId: asChatId(-200), sourceChatId: asChatId(-100), messageId: asMessageId(10) })).toBe(asMessageId(701));
     expect(calls.find((call) => call.method === "forwardMessages")?.args).toEqual([-200, -100, [10, 11], { disable_notification: true }]);
     expect(calls.find((call) => call.method === "copyMessages")?.args).toEqual([-200, -100, [10, 11], { disable_notification: false }]);
+    expect(calls.find((call) => call.method === "copyMessage")?.args).toEqual([-200, -100, 10, {}]);
   });
 
   test("normalizes optional fields and membership defaults", async () => {
@@ -117,6 +120,9 @@ describe("Telegram gateway adapter", () => {
       const error = await rejected(() => invalidGateway.copyMessages(source));
       expect(error).toMatchObject({ kind: "ambiguous_send_result", method: "copyMessages" });
     }
+    const { api: malformedApi } = createApi({ copyMessages: async () => [{ message_id: 20 }, null, { message_id: 22 }] });
+    const malformedError = await rejected(() => createTelegramGateway(malformedApi, asChatId(42)).copyMessages(source));
+    expect(malformedError).toMatchObject({ kind: "ambiguous_send_result", knownOutputs: [asMessageId(20), asMessageId(22)], requestMayHaveSucceeded: true });
   });
 
   test("normalizes and classifies API failures for every public method", async () => {

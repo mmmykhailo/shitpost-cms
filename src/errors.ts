@@ -8,9 +8,14 @@ export class OperationConflictError extends Error {
 }
 
 export class InvalidTelegramOutputError extends Error {
-  constructor(message: string) {
+  readonly knownOutputs: readonly number[];
+  readonly requestMayHaveSucceeded: boolean;
+
+  constructor(message: string, knownOutputs: readonly number[] = [], requestMayHaveSucceeded = true) {
     super(message);
     this.name = "InvalidTelegramOutputError";
+    this.knownOutputs = knownOutputs;
+    this.requestMayHaveSucceeded = requestMayHaveSucceeded;
   }
 }
 
@@ -36,7 +41,9 @@ const numeric = (value: unknown): number | undefined => (typeof value === "numbe
 
 export const classifyTelegramError = (error: unknown, method?: string): NormalizedTelegramError => {
   if (error instanceof InvalidTelegramOutputError) {
-    return { kind: "ambiguous_send_result", method: method ?? "recordOutput", description: error.message, cause: error };
+    const normalized: NormalizedTelegramError = { kind: "ambiguous_send_result", method: method ?? "recordOutput", description: error.message, requestMayHaveSucceeded: error.requestMayHaveSucceeded, cause: error };
+    if (error.knownOutputs.length > 0) normalized.knownOutputs = error.knownOutputs as NormalizedTelegramError["knownOutputs"] & {};
+    return normalized;
   }
   if (typeof error === "object" && error !== null && "kind" in error && "description" in error) {
     const normalized = error as NormalizedTelegramError;
@@ -50,7 +57,7 @@ export const classifyTelegramError = (error: unknown, method?: string): Normaliz
   const retryAfterSeconds = numeric(candidate.parameters?.retry_after);
   let kind: NormalizedTelegramErrorKind;
   if (code === 429 || retryAfterSeconds !== undefined || lower.includes("too many requests")) kind = "rate_limited";
-  else if (lower.includes("message to delete not found") || lower.includes("message not found") || lower.includes("message_id_invalid")) kind = "source_missing";
+  else if (["message to delete not found", "message to copy not found", "message to forward not found", "message to edit not found"].some((phrase) => lower.includes(phrase))) kind = "source_missing";
   else if (lower.includes("protected content") || lower.includes("can't be forwarded") || lower.includes("cannot be forwarded")) kind = "content_protected";
   else if (lower.includes("not enough rights") || lower.includes("forbidden") || code === 401 || code === 403) kind = "permission_denied";
   else if (lower.includes("48 hours") || lower.includes("too old") || lower.includes("message is too old") || lower.includes("can't be deleted after") || lower.includes("can't be deleted for everyone") || lower.includes("cannot be deleted for everyone")) kind = "telegram_age_limit";

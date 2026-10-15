@@ -304,10 +304,21 @@ const migrations: readonly Migration[] = [
       `ALTER TABLE queue_items ADD COLUMN nickname_revision_wanted INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE queue_items ADD COLUMN nickname_revision_applied INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE queue_items ADD COLUMN attribution_json TEXT`,
+      `UPDATE queue_items
+       SET delivery_mode = CASE
+             WHEN json_extract(origin_json, '$.kind') = 'channel'
+              AND EXISTS (SELECT 1 FROM channel_whitelist WHERE chat_id = json_extract(queue_items.origin_json, '$.chatId')) THEN 'forward'
+             ELSE 'copy' END,
+           policy_captured_at = COALESCE(policy_captured_at, unixepoch('now') * 1000)
+       WHERE delivery_mode IS NULL`,
       `ALTER TABLE queue_messages ADD COLUMN member_key TEXT`,
       `UPDATE queue_messages SET member_key = 'legacy:' || telegram_message_id WHERE member_key IS NULL`,
       `ALTER TABLE queue_messages ADD COLUMN member_role TEXT NOT NULL DEFAULT 'content' CHECK (member_role IN ('content','credit'))`,
       `ALTER TABLE queue_messages ADD COLUMN member_delivery_mode TEXT CHECK (member_delivery_mode IN ('copy','forward'))`,
+      `UPDATE queue_messages
+       SET member_delivery_mode = CASE
+         WHEN COALESCE(json_extract(snapshot_json, '$.nativeOrigin.kind'), json_extract(snapshot_json, '$.origin.kind')) = 'channel' THEN 'forward'
+         ELSE 'copy' END`,
       `ALTER TABLE queue_messages ADD COLUMN album_key TEXT`,
       `ALTER TABLE queue_messages ADD COLUMN removed_at INTEGER`,
       `ALTER TABLE queue_messages ADD COLUMN removal_reason TEXT`,

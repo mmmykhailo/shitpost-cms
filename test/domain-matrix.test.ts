@@ -92,6 +92,7 @@ describe("Telegram message normalization matrix", () => {
       edit_date: 101,
     }) as never) as StoredMessageSnapshot;
     expect(result).toMatchObject({
+      schemaVersion: 2,
       messageId: asMessageId(10),
       contentType: "photo",
       mediaGroupId: "album-1",
@@ -99,6 +100,8 @@ describe("Telegram message normalization matrix", () => {
       showCaptionAboveMedia: true,
       editDate: 101_000,
       hasReplyMarkup: true,
+      nativeOrigin: { kind: "absent" },
+      contentFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
     });
     expect(result.captionEntities?.[0]).toEqual({ type: "italic", offset: 0, length: 7, language: "en" });
     const textResult = snapshotFromMessage(message({
@@ -106,6 +109,10 @@ describe("Telegram message normalization matrix", () => {
       entities: [{ type: "text_mention", offset: 0, length: 5, user: { id: 7, first_name: "Ada", last_name: "L" }, custom_emoji_id: "emoji" }],
     }) as never);
     expect(textResult.entities?.[0]).toEqual({ type: "text_mention", offset: 0, length: 5, user: { id: asUserId(7), firstName: "Ada", lastName: "L" }, customEmojiId: "emoji" });
+    const first = snapshotFromMessage(message({ text: "hello", views: 1 }) as never);
+    const second = snapshotFromMessage(message({ text: "hello", views: 999 }) as never);
+    expect(first.contentFingerprint).toBe(second.contentFingerprint);
+    expect(snapshotFromMessage(message({ text: "changed" }) as never).contentFingerprint).not.toBe(first.contentFingerprint);
   });
 
   test("preserves each semantic forward origin and handles absent origins", () => {
@@ -270,7 +277,7 @@ describe("stored-data validation matrix", () => {
 
   test("rejects invalid stored shapes and publication contracts", () => {
     const invalidSnapshots: unknown[] = [
-      null, [], { ...validSnapshot(), schemaVersion: 2 }, { ...validSnapshot(), contentType: "not-real" }, { ...validSnapshot(), hasReplyMarkup: "no" },
+      null, [], { ...validSnapshot(), schemaVersion: 3 }, { ...validSnapshot(), contentType: "not-real" }, { ...validSnapshot(), hasReplyMarkup: "no" },
       { ...validSnapshot(), messageId: 0 }, { ...validSnapshot(), ordinal: -1 }, { ...validSnapshot(), origin: { kind: "user" } },
       { ...validSnapshot(), entities: "not-array" }, { ...validSnapshot(), showCaptionAboveMedia: "no" }, { ...validSnapshot(), entities: [{ type: "bold", offset: -1, length: 1 }] },
     ];
