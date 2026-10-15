@@ -10,6 +10,7 @@ import { createDatabase } from "../src/db/database";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
+import { createPreparationRepository } from "../src/db/preparation-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { createRenewalService } from "../src/services/renewal";
 import { createFakeClock } from "../src/clock";
@@ -79,6 +80,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const schedule = createScheduleRepository(database);
   const admin = createAdminRepository(database);
   const pending = createPendingUpdateRepository(database);
+  const preparation = createPreparationRepository(database);
   const orphan = createOrphanRepository(database);
   const calls: ApiCall[] = [];
   const sent: SentMessage[] = [];
@@ -92,6 +94,14 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   let resolvedChat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" } = { id: asChatId(-100555), type: "channel" };
 
   const gateway = {
+    copyMessage: async ({ messageId }: { messageId: number }) => {
+      sourceTransfers.push([Number(messageId)]);
+      return asMessageId(nextSourceMessageId++);
+    },
+    forwardMessage: async ({ messageId }: { messageId: number }) => {
+      sourceTransfers.push([Number(messageId)]);
+      return asMessageId(nextSourceMessageId++);
+    },
     copyMessages: async ({ messageIds }: { messageIds: readonly number[] }) => {
       sourceTransfers.push(messageIds.map(Number));
       return messageIds.map(() => asMessageId(nextSourceMessageId++));
@@ -151,6 +161,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     schedule,
     admin,
     pending,
+    preparation,
     orphan,
     gateway,
     publisher: {} as AdminDeps["publisher"],
@@ -193,6 +204,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     queue,
     policy,
     pending,
+    preparation,
     orphan,
     gateway,
     config,
@@ -391,16 +403,53 @@ describe("admin schedule handlers", () => {
     }
   });
 
-  test("renders an explicit successful manual publication result", async () => {
-    const harness = createHarness(async () => ({ kind: "published", itemId: 1, destinationMessageIds: [asMessageId(701)], operationId: "published-1" }));
+  test("manual publish previews and binds the earliest ready candidate, skipping an issue item", async () => {
+    let expected: Parameters<AdminDeps["scheduler"]["manualPublish"]>[0];
+    const harness = createHarness(async (candidate) => {
+      expected = candidate;
+      return { kind: "published", itemId: candidate?.itemId ?? 1, destinationMessageIds: [asMessageId(701)], operationId: "published-1" };
+    });
     try {
-      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(51) }), NOW);
-      const source = makeMessage(901, "publish menu", BOT_INFO);
-      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW, 1);
+      const issue = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(50) }), NOW).item;
+      harness.queue.transition(issue.id, "queued", "needs_edit", NOW, "invalid", "edit needed");
+      const ready = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(51) }), NOW + 1).item;
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = ?").run(ready.id);
 
-      await harness.run(callbackUpdate(902, "callback-publish", `v1:${token}`, source));
+      await harness.run(commandUpdate(901, 901, "manage"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(902, "publish-next", harness.callbackData(menu, "Publish next now"), menu.message));
+      const confirmation = harness.lastSent();
+      expect(confirmation.message.text).toContain("next available item #2");
+      await harness.run(callbackUpdate(903, "callback-publish", harness.callbackData(confirmation, "Confirm publish next"), confirmation.message));
 
-      expect(harness.lastSent().message.text).toBe("Queue item #1 was published and source cleanup completed.");
+      expect(harness.lastSent().message.text).toBe("Queue item #2 was published and source cleanup completed.");
+      expect(expected).toEqual({ itemId: 2, contentVersion: ready.contentVersion, sourceGeneration: ready.sourceGeneration });
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("rejects a stale manual candidate instead of switching to the next item", async () => {
+    let publishCalls = 0;
+    const harness = createHarness(async () => {
+      publishCalls += 1;
+      return { kind: "empty" };
+    });
+    try {
+      const first = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(53) }), NOW).item;
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = ?").run(first.id);
+      const second = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(54) }), NOW + 1).item;
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = ?").run(second.id);
+
+      await harness.run(commandUpdate(906, 906, "manage"));
+      const dashboard = harness.lastSent();
+      await harness.run(callbackUpdate(907, "publish-next", harness.callbackData(dashboard, "Publish next now"), dashboard.message));
+      const confirmation = harness.lastSent();
+      harness.queue.transition(first.id, "queued", "needs_edit", NOW + 2, "invalid", "requires edit");
+
+      await harness.run(callbackUpdate(908, "stale-publish", harness.callbackData(confirmation, "Confirm publish next"), confirmation.message));
+      expect(harness.lastSent().message.text).toContain("ready queue changed; reopen the dashboard");
+      expect(publishCalls).toBe(0);
     } finally {
       harness.close();
     }
@@ -431,10 +480,13 @@ describe("admin schedule handlers", () => {
     });
     try {
       harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(52) }), NOW);
-      const source = makeMessage(903, "publish menu", BOT_INFO);
-      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW, 1);
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = 1").run();
 
-      await harness.run(callbackUpdate(904, "callback-uncertain", `v1:${token}`, source));
+      await harness.run(commandUpdate(903, 903, "manage"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(904, "publish-next", harness.callbackData(menu, "Publish next now"), menu.message));
+      const confirmation = harness.lastSent();
+      await harness.run(callbackUpdate(905, "callback-uncertain", harness.callbackData(confirmation, "Confirm publish next"), confirmation.message));
 
       const response = harness.lastSent();
       expect(response.message.text).toContain("Uncertain publication #1");
@@ -510,7 +562,7 @@ describe("admin schedule handlers", () => {
 
       await harness.run(commandUpdate(200, 200, "recover"));
       const recoveryQuestion = harness.lastSent();
-      expect(recoveryQuestion.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: "queue link or message ID" });
+      expect(recoveryQuestion.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: "message IDs [--credit-last]" });
       expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: "recover", state: {}, expectedReplyToMessageId: recoveryQuestion.message.message_id });
     } finally {
       harness.close();
@@ -562,7 +614,7 @@ describe("admin command, queue, and publication handlers", () => {
       await harness.run(commandUpdate(299, 299, "queue"));
 
       const listing = harness.lastSent();
-      expect(listing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+      expect(listing.message.text).toContain(`#${item.id} · text · queued · unprepared · age 2.87 days`);
       expect(listing.message.text).not.toContain(`${queueAge} ms`);
       const entities = listing.payload.entities as Array<{ type: string; offset: number; length: number; url?: string }>;
       const link = entities?.find((entity) => entity.type === "text_link");
@@ -606,7 +658,7 @@ describe("admin command, queue, and publication handlers", () => {
       for (let renewalNumber = 0; renewalNumber < 3; renewalNumber += 1) {
         await harness.run(commandUpdate(360 + renewalNumber, 360 + renewalNumber, "queue"));
         const listing = harness.lastSent();
-        expect(listing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+        expect(listing.message.text).toContain(`#${item.id} · text · queued · unprepared · age 2.87 days`);
         const link = (listing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
         expect(link).toBeDefined();
         expect(listing.message.text.slice(link!.offset, link!.offset + link!.length)).toBe(`#${item.id}`);
@@ -617,7 +669,7 @@ describe("admin command, queue, and publication handlers", () => {
       }
       await harness.run(commandUpdate(363, 363, "queue"));
       const finalListing = harness.lastSent();
-      expect(finalListing.message.text).toContain(`#${item.id} · text · queued · age 2.87 days`);
+      expect(finalListing.message.text).toContain(`#${item.id} · text · queued · unprepared · age 2.87 days`);
       const finalLink = (finalListing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
       expect(finalLink).toBeDefined();
       expect(finalListing.message.text.slice(finalLink!.offset, finalLink!.offset + finalLink!.length)).toBe(`#${item.id}`);
@@ -742,13 +794,13 @@ describe("admin command, queue, and publication handlers", () => {
     }
   });
 
-  test("keeps queue link offsets correct when the uncertainty notice precedes rows", async () => {
+  test("keeps queue links correct in a list containing an uncertain item", async () => {
     const harness = createHarness();
     try {
       prepareUncertainPublication(harness, 1601);
       await harness.run(commandUpdate(338, 338, "queue"));
       const listing = harness.lastSent();
-      expect(listing.message.text).toContain("destination may already contain");
+      expect(listing.message.text).toContain("uncertain_publish");
       const link = (listing.payload.entities as Array<{ type: string; offset: number; length: number; url: string }>).find((entity) => entity.type === "text_link");
       expect(link).toBeDefined();
       expect(listing.message.text.slice(link!.offset, link!.offset + link!.length)).toBe("#1");
@@ -813,12 +865,13 @@ describe("admin command, queue, and publication handlers", () => {
     [{ kind: "blocked", itemId: 1, status: "blocked", reason: "manual" }, "remains blocked"],
     [{ kind: "failed", itemId: 1, status: "queued", error: "failed" }, "failed"],
     [{ kind: "deleted_external", itemId: 1 }, "already missing"],
-    [{ kind: "empty" }, "queue is empty"],
+    [{ kind: "empty" }, "no prepared queue item is currently ready"],
   ] as const)("renders publication outcome %s", async (outcome, expectedText) => {
     const harness = createHarness(async () => outcome);
     try {
-      harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(980) }), NOW);
-      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, sourceGeneration: 0 }, NOW);
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(980) }), NOW).item;
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = ?").run(item.id);
+      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: 1, contentVersion: item.contentVersion, sourceGeneration: 0 }, NOW, item.contentVersion);
       await harness.run(callbackUpdate(360, "outcome", `v1:${token}`, makeMessage(360, "menu", BOT_INFO)));
       expect(harness.lastSent().message.text.toLowerCase()).toContain(expectedText);
     } finally {
@@ -828,6 +881,67 @@ describe("admin command, queue, and publication handlers", () => {
 });
 
 describe("admin uncertainty resolution handlers", () => {
+  test("shows preparation operation evidence and requires explicit no-output confirmation before retry", async () => {
+    const harness = createHarness();
+    try {
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1750) }), NOW).item;
+      const claim = harness.preparation.claimNextPreparation(NOW, "admin-test");
+      expect(claim?.itemId).toBe(item.id);
+      harness.preparation.markUncertain(claim!.operationId, "ambiguous_send_result", "transfer response was lost", NOW);
+
+      await harness.run(commandUpdate(440, 440, "queue"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(441, "prep-resolve", harness.callbackData(menu, "Resolve preparation #1"), menu.message));
+      let response = harness.lastSent();
+      expect(response.message.text).toContain("Uncertain preparation #1");
+      expect(response.message.text).toContain(claim!.operationId);
+      expect(response.message.text).toContain("Known output count: 0");
+
+      await harness.run(callbackUpdate(442, "prep-retry", harness.callbackData(response, "Confirm no output and retry"), response.message));
+      expect(harness.queue.findItemById(item.id)?.status).toBe("queued");
+      expect(harness.database.raw.query("SELECT preparation_state FROM queue_items WHERE id = ?").get(item.id)).toEqual({ preparation_state: "unprepared" });
+      expect(harness.preparation.operationEvidence(item.id).find((entry) => entry.operationId === claim!.operationId)?.state).toBe("failed");
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("deletes tracked preparation outputs before retry and keeps uncertainty when cleanup fails", async () => {
+    const harness = createHarness();
+    try {
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1751) }), NOW).item;
+      const claim = harness.preparation.claimNextPreparation(NOW, "admin-test");
+      expect(claim?.itemId).toBe(item.id);
+      harness.preparation.recordOutput(claim!.operationId, {
+        chatId: Number(QUEUE_CHAT_ID), messageId: 1752, ordinal: 0, outputKey: "member:0", stepKey: "member:0", sourceMemberKey: `legacy:${item.firstMessageId}`, role: "content",
+      }, NOW);
+      harness.preparation.markUncertain(claim!.operationId, "ambiguous_send_result", "second step may have failed", NOW);
+
+      await harness.run(commandUpdate(443, 443, "queue"));
+      let menu = harness.lastSent();
+      await harness.run(callbackUpdate(444, "prep-resolve", harness.callbackData(menu, "Resolve preparation #1"), menu.message));
+      const response = harness.lastSent();
+      expect(response.message.text).toContain(`${Number(QUEUE_CHAT_ID)}/1752`);
+      harness.setDeleteFailure({ kind: "permission_denied", description: "cannot clean output" });
+      await harness.run(callbackUpdate(445, "prep-clean-fail", harness.callbackData(response, "Delete tracked outputs and retry"), response.message));
+      expect(harness.lastSent().message.text).toContain("Tracked output cleanup failed");
+      expect(harness.queue.findItemById(item.id)?.preparationState).toBe("uncertain");
+
+      harness.setDeleteFailure(undefined);
+      menu = harness.lastSent();
+      await harness.run(commandUpdate(446, 446, "queue"));
+      menu = harness.lastSent();
+      await harness.run(callbackUpdate(447, "prep-resolve-again", harness.callbackData(menu, "Resolve preparation #1"), menu.message));
+      const retryResponse = harness.lastSent();
+      await harness.run(callbackUpdate(448, "prep-clean-retry", harness.callbackData(retryResponse, "Delete tracked outputs and retry"), retryResponse.message));
+      expect(harness.deleted.some((entry) => entry.chatId === Number(QUEUE_CHAT_ID) && entry.messageIds.includes(1752))).toBe(true);
+      expect(harness.database.raw.query("SELECT preparation_state FROM queue_items WHERE id = ?").get(item.id)).toEqual({ preparation_state: "unprepared" });
+      expect(harness.queue.findItemById(item.id)?.status).toBe("queued");
+    } finally {
+      harness.close();
+    }
+  });
+
   test("shows incomplete renewal evidence and rejects a conflicting exact replacement set", async () => {
     const harness = createHarness();
     try {

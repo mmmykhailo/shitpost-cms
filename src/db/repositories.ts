@@ -1026,7 +1026,10 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const retryItem = (itemId: number, now: number): void => {
-    database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND maintenance_status = 'idle' AND status IN ('blocked','needs_edit','needs_review','delete_blocked')").run(itemId);
+    database.raw.query(`UPDATE queue_items SET status = 'queued', retry_not_before = NULL, last_error_code = NULL, last_error = NULL, claimed_operation_id = NULL, claimed_at = NULL,
+      preparation_state = CASE WHEN representation_kind = 'raw' AND preparation_state = 'failed' THEN 'unprepared' ELSE preparation_state END
+      WHERE id = ? AND maintenance_status = 'idle' AND status IN ('blocked','needs_edit','needs_review','delete_blocked')`).run(itemId);
+    void now;
   };
 
   const operationEvidence = (itemId: number): {

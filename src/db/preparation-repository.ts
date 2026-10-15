@@ -293,13 +293,21 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     return rows.map((row) => ({ operationId: row.id, kind: row.kind, state: row.state, phase: row.phase, ...(row.contract_json === "{}" ? {} : { contract: JSON.parse(row.contract_json) as unknown }), progress: JSON.parse(row.progress_json) as unknown, ...(row.result_json === null ? {} : { result: JSON.parse(row.result_json) as unknown }), outputs: database.raw.query("SELECT chat_id, telegram_message_id, ordinal, output_key, step_key, source_member_key, role, snapshot_json FROM queue_preparation_outputs WHERE operation_id = ? ORDER BY ordinal").all(row.id) as unknown[] }));
   };
 
-  const releaseForResolution = (operationId: string, retry: boolean, now: number): void => database.transaction(() => {
+  const releaseForResolution = (operationId: string, action: "retry" | "retry_after_cleanup" | "discard" | "discard_after_cleanup", now: number): void => database.transaction(() => {
     const row = operation(operationId);
     if (!row || row.state !== "uncertain") throw conflict("Preparation operation is not uncertain");
-    if (retry && database.raw.query("SELECT 1 FROM queue_preparation_outputs WHERE operation_id = ? LIMIT 1").get(operationId)) throw conflict("Known outputs must be cleaned or adopted before retry");
+    const hasOutputs = database.raw.query("SELECT 1 FROM queue_preparation_outputs WHERE operation_id = ? LIMIT 1").get(operationId) !== null;
+    const retry = action === "retry" || action === "retry_after_cleanup";
+    const cleanupConfirmed = action === "retry_after_cleanup" || action === "discard_after_cleanup";
+    if (hasOutputs && !cleanupConfirmed) throw conflict("Known outputs must be deleted before retrying or discarding this preparation");
+    if (!hasOutputs && cleanupConfirmed) throw conflict("No tracked preparation outputs exist for cleanup confirmation");
     const next = retry ? (row.kind === "refresh" ? "refresh_pending" : "unprepared") : "failed";
-    database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL, status = 'queued', retry_not_before = NULL WHERE id = ? AND preparation_operation_id IS NULL AND status = 'needs_review'").run(next, row.item_id);
-    database.raw.query("UPDATE queue_preparation_operations SET state = ?, phase = ?, updated_at = ? WHERE id = ? AND state = 'uncertain'").run(retry ? "failed" : "done", retry ? "failed" : "completed", now, operationId);
+    const status = retry ? "queued" : "needs_review";
+    const changed = database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL, status = ?, retry_not_before = NULL WHERE id = ? AND preparation_operation_id IS NULL AND status = 'needs_review' AND preparation_state = 'uncertain'").run(next, status, row.item_id);
+    if (Number(changed.changes) !== 1) throw conflict("Preparation item changed before uncertainty resolution");
+    database.raw.query("UPDATE queue_preparation_operations SET state = ?, phase = ?, error_code = ?, updated_at = ? WHERE id = ? AND state = 'uncertain'").run(retry ? "failed" : "done", retry ? "failed" : "completed", retry ? "admin_retry" : "admin_discard", now, operationId);
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('preparation_uncertainty_resolved', 'admin', ?, ?, ?, ?)")
+      .run(row.item_id, operationId, JSON.stringify({ action, trackedOutputs: hasOutputs }), now);
   });
 
   return { claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };

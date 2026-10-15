@@ -10,6 +10,7 @@ import type { PolicyRepository, QueueRepository, ScheduleRepository } from "../d
 import type { AdminRepository } from "../db/admin-repository";
 import type { OrphanRepository } from "../db/orphan-repository";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
+import type { PreparationRepository } from "../db/preparation-repository";
 import type { AppConfig } from "../config";
 import type { Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
@@ -27,6 +28,7 @@ type AdminDeps = {
   schedule: ScheduleRepository;
   admin: AdminRepository;
   pending: PendingUpdateRepository;
+  preparation: PreparationRepository;
   orphan: OrphanRepository;
   gateway: TelegramGateway;
   publisher: PublicationService;
@@ -66,18 +68,22 @@ const keyboard = (rows: Array<Awaited<ReturnType<typeof button>>[]>): InlineKeyb
 const dashboardText = (deps: AdminDeps): string => {
   const now = deps.now();
   const counts = deps.queue.statusCounts();
+  const activeItems = deps.queue.listActive(10_000);
   const head = deps.queue.getHead();
+  const ready = deps.queue.peekNextReady(now);
   const slots = deps.schedule.slots();
   const next = deps.scheduler.nextAt();
   const nextText = next === undefined ? "not configured" : new Date(next).toISOString();
   const status = deps.schedule.enabled() ? "running" : "paused";
   const headText = head ? `#${head.id} · ${head.status} · logical age ${formatAge(Math.max(0, now - head.enqueuedAt))}` : "empty";
+  const readyText = ready ? `#${ready.id} · logical age ${formatAge(Math.max(0, now - ready.enqueuedAt))}` : "none currently ready";
   return [
     "Telegram queue manager",
     `Schedule: ${status} · ${slots.map(formatUtcSlot).join(", ") || "no UTC slots"}`,
     `Next run: ${nextText}`,
-    `Queue: ${counts.queued ?? 0} queued · ${counts.blocked ?? 0} blocked · ${(counts.uncertain_publish ?? 0) + deps.queue.listActive(10_000).filter((item) => item.maintenanceStatus === "uncertain_renewal").length} uncertain`,
-    `Head: ${headText}`,
+    `Queue: ${counts.queued ?? 0} queued · ${counts.blocked ?? 0} blocked · ${(counts.uncertain_publish ?? 0) + activeItems.filter((item) => item.maintenanceStatus === "uncertain_renewal" || item.preparationState === "uncertain").length} uncertain`,
+    `Next to publish: ${readyText}`,
+    `Earliest active item: ${headText}`,
     `Renewal warnings: ${deps.queue.listRenewalAges(deps.now()).filter((entry) => entry.ageMs >= 42 * 60 * 60 * 1000).length}`,
   ].join("\n");
 };
@@ -160,7 +166,28 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (evidence.expectedOutputCount === evidence.knownDestinationIds.length && evidence.expectedOutputCount === evidence.sourceIds.length && evidence.expectedOutputCount > 0) rows.push([await button(deps, "Delete known outputs and retry", "uncertain_publish_delete_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
     rows.push([await button(deps, "Delete queue item", "queue_delete", { itemId }, item.contentVersion)], [await button(deps, "Back", "queue")]);
     return {
-      text: [`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "The destination may already contain this post. The item remains the active FIFO head until an explicit resolution prevents duplication.", "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"),
+      text: [`Uncertain publication #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known destination IDs: ${evidence.knownDestinationIds.join(", ") || "none"}`, `Expected destination count: ${evidence.expectedOutputCount ?? "unknown"}`, "The destination may already contain this post. It will not be retried until you resolve it; other ready posts can use later slots.", "Choose an explicit resolution; retrying can duplicate a Telegram send."].join("\n"),
+      replyMarkup: keyboard(rows),
+    };
+  };
+
+  const uncertainPreparationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: InlineKeyboardMarkup } | undefined> => {
+    const item = deps.queue.findItemById(itemId);
+    const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.state === "uncertain");
+    if (!item || item.status !== "needs_review" || item.preparationState !== "uncertain" || !evidence) return undefined;
+    const outputs = evidence.outputs as Array<{ chat_id: number; telegram_message_id: number; ordinal: number; step_key: string; source_member_key: string | null; role: string }>;
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
+    if (outputs.length === 0) {
+      rows.push([await button(deps, "Confirm no output and retry", "preparation_uncertain_retry", { itemId, operationId: evidence.operationId, phase: evidence.phase }, item.contentVersion)]);
+      rows.push([await button(deps, "Keep in review", "preparation_uncertain_discard", { itemId, operationId: evidence.operationId, phase: evidence.phase }, item.contentVersion)]);
+    } else {
+      rows.push([await button(deps, "Delete tracked outputs and retry", "preparation_uncertain_cleanup_retry", { itemId, operationId: evidence.operationId, phase: evidence.phase }, item.contentVersion)]);
+      rows.push([await button(deps, "Delete tracked outputs and keep in review", "preparation_uncertain_cleanup_discard", { itemId, operationId: evidence.operationId, phase: evidence.phase }, item.contentVersion)]);
+    }
+    rows.push([await button(deps, "Back", "queue")]);
+    const outputLines = outputs.map((output) => `Output ${output.chat_id}/${output.telegram_message_id} · ${output.role} · ${output.step_key}${output.source_member_key ? ` · member ${output.source_member_key}` : ""}`);
+    return {
+      text: [`Uncertain preparation #${itemId}`, `Operation: ${evidence.operationId}`, `Phase: ${evidence.phase}`, `Known output count: ${outputs.length}`, ...outputLines, "The original source remains in the queue. Retrying is allowed only after you confirm that no result exists or delete the tracked outputs.", "Any output Telegram created but did not return cannot be reconciled automatically; choose a resolution only after checking the queue channel."].join("\n"),
       replyMarkup: keyboard(rows),
     };
   };
@@ -171,13 +198,15 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const page = deps.queue.listActive(pageSize + 1, Math.max(0, offset));
     const items = page.slice(0, pageSize);
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
-    const lines = [`Queue (FIFO) · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`];
-    if (deps.queue.getHead()?.status === "uncertain_publish") lines.push("The destination may already contain this post. This item stays in the active FIFO queue until an explicit resolution prevents duplication.");
+    const ready = deps.queue.peekNextReady(now);
+    const lines = [`Queue · logical order · items ${items.length === 0 ? "none" : `${offset + 1}–${offset + items.length}`}`, `Next to publish: ${ready ? `#${ready.id}` : "none currently ready"}`];
     let text = lines.join("\n");
     const entities: Array<{ type: "text_link"; offset: number; length: number; url: string }> = [];
     for (const item of items) {
       const label = `#${item.id}`;
-      const row = `${label} · ${item.contentType} · ${item.status}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${formatAge(Math.max(0, now - item.enqueuedAt))}`;
+      const preparationState = item.preparationState ?? "unprepared";
+      const preparation = preparationState === "ready" ? "ready to publish" : preparationState.replaceAll("_", " ");
+      const row = `${label} · ${item.contentType} · ${item.status} · ${preparation}${item.maintenanceStatus === "idle" ? "" : ` · maintenance ${item.maintenanceStatus}`} · age ${formatAge(Math.max(0, now - item.enqueuedAt))}`;
       const rowOffset = text.length + 1;
       text += `\n${row}`;
       const sourceMessageId = deps.queue.currentSourceIds(item.id)[0];
@@ -187,6 +216,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       const actions: Array<Awaited<ReturnType<typeof button>>> = [await button(deps, `Delete #${item.id}`, "queue_delete", { itemId: item.id }, item.contentVersion)];
       if (item.status === "uncertain_publish") actions.push(await button(deps, `Resolve #${item.id}`, "queue_uncertain", { itemId: item.id }, item.contentVersion));
+      else if (item.preparationState === "uncertain") actions.push(await button(deps, `Resolve preparation #${item.id}`, "preparation_uncertain", { itemId: item.id }, item.contentVersion));
       else if (item.maintenanceStatus === "uncertain_renewal") actions.push(await button(deps, `Resolve renewal #${item.id}`, "renewal_uncertain", { itemId: item.id }, item.contentVersion));
       else if (["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status)) actions.push(await button(deps, `Retry #${item.id}`, "queue_retry", { itemId: item.id }, item.contentVersion));
       actions.push(await button(deps, `Move #${item.id}`, "queue_move_end", { itemId: item.id }, item.contentVersion));
@@ -216,7 +246,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           await ctx.reply(response.text, { reply_markup: response.replyMarkup });
           return;
         }
-        await ctx.reply(`Publication for queue item #${outcome.itemId} may already exist. The FIFO head remains blocked; automatic retry is unsafe. Reopen Queue to resolve it.`, { reply_markup: keyboard([[await button(deps, `Resolve #${outcome.itemId}`, "queue_uncertain", { itemId: outcome.itemId })], [queue]]) });
+        await ctx.reply(`Publication for queue item #${outcome.itemId} may already exist. Automatic retry is unsafe; other ready posts remain eligible for later slots. Reopen Queue to resolve it.`, { reply_markup: keyboard([[await button(deps, `Resolve #${outcome.itemId}`, "queue_uncertain", { itemId: outcome.itemId })], [queue]]) });
         return;
       }
       case "retry_scheduled":
@@ -232,7 +262,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         await ctx.reply(`Queue source for item #${outcome.itemId} was already missing; the item was removed without publishing.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "empty":
-        await ctx.reply("The queue is empty.", { reply_markup: keyboard([[dashboard]]) });
+        await ctx.reply("No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
     }
   };
@@ -512,18 +542,64 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         }
       }
       case "safety": return sendSafety(ctx, typeof payload.offset === "number" ? payload.offset : 0);
+      case "preparation_uncertain": {
+        if (itemId === undefined) return ctx.reply("Invalid preparation resolution.");
+        const response = await uncertainPreparationResponse(itemId);
+        if (!response) return ctx.reply("This preparation is no longer awaiting resolution.");
+        return ctx.reply(response.text, { reply_markup: response.replyMarkup });
+      }
+      case "preparation_uncertain_retry":
+      case "preparation_uncertain_discard": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return ctx.reply("Invalid preparation resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.operationId === payload.operationId);
+        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length > 0) return ctx.reply("This preparation resolution is stale or output evidence is incomplete.");
+        try {
+          deps.preparation.releaseForResolution(evidence.operationId, resolved.action === "preparation_uncertain_retry" ? "retry" : "discard", deps.now());
+          deps.admin.audit(resolved.action, String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { phase: evidence.phase, trackedOutputs: evidence.outputs.length });
+          await ctx.reply(resolved.action === "preparation_uncertain_retry" ? `Preparation for queue item #${itemId} was requeued. It remains unscheduled until preparation finishes.` : `Preparation for queue item #${itemId} was discarded and left in review; the original source remains available.`);
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Could not apply the preparation resolution.");
+        }
+      }
+      case "preparation_uncertain_cleanup_retry":
+      case "preparation_uncertain_cleanup_discard": {
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return ctx.reply("Invalid preparation resolution.");
+        const item = deps.queue.findItemById(itemId);
+        const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.operationId === payload.operationId);
+        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length === 0) return ctx.reply("This preparation resolution is stale or output evidence is incomplete.");
+        try {
+          const outputs = evidence.outputs as Array<{ chat_id: number; telegram_message_id: number }>;
+          for (const output of outputs) {
+            if (!Number.isSafeInteger(output.chat_id) || !Number.isSafeInteger(output.telegram_message_id) || output.telegram_message_id <= 0) throw new Error("Tracked output evidence is malformed; no outputs were cleaned automatically.");
+            try { await deps.gateway.deleteMessages(asChatId(output.chat_id), [asMessageId(output.telegram_message_id)]); }
+            catch (error) {
+              if (classifyTelegramError(error, "deleteMessages").kind !== "source_missing") throw error;
+            }
+          }
+          const action = resolved.action === "preparation_uncertain_cleanup_retry" ? "retry_after_cleanup" : "discard_after_cleanup";
+          deps.preparation.releaseForResolution(evidence.operationId, action, deps.now());
+          deps.admin.audit(resolved.action, String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { phase: evidence.phase, trackedOutputs: outputs.length });
+          await ctx.reply(resolved.action === "preparation_uncertain_cleanup_retry" ? `Tracked outputs were deleted and preparation for queue item #${itemId} was requeued.` : `Tracked outputs were deleted and preparation for queue item #${itemId} was discarded; the original source remains in review.`);
+          return sendQueue(ctx);
+        } catch (error) {
+          return ctx.reply(error instanceof Error ? error.message : "Tracked output cleanup failed; the item remains uncertain.");
+        }
+      }
       case "publish": {
-        const head = deps.queue.getHead();
-        if (!head) return ctx.reply("The queue is empty.");
-        if (head.status !== "queued" || head.maintenanceStatus !== "idle") return ctx.reply(`The head is ${head.status}${head.maintenanceStatus === "idle" ? "" : ` (${head.maintenanceStatus})`} and cannot be published automatically.`);
-        const confirm = await button(deps, "Confirm publish", "publish_execute", { itemId: head.id, sourceGeneration: head.sourceGeneration }, head.contentVersion);
-        return ctx.reply(`Publish queue head #${head.id} now? This captures the current policy and deletes the source only after complete destination output.`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "dashboard")]]) });
+        const candidate = deps.queue.peekNextReady(deps.now());
+        if (!candidate) return ctx.reply("No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[await button(deps, "Queue", "queue")], [await button(deps, "Cancel", "dashboard")]]) });
+        const confirm = await button(deps, "Confirm publish next", "publish_execute", { itemId: candidate.id, contentVersion: candidate.contentVersion, sourceGeneration: candidate.sourceGeneration }, candidate.contentVersion);
+        return ctx.reply(`Publish next available item #${candidate.id} now? If an item fails definitively before producing output, this run may skip it and try a later ready item.`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "dashboard")]]) });
       }
       case "publish_execute": {
         const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
-        if (!item || deps.queue.getHead()?.id !== item.id || item.status !== "queued" || item.maintenanceStatus !== "idle" || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The queue head changed; reopen the dashboard.");
-        const outcome = await deps.scheduler.manualPublish();
-        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
+        if (!item || typeof payload.contentVersion !== "number" || item.contentVersion !== payload.contentVersion || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The ready candidate changed; reopen the dashboard.");
+        const candidate = deps.queue.peekNextReady(deps.now());
+        if (!candidate || candidate.id !== item.id || candidate.contentVersion !== item.contentVersion || candidate.sourceGeneration !== item.sourceGeneration) return ctx.reply("The ready queue changed; reopen the dashboard.");
+        const outcome = await deps.scheduler.manualPublish({ itemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
+        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), "itemId" in outcome ? outcome.itemId : item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, requestedItemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
         return sendPublicationOutcome(ctx, outcome);
       }
       case "slot_add": return beginPrompt(ctx, { kind: "slot_add", state: {}, text: "Reply with the daily UTC slot as HH:MM.", placeholder: "HH:MM UTC" });

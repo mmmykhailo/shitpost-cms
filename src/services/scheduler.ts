@@ -5,7 +5,8 @@ import type { Clock } from "../types";
 import type { PublicationOutcome } from "./publisher";
 import { abortableSleep } from "./task-supervisor";
 
-type Publisher = { publishNext(type?: "publish" | "manual_publish"): Promise<PublicationOutcome> };
+type ReadyCandidate = { itemId: number; contentVersion: number; sourceGeneration: number };
+type Publisher = { publishNext(type?: "publish" | "manual_publish", expected?: ReadyCandidate): Promise<PublicationOutcome> };
 
 export type SchedulerService = ReturnType<typeof createSchedulerService>;
 
@@ -94,7 +95,7 @@ export const createSchedulerService = (input: {
 
   const stop = (): void => { loopRunning = false; };
 
-  const manualPublish = (): Promise<PublicationOutcome> => input.publisher.publishNext("manual_publish");
+  const manualPublish = (expected?: ReadyCandidate): Promise<PublicationOutcome> => input.publisher.publishNext("manual_publish", expected);
 
   return { scanOnce, nextAt, run, stop, manualPublish };
 };

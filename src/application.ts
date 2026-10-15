@@ -278,6 +278,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     schedule,
     admin,
     pending,
+    preparation: preparationRepository,
     orphan: orphanRepository,
     gateway,
     publisher,
