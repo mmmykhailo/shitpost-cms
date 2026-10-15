@@ -1,4 +1,4 @@
-import type { ContentType, MessageEntity, PublicationContract, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { AttributionDescriptor, ContentType, DeliveryMode, ExecutionProgress, MemberRole, MessageEntity, PreparationContractV1, PreparedMember, PreparedPublicationContractV2, PublicationContract, SemanticOrigin, StoredMessageSnapshot, TransferStep } from "../types";
 import { asChatId, asMessageId, asUserId, type MessageId } from "../types";
 
 export class StoredDataValidationError extends Error {
@@ -225,4 +225,130 @@ export const validatePublicationContract = (value: unknown): PublicationContract
   if (result.capturedContentVersion < 1 || result.capturedSourceGeneration < 0 || result.expectedTransferredMessageCount !== sourceIds.length || result.expectedOutputMessageCount < sourceIds.length || result.expectedOutputMessageCount !== sourceIds.length + (result.requiresSeparateByline ? 1 : 0) || result.requiresInlineEdit && result.requiresSeparateByline) throw new StoredDataValidationError("contract output counts or attribution flags are inconsistent");
   if ((result.policy.kind === "copy_with_inline_byline" || result.policy.kind === "copy_with_separate_byline") && result.bylineText === undefined) throw new StoredDataValidationError("contract.bylineText is required for attributed copies");
   return result;
+};
+
+const validateDeliveryMode = (value: unknown, field: string): DeliveryMode => {
+  if (value !== "copy" && value !== "forward") throw new StoredDataValidationError(`${field} must be copy or forward`);
+  return value;
+};
+
+export const validatePreparedMember = (value: unknown, field = "preparedMember"): PreparedMember => {
+  const candidate = record(value);
+  const memberKey = optionalString(candidate.memberKey, `${field}.memberKey`);
+  if (!memberKey) throw new StoredDataValidationError(`${field}.memberKey is required`);
+  const messageId = integer(candidate.messageId, `${field}.messageId`);
+  if (messageId <= 0) throw new StoredDataValidationError(`${field}.messageId must be positive`);
+  if (candidate.role !== "content" && candidate.role !== "credit") throw new StoredDataValidationError(`${field}.role is invalid`);
+  const snapshot = validateStoredMessageSnapshot(candidate.snapshot);
+  if (snapshot.messageId !== messageId) throw new StoredDataValidationError(`${field}.snapshot.messageId does not match its member`);
+  const member: PreparedMember = { memberKey, messageId: asMessageId(messageId), role: candidate.role as MemberRole, deliveryMode: validateDeliveryMode(candidate.deliveryMode, `${field}.deliveryMode`), snapshot };
+  const albumKey = optionalString(candidate.albumKey, `${field}.albumKey`);
+  if (albumKey !== undefined) member.albumKey = albumKey;
+  return member;
+};
+
+const validateTransferStep = (value: unknown, field: string): TransferStep => {
+  const candidate = record(value);
+  const stepKey = optionalString(candidate.stepKey, `${field}.stepKey`);
+  if (!stepKey) throw new StoredDataValidationError(`${field}.stepKey is required`);
+  const mode = validateDeliveryMode(candidate.mode, `${field}.mode`);
+  if (typeof candidate.grouped !== "boolean") throw new StoredDataValidationError(`${field}.grouped must be boolean`);
+  if (!Array.isArray(candidate.members) || candidate.members.length === 0) throw new StoredDataValidationError(`${field}.members must not be empty`);
+  const members = candidate.members.map((member, index) => validatePreparedMember(member, `${field}.members[${index}]`));
+  if (members.some((member) => member.deliveryMode !== mode)) throw new StoredDataValidationError(`${field}.members use inconsistent delivery modes`);
+  if (candidate.grouped && (members.length < 2 || !members[0]?.albumKey || members.some((member) => member.albumKey !== members[0]!.albumKey))) throw new StoredDataValidationError(`${field} is not one complete album group`);
+  if (!candidate.grouped && members.some((member) => member.albumKey !== undefined)) throw new StoredDataValidationError(`${field} must preserve album grouping`);
+  return { stepKey, mode, grouped: candidate.grouped, members };
+};
+
+export const validateAttributionDescriptor = (value: unknown): AttributionDescriptor => {
+  const candidate = record(value);
+  if (candidate.ownership === "none") return { ownership: "none" };
+  if (candidate.ownership === "admin") {
+    const result: AttributionDescriptor = { ownership: "admin" };
+    const previousMemberKey = optionalString(candidate.previousMemberKey, "attribution.previousMemberKey");
+    if (previousMemberKey !== undefined) return { ownership: "admin", previousMemberKey };
+    return result;
+  }
+  if (candidate.ownership === "bot") {
+    if (candidate.placement !== "inline_text" && candidate.placement !== "inline_caption" && candidate.placement !== "separate") throw new StoredDataValidationError("attribution.placement is invalid");
+    const memberKey = optionalString(candidate.memberKey, "attribution.memberKey");
+    const generatedText = optionalString(candidate.generatedText, "attribution.generatedText");
+    if (!memberKey || generatedText === undefined) throw new StoredDataValidationError("bot attribution member key and text are required");
+    const start = integer(candidate.generatedStartUtf16, "attribution.generatedStartUtf16");
+    const length = integer(candidate.generatedLengthUtf16, "attribution.generatedLengthUtf16");
+    const revision = integer(candidate.appliedNicknameRevision, "attribution.appliedNicknameRevision");
+    if (start < 0 || length < 0 || length !== generatedText.length || revision < 0) throw new StoredDataValidationError("bot attribution offsets or revision are invalid");
+    return { ownership: "bot", placement: candidate.placement, memberKey, generatedText, generatedStartUtf16: start, generatedLengthUtf16: length, appliedNicknameRevision: revision };
+  }
+  throw new StoredDataValidationError("attribution.ownership is invalid");
+};
+
+export const validatePreparationContractV1 = (value: unknown): PreparationContractV1 => {
+  const candidate = record(value);
+  if (candidate.version !== 1 || (candidate.kind !== "prepare" && candidate.kind !== "refresh")) throw new StoredDataValidationError("Preparation contract version or kind is invalid");
+  if (!Array.isArray(candidate.capturedMembers) || candidate.capturedMembers.length === 0 || !Array.isArray(candidate.steps)) throw new StoredDataValidationError("Preparation contract members and steps are required");
+  const capturedMembers = candidate.capturedMembers.map((member, index) => validatePreparedMember(member, `contract.capturedMembers[${index}]`));
+  const steps = candidate.steps.map((step, index) => validateTransferStep(step, `contract.steps[${index}]`));
+  const itemId = integer(candidate.itemId, "contract.itemId");
+  const capturedContentVersion = integer(candidate.capturedContentVersion, "contract.capturedContentVersion");
+  const capturedSourceGeneration = integer(candidate.capturedSourceGeneration, "contract.capturedSourceGeneration");
+  const targetNicknameRevision = integer(candidate.targetNicknameRevision, "contract.targetNicknameRevision");
+  if (itemId <= 0 || capturedContentVersion < 1 || capturedSourceGeneration < 0 || targetNicknameRevision < 0) throw new StoredDataValidationError("Preparation contract versions are invalid");
+  const result: PreparationContractV1 = {
+    version: 1, kind: candidate.kind, itemId, capturedContentVersion, capturedSourceGeneration,
+    originalOrigin: validateSemanticOrigin(candidate.originalOrigin), deliveryMode: validateDeliveryMode(candidate.deliveryMode, "contract.deliveryMode"),
+    capturedMembers, steps, targetNicknameRevision, attribution: validateAttributionDescriptor(candidate.attribution),
+  };
+  const targetName = optionalString(candidate.targetName, "contract.targetName");
+  if (targetName !== undefined) result.targetName = targetName;
+  const keys = new Set(capturedMembers.map((member) => member.memberKey));
+  if (keys.size !== capturedMembers.length || steps.some((step) => step.members.some((member) => !keys.has(member.memberKey)))) throw new StoredDataValidationError("Preparation contract source associations are inconsistent");
+  return result;
+};
+
+export const validatePreparedPublicationContractV2 = (value: unknown): PreparedPublicationContractV2 => {
+  const candidate = record(value);
+  if (candidate.version !== 2 || candidate.kind !== "prepared_delivery") throw new StoredDataValidationError("Prepared publication contract version or kind is invalid");
+  if (!Array.isArray(candidate.sourceIds) || !Array.isArray(candidate.steps) || candidate.steps.length === 0) throw new StoredDataValidationError("Prepared publication contract requires source IDs and steps");
+  const sourceIds = candidate.sourceIds.map((id, index) => {
+    const parsed = integer(id, `contract.sourceIds[${index}]`);
+    if (parsed <= 0) throw new StoredDataValidationError("Prepared source IDs must be positive");
+    return asMessageId(parsed);
+  });
+  const steps = candidate.steps.map((step, index) => validateTransferStep(step, `contract.steps[${index}]`));
+  const capturedContentVersion = integer(candidate.capturedContentVersion, "contract.capturedContentVersion");
+  const capturedSourceGeneration = integer(candidate.capturedSourceGeneration, "contract.capturedSourceGeneration");
+  const expectedOutputMessageCount = integer(candidate.expectedOutputMessageCount, "contract.expectedOutputMessageCount");
+  const memberCount = steps.reduce((count, step) => count + step.members.length, 0);
+  if (capturedContentVersion < 1 || capturedSourceGeneration < 0 || expectedOutputMessageCount < 1 || expectedOutputMessageCount !== memberCount) throw new StoredDataValidationError("Prepared publication counts or versions are inconsistent");
+  return { version: 2, kind: "prepared_delivery", capturedContentVersion, capturedSourceGeneration, sourceIds, steps, expectedOutputMessageCount };
+};
+
+export const validateExecutionProgress = (value: unknown): ExecutionProgress => {
+  const candidate = record(value);
+  if (candidate.version !== 1 || !Array.isArray(candidate.members)) throw new StoredDataValidationError("Execution progress version or members are invalid");
+  const effectiveContentVersion = integer(candidate.effectiveContentVersion, "progress.effectiveContentVersion");
+  if (effectiveContentVersion < 1) throw new StoredDataValidationError("progress.effectiveContentVersion must be positive");
+  const members = candidate.members.map((entry, index) => {
+    const member = record(entry);
+    const memberKey = optionalString(member.memberKey, `progress.members[${index}].memberKey`);
+    if (!memberKey || !["pending", "sent", "confirmed_missing"].includes(String(member.outcome)) || !Array.isArray(member.outputIds)) throw new StoredDataValidationError(`progress.members[${index}] is invalid`);
+    const outputIds = member.outputIds.map((id, outputIndex) => {
+      const parsed = integer(id, `progress.members[${index}].outputIds[${outputIndex}]`);
+      if (parsed <= 0) throw new StoredDataValidationError("Progress output IDs must be positive");
+      return asMessageId(parsed);
+    });
+    const result: ExecutionProgress["members"][number] = { memberKey, outcome: member.outcome as ExecutionProgress["members"][number]["outcome"], outputIds };
+    if (member.missingEvidence !== undefined) {
+      const evidence = record(member.missingEvidence);
+      const method = optionalString(evidence.method, "progress.missingEvidence.method");
+      const description = optionalString(evidence.description, "progress.missingEvidence.description");
+      const code = evidence.code === undefined ? undefined : integer(evidence.code, "progress.missingEvidence.code");
+      if (!method || description === undefined) throw new StoredDataValidationError("Progress missing evidence is incomplete");
+      result.missingEvidence = { method, description, ...(code === undefined ? {} : { code }) };
+    }
+    return result;
+  });
+  return { version: 1, effectiveContentVersion, members };
 };

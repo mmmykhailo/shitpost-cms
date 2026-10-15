@@ -3,7 +3,7 @@ import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from ".
 import { validateSlotCount } from "../domain/schedule";
 import { validateOrderedMessageIds, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
-import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -44,6 +44,12 @@ type QueueMessageRow = {
   telegram_date: number;
   edit_date: number | null;
   snapshot_json: string;
+  member_key: string | null;
+  member_role: "content" | "credit";
+  member_delivery_mode: DeliveryMode | null;
+  album_key: string | null;
+  removed_at: number | null;
+  removal_reason: string | null;
 };
 
 export type QueueMessageRecord = {
@@ -54,6 +60,12 @@ export type QueueMessageRecord = {
   ordinal: number;
   telegramDate: number;
   editDate?: number;
+  memberKey?: string;
+  memberRole?: "content" | "credit";
+  memberDeliveryMode?: DeliveryMode;
+  albumKey?: string;
+  removedAt?: number;
+  removalReason?: string;
   snapshot: StoredMessageSnapshot;
 };
 
@@ -117,6 +129,12 @@ const messageRowToRecord = (row: QueueMessageRow): QueueMessageRecord => {
     snapshot: validateStoredMessageSnapshot(JSON.parse(row.snapshot_json) as unknown),
   };
   if (row.edit_date !== null) result.editDate = row.edit_date;
+  if (row.member_key !== null) result.memberKey = row.member_key;
+  result.memberRole = row.member_role;
+  if (row.member_delivery_mode !== null) result.memberDeliveryMode = row.member_delivery_mode;
+  if (row.album_key !== null) result.albumKey = row.album_key;
+  if (row.removed_at !== null) result.removedAt = row.removed_at;
+  if (row.removal_reason !== null) result.removalReason = row.removal_reason;
   return result;
 };
 
@@ -169,7 +187,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const insertSnapshot = (itemId: number, generation: number, snapshot: StoredMessageSnapshot): void => {
-    database.raw.query(`INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, edit_date, snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    const nativeOrigin = snapshot.nativeOrigin ?? snapshot.origin;
+    const mode: DeliveryMode = nativeOrigin.kind === "absent" ? "copy" : "forward";
+    database.raw.query(`INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, edit_date, snapshot_json, member_key, member_role, member_delivery_mode, album_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'content', ?, ?)`).run(
       itemId,
       generation,
       snapshot.chatId,
@@ -178,7 +198,47 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       snapshot.telegramDate,
       snapshot.editDate ?? null,
       JSON.stringify(snapshot),
+      `legacy:${snapshot.messageId}`,
+      mode,
+      snapshot.mediaGroupId ?? null,
     );
+  };
+
+  const toPreparedMember = (message: QueueMessageRecord): PreparedMember => {
+    if (!message.memberKey) throw new Error(`Queue member ${message.telegramMessageId} has no stable member key`);
+    const nativeOrigin = message.snapshot.nativeOrigin ?? message.snapshot.origin;
+    const member: PreparedMember = {
+      memberKey: message.memberKey,
+      messageId: message.telegramMessageId,
+      role: message.memberRole ?? "content",
+      deliveryMode: message.memberDeliveryMode ?? (nativeOrigin.kind === "absent" ? "copy" : "forward"),
+      snapshot: message.snapshot,
+    };
+    if (message.albumKey !== undefined) member.albumKey = message.albumKey;
+    return member;
+  };
+
+  const getCurrentMembers = (itemId: number): PreparedMember[] => {
+    const item = findItemById(itemId);
+    if (!item) return [];
+    return getMessages(itemId, item.sourceGeneration).filter((message) => message.removedAt === undefined).map(toPreparedMember);
+  };
+
+  const getCapturedMembers = (itemId: number, generation: number, capturedMessageIds: readonly number[]): PreparedMember[] => {
+    if (capturedMessageIds.length === 0) return [];
+    if (capturedMessageIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) throw new Error("Captured message IDs must be positive safe integers");
+    const placeholders = capturedMessageIds.map(() => "?").join(",");
+    const rows = database.raw.query(`SELECT * FROM queue_messages WHERE item_id = ? AND source_generation = ? AND telegram_message_id IN (${placeholders}) ORDER BY ordinal, telegram_message_id`).all(itemId, generation, ...capturedMessageIds) as QueueMessageRow[];
+    if (rows.length !== new Set(capturedMessageIds).size) throw new Error("A captured queue member is missing");
+    return rows.map(messageRowToRecord).map(toPreparedMember);
+  };
+
+  const findKnownSource = (queueChatId: number, messageId: number): { itemId: number; generation: number; current: boolean; removed: boolean } | undefined => {
+    const row = database.raw.query(`SELECT qm.item_id, qm.source_generation, qm.removed_at, qi.source_generation AS current_generation
+      FROM queue_messages qm JOIN queue_items qi ON qi.id = qm.item_id
+      WHERE qm.queue_chat_id = ? AND qm.telegram_message_id = ?`)
+      .get(queueChatId, messageId) as { item_id: number; source_generation: number; removed_at: number | null; current_generation: number } | null;
+    return row ? { itemId: row.item_id, generation: row.source_generation, current: row.source_generation === row.current_generation, removed: row.removed_at !== null } : undefined;
   };
 
   const observeQueueSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode?: DeliveryMode, policyCapturedAt?: number): { item: QueueItemRecord; inserted: boolean } => {
@@ -816,9 +876,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return counts;
   };
 
-  const currentSourceIds = (itemId: number): MessageId[] => getMessages(itemId).map((message) => message.telegramMessageId);
+  const currentSourceIds = (itemId: number): MessageId[] => getMessages(itemId).filter((message) => message.removedAt === undefined).map((message) => message.telegramMessageId);
 
-  const getCurrentSnapshotSet = (itemId: number): StoredMessageSnapshot[] => getMessages(itemId).map((message) => message.snapshot);
+  const getCurrentSnapshotSet = (itemId: number): StoredMessageSnapshot[] => getMessages(itemId).filter((message) => message.removedAt === undefined).map((message) => message.snapshot);
 
   const cloneSnapshotsWithIds = (itemId: number, messageIds: readonly MessageId[]): StoredMessageSnapshot[] => {
     const originals = getCurrentSnapshotSet(itemId);
@@ -869,6 +929,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     findCollectingAlbum,
     findAlbum,
     getMessages,
+    getCurrentMembers,
+    getCapturedMembers,
+    findKnownSource,
     observeQueueSnapshot,
     addAlbumMember,
     addLateAlbumMember,
