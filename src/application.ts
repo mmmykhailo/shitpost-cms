@@ -253,7 +253,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     queue, policy, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
     onSharedFailure: async (error) => alerts.raise("publication_access", "immediate", "Prepared publication stopped because Telegram rejected access: " + error.description, clock.now()),
   });
-  const renewal = createRenewalService({ queue, policy, generated, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const renewal = createRenewalService({ queue, policy, generated, events: generatedEvents, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });

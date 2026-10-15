@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { validateOrderedMessageIds } from "../domain/validation";
+import { fingerprintSnapshotContent } from "../domain/message";
+import { validatePreparedRenewalContractV2 } from "../domain/validation";
 import { RENEWAL_ITEM_RETRY_MS } from "../domain/renewal-policy";
 import { classifyTelegramError } from "../errors";
 import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } from "../db/repositories";
 import type { Logger } from "../logger";
-import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, StoredMessageSnapshot } from "../types";
+import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedRenewalContractV2, RenewalExecutionGuard, StoredMessageSnapshot, TransferStep } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
 import type { OperationTracker } from "./task-supervisor";
+import type { createGeneratedEventRepository } from "../db/generated-event-repository";
+import { transferPreparedStep } from "./prepared-transfer";
 
 export type RenewalOutcome =
   | { kind: "nothing_due" }
@@ -31,6 +34,7 @@ export const createRenewalService = (input: {
   cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
+  events?: ReturnType<typeof createGeneratedEventRepository>;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
 
@@ -40,12 +44,45 @@ export const createRenewalService = (input: {
     finally { finish?.(); }
   };
 
-  const replacementSnapshots = (snapshots: readonly StoredMessageSnapshot[], messageIds: readonly MessageId[], sourceCreatedAt: number): StoredMessageSnapshot[] => {
-    if (snapshots.length !== messageIds.length) throw new Error("Renewal output count does not match source count");
-    return snapshots.map((snapshot, ordinal) => {
-      const { editDate: _editDate, ...withoutEditDate } = snapshot;
-      return { ...withoutEditDate, messageId: messageIds[ordinal]!, ordinal, telegramDate: sourceCreatedAt };
-    });
+  const renewalSteps = (members: readonly PreparedMember[]): TransferStep[] => {
+    const steps: TransferStep[] = [];
+    for (let index = 0; index < members.length;) {
+      const first = members[index]!;
+      let end = index + 1;
+      if (first.albumKey !== undefined) {
+        while (end < members.length && members[end]!.albumKey === first.albumKey && members[end]!.deliveryMode === first.deliveryMode) end += 1;
+      }
+      const group = members.slice(index, end);
+      if (first.albumKey !== undefined && group.length > 1) {
+        steps.push({ stepKey: `renewal:${steps.length}`, mode: first.deliveryMode, grouped: true, members: group });
+      } else {
+        const { albumKey: _albumKey, ...standalone } = first;
+        steps.push({ stepKey: `renewal:${steps.length}`, mode: first.deliveryMode, grouped: false, members: [standalone] });
+      }
+      index = end;
+    }
+    return steps;
+  };
+
+  const renewedMember = (source: PreparedMember, outputId: MessageId, ordinal: number, createdAt: number, grouped: boolean): PreparedMember => {
+    const { editDate: _editDate, mediaGroupId: _oldMediaGroupId, ...base } = source.snapshot;
+    const snapshot: StoredMessageSnapshot = {
+      ...base,
+      chatId: input.queueChannelId,
+      messageId: outputId,
+      ordinal,
+      telegramDate: createdAt,
+      nativeOrigin: source.deliveryMode === "copy" ? { kind: "absent" } : (source.snapshot.nativeOrigin ?? source.snapshot.origin),
+    };
+    snapshot.contentFingerprint = fingerprintSnapshotContent(snapshot);
+    return {
+      memberKey: source.memberKey,
+      messageId: outputId,
+      role: source.role,
+      deliveryMode: source.deliveryMode,
+      ...(grouped && source.albumKey !== undefined ? { albumKey: source.albumKey } : {}),
+      snapshot,
+    };
   };
 
   const guardFor = (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): OperationGuard => ({
@@ -81,8 +118,9 @@ export const createRenewalService = (input: {
     claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>,
     oldSourceIds: readonly MessageId[],
     generation: number,
+    operationGuard: RenewalExecutionGuard | OperationGuard = guardFor(claimed),
   ): Promise<RenewalOutcome> => {
-    const guard = guardFor(claimed);
+    const guard = operationGuard;
     input.queue.setOperationPhase(claimed.operationId, "old_source_cleanup_pending", input.clock.now());
     try {
       await input.gateway.deleteMessages(input.queueChannelId, oldSourceIds);
@@ -104,61 +142,94 @@ export const createRenewalService = (input: {
   };
 
   const renewClaimed = async (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>): Promise<RenewalOutcome> => {
-    const guard = guardFor(claimed);
+    let guard: RenewalExecutionGuard = { ...guardFor(claimed), expectedContentVersion: claimed.capturedContentVersion };
     const now = input.clock.now();
-    const oldSourceIds = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).map((message) => message.telegramMessageId);
-    if (oldSourceIds.length === 0) {
+    const oldSourceIds = input.queue.currentSourceIds(claimed.item.id);
+    let members = input.queue.getCapturedMembers(claimed.item.id, claimed.capturedSourceGeneration, oldSourceIds);
+    if (members.length === 0) {
       input.queue.markMissing(claimed.item.id, claimed.operationId, now);
       return { kind: "deleted_external", itemId: claimed.item.id };
     }
-    const snapshots = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).map((message) => message.snapshot);
-    input.queue.setOperationPhase(claimed.operationId, "replacement_pending", now);
+    const steps = renewalSteps(members);
+    const contract: PreparedRenewalContractV2 = {
+      version: 2,
+      kind: "prepared_renewal",
+      capturedLogicalStatus: claimed.item.status,
+      capturedContentVersion: guard.capturedContentVersion,
+      capturedSourceGeneration: guard.capturedSourceGeneration,
+      sourceIds: oldSourceIds,
+      steps,
+      expectedReplacementMessageCount: members.length,
+    };
+    input.queue.persistPreparedRenewalContract(guard, contract, now);
+    let knownOutputCount = 0;
+    let globalOrdinal = 0;
+    let removedAll = false;
+    const missingSourceIds = new Set<number>();
+    const outputMemberKeys = new Map<string, MessageId>();
+    const sourceCreatedAt = input.clock.now();
     try {
-      const transferInput = { targetChatId: input.queueChannelId, sourceChatId: input.queueChannelId, messageIds: oldSourceIds, disableNotification: true };
-      const sourceCreatedAt = input.clock.now();
-      const replacementIds = claimed.item.origin.kind === "absent"
-        ? await input.gateway.copyMessages(transferInput)
-        : await input.gateway.forwardMessages(transferInput);
-
-      let validatedReplacementIds: MessageId[] | undefined;
-      let validationError: unknown;
-      try { validatedReplacementIds = validateOrderedMessageIds(replacementIds, "renewal replacement IDs"); }
-      catch (error) { validationError = error; }
-
-      // Persist every known result before doing any state transition. The
-      // ingestion layer also treats these IDs as candidates if Telegram emits
-      // the channel update before this process sees the response.
-      const recordedIds = new Set<number>();
-      for (const [ordinal, messageId] of replacementIds.entries()) {
-        if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0 || recordedIds.has(messageId)) continue;
+      for (const step of steps) {
+        if (step.members.every((member) => !members.some((current) => current.memberKey === member.memberKey))) continue;
         try {
-          input.queue.recordReplacementOutput(claimed.operationId, input.queueChannelId, messageId, ordinal, input.clock.now());
-          recordedIds.add(messageId);
+          const stepOutputs = await transferPreparedStep({
+            gateway: input.gateway,
+            targetChatId: input.queueChannelId,
+            sourceChatId: input.queueChannelId,
+            step,
+            beforeRequest: () => input.queue.setOperationPhase(claimed.operationId, "replacement_pending", input.clock.now()),
+            recordOutput: (output) => {
+              const ordinal = globalOrdinal++;
+              input.queue.recordReplacementOutput(claimed.operationId, output.chatId, output.messageId, ordinal, input.clock.now(), { stepKey: output.stepKey, ...(output.sourceMemberKey === undefined ? {} : { sourceMemberKey: output.sourceMemberKey }) });
+              input.events?.expect({ family: "renewal", operationId: claimed.operationId, chatId: Number(output.chatId), messageId: Number(output.messageId), kind: "post", now: input.clock.now() });
+              knownOutputCount += 1;
+            },
+          });
+          for (const output of stepOutputs) {
+            if (!output.sourceMemberKey) throw new Error("A completed renewal output has no validated source-member association");
+            outputMemberKeys.set(output.sourceMemberKey, output.messageId);
+            input.queue.markRenewalMemberSent(guard, output.sourceMemberKey, output.messageId, input.clock.now());
+          }
         } catch (error) {
-          const description = `Replacement output ${messageId} could not be safely recorded: ${error instanceof Error ? error.message : "unknown storage error"}`;
-          input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "ambiguous_send_result", description);
-          return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
+          const normalized = classifyTelegramError(error, step.mode === "copy" ? (step.grouped ? "copyMessages" : "copyMessage") : (step.grouped ? "forwardMessages" : "forwardMessage"));
+          if (normalized.kind === "source_missing" && !step.grouped && step.members.length === 1) {
+            const missing = input.queue.markRenewalMemberMissing(guard, step.members[0]!.memberKey, { method: normalized.method ?? (step.mode === "copy" ? "copyMessage" : "forwardMessage"), ...(normalized.code === undefined ? {} : { code: normalized.code }), description: normalized.description }, input.clock.now());
+            guard = missing.nextGuard;
+            missingSourceIds.add(Number(step.members[0]!.messageId));
+            members = members.filter((member) => member.memberKey !== step.members[0]!.memberKey);
+            if (missing.itemRemoved) {
+              removedAll = true;
+              return { kind: "deleted_external", itemId: claimed.item.id };
+            }
+            continue;
+          }
+          const message = step.grouped && normalized.kind === "source_missing"
+            ? `Telegram reported a missing source for album step ${step.stepKey}; the omitted member cannot be identified safely. ${normalized.description}`
+            : normalized.description;
+          if (knownOutputCount > 0 || normalized.requestMayHaveSucceeded || normalized.kind === "ambiguous_send_result" || normalized.kind === "transient_network" || normalized.kind === "transient_server") {
+            const code = step.grouped && normalized.kind === "ambiguous_send_result" && normalized.description.startsWith("Expected ") ? "partial_replacement" : normalized.kind === "source_missing" ? "ambiguous_send_result" : normalized.kind;
+            input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), code, message);
+            return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
+          }
+          return handleError(claimed, normalized);
         }
       }
 
-      if (replacementIds.length !== oldSourceIds.length) {
-        const description = `Incomplete replacement: expected ${oldSourceIds.length} messages but received ${replacementIds.length}; known replacement IDs: ${[...recordedIds].join(", ") || "none"}. Originals remain current pending review.`;
-        input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "partial_replacement", description);
-        return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
-      }
-      if (validatedReplacementIds === undefined) {
-        const description = validationError instanceof Error ? validationError.message : "Replacement message IDs were invalid or out of order";
+      if (members.length === 0 || removedAll) return { kind: "deleted_external", itemId: claimed.item.id };
+      input.queue.markReplacementOutputsRecorded(guard, input.clock.now());
+      const sentMembers = members.filter((member) => outputMemberKeys.has(member.memberKey));
+      if (sentMembers.length !== members.length) throw new Error("Renewal completed without one output for every surviving member");
+      const nextMembers = sentMembers.map((member, ordinal) => renewedMember(member, outputMemberKeys.get(member.memberKey)!, ordinal, sourceCreatedAt, member.albumKey !== undefined && steps.some((step) => step.grouped && step.members.some((entry) => entry.memberKey === member.memberKey))));
+      const generation = input.queue.installRenewedGeneration(guard, nextMembers, input.clock.now(), sourceCreatedAt);
+      return cleanupOldGeneration(claimed, oldSourceIds.filter((id) => !missingSourceIds.has(Number(id))), generation, guard);
+    } catch (error) {
+      const normalized = classifyTelegramError(error);
+      const description = error instanceof Error ? error.message : normalized.description;
+      if (knownOutputCount > 0) {
         input.queue.setRenewalUncertain(claimed.item.id, claimed.operationId, input.clock.now(), "ambiguous_send_result", description);
         return { kind: "uncertain", itemId: claimed.item.id, operationId: claimed.operationId };
       }
-
-      input.queue.markReplacementOutputsRecorded(guard, input.clock.now());
-      const installedAt = input.clock.now();
-      const nextSnapshots = replacementSnapshots(snapshots, validatedReplacementIds, sourceCreatedAt);
-      const generation = input.queue.installRenewedGeneration(guard, nextSnapshots, installedAt, sourceCreatedAt);
-      return cleanupOldGeneration(claimed, oldSourceIds, generation);
-    } catch (error) {
-      return handleError(claimed, classifyTelegramError(error));
+      return handleError(claimed, normalized);
     }
   };
 
@@ -179,13 +250,20 @@ export const createRenewalService = (input: {
     const operation = input.queue.operationForItem(itemId);
     if (!item || !operation || item.maintenanceStatus !== "renewal_cleanup_pending" || item.sourceGeneration < 1) return { kind: "blocked", itemId, reason: "renewal_cleanup_not_pending" };
     return tracked(operation.id, async () => {
-      const oldSourceIds = input.queue.getMessages(itemId, operation.capturedSourceGeneration).map((message) => message.telegramMessageId);
+      const oldSourceIds = input.queue.getMessages(itemId, operation.capturedSourceGeneration).filter((message) => message.removedAt === undefined).map((message) => message.telegramMessageId);
+      const progress = input.queue.renewalProgress(operation.id);
       return cleanupOldGeneration({
         item: { ...item, maintenanceStatus: "renewing" },
         operationId: operation.id,
         capturedContentVersion: operation.capturedContentVersion,
         capturedSourceGeneration: operation.capturedSourceGeneration,
-      }, oldSourceIds, item.sourceGeneration);
+      }, oldSourceIds, item.sourceGeneration, {
+        operationId: operation.id,
+        itemId,
+        capturedContentVersion: operation.capturedContentVersion,
+        capturedSourceGeneration: operation.capturedSourceGeneration,
+        expectedContentVersion: progress?.effectiveContentVersion ?? item.contentVersion,
+      });
     });
   };
 

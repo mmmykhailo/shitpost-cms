@@ -14,6 +14,7 @@ import { createLogger } from "../src/logger";
 import { asChatId, asMessageId, asUserId } from "../src/types";
 import type { TelegramGateway } from "../src/telegram";
 import { snapshotFixture } from "./fixtures";
+import { markQueueItemPrepared } from "./support";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
@@ -27,7 +28,8 @@ const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "perm
     getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
     forwardMessages: async ({ messageIds }) => { calls.push("forward"); return messageIds.map(() => asMessageId(nextId++)); },
     copyMessages: async ({ messageIds }) => { calls.push("copy"); return messageIds.map(() => asMessageId(nextId++)); },
-    forwardMessage: async () => { throw new Error("unused"); },
+    forwardMessage: async () => { calls.push("forward"); return { message_id: nextId++ } as never; },
+    copyMessage: async () => { calls.push("copy"); return asMessageId(nextId++); },
     editText: async () => {},
     editCaption: async () => {},
     sendText: async () => asMessageId(nextId++),
@@ -90,7 +92,7 @@ describe("renewal service", () => {
     const fake = gatewayWithDeleteFailure("transient_network", false);
     const gateway: TelegramGateway = {
       ...fake.gateway,
-      copyMessages: async () => { throw failure; },
+      copyMessage: async () => { throw failure; },
     };
     const { queue, renewal } = open(gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(48), telegramDate: 0, origin: { kind: "absent" } }), 1);
@@ -107,7 +109,7 @@ describe("renewal service", () => {
     const fake = gatewayWithDeleteFailure("transient_network", false);
     const gateway: TelegramGateway = {
       ...fake.gateway,
-      copyMessages: async () => { throw { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 }; },
+      copyMessage: async () => { throw { kind: "rate_limited", description: "slow down", retryAfterSeconds: 1_800 }; },
     };
     const { queue, renewal, cooldown } = open(gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(481), telegramDate: 0, origin: { kind: "absent" } }), 1);
@@ -124,7 +126,7 @@ describe("renewal service", () => {
     const fake = gatewayWithDeleteFailure("transient_network", false);
     const gateway: TelegramGateway = {
       ...fake.gateway,
-      copyMessages: async () => [0 as never],
+      copyMessage: async () => 0 as never,
     };
     const { queue, renewal } = open(gateway);
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(47), telegramDate: 0, origin: { kind: "absent" } }), 1);
@@ -164,7 +166,7 @@ describe("renewal service", () => {
     expect(queue.operationEvidence(1)?.knownReplacementIds).toEqual([asMessageId(910), asMessageId(911)]);
     expect(fake.calls).toEqual(["copy"]);
     expect(item?.lastErrorCode).toBe("partial_replacement");
-    expect(item?.lastError).toContain("expected 3");
+    expect(item?.lastError).toContain("Expected 3");
     expect(item?.lastError).toContain("received 2");
   });
 
@@ -195,6 +197,11 @@ describe("renewal service", () => {
         advanceClock();
         return result;
       },
+      copyMessage: async (transfer) => {
+        const result = await fake.gateway.copyMessage!(transfer);
+        advanceClock();
+        return result;
+      },
     };
     const { queue, renewal, clock } = open(gateway);
     advanceClock = () => clock.advance(45_000);
@@ -215,6 +222,10 @@ describe("renewal service", () => {
       copyMessages: async (transfer) => {
         copiedFrom.push(transfer.messageIds.map(Number));
         return fake.gateway.copyMessages(transfer);
+      },
+      copyMessage: async (transfer) => {
+        copiedFrom.push([Number(transfer.messageId)]);
+        return fake.gateway.copyMessage!(transfer);
       },
     };
     const { queue, renewal, clock } = open(gateway);
@@ -248,6 +259,55 @@ describe("renewal service", () => {
     const result = await renewal.renewNext(36_000);
     expect(result.kind).toBe("renewed");
     expect(fake.calls[0]).toBe("forward");
+  });
+
+  test("renews a prepared user copy with its frozen mode and stable member identity", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, renewal, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(58), telegramDate: 0, origin: { kind: "user", userId: asUserId(800), displayName: "Alex" } }), 1);
+    markQueueItemPrepared(database, 1, "copy", 2);
+    const before = queue.getCurrentMembers(1)[0]!;
+
+    expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
+
+    const after = queue.getCurrentMembers(1)[0]!;
+    expect(fake.calls).toEqual(["copy", "delete"]);
+    expect(after.memberKey).toBe(before.memberKey);
+    expect(after.role).toBe("content");
+    expect(after.deliveryMode).toBe("copy");
+    expect(after.snapshot.nativeOrigin).toEqual({ kind: "absent" });
+  });
+
+  test("renews a separate credit as a copied member and tombstones a definitely missing standalone source", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const deleted: number[][] = [];
+    const base = fake.gateway;
+    const gateway: TelegramGateway = {
+      ...base,
+      copyMessage: async (transfer) => {
+        fake.calls.push(`copy:${Number(transfer.messageId)}`);
+        if (Number(transfer.messageId) === 60) throw { kind: "source_missing", method: "copyMessage", code: 400, description: "message to copy not found" };
+        return base.copyMessage!(transfer);
+      },
+      deleteMessages: async (_chatId, ids) => { deleted.push(ids.map(Number)); },
+    };
+    const { queue, renewal, database } = open(gateway);
+    const { text: _text, ...videoNote } = snapshotFixture({ messageId: asMessageId(60), telegramDate: 0, contentType: "video_note", origin: { kind: "absent" } });
+    const item = queue.observeQueueSnapshot(videoNote, 1, "copy", 1).item;
+    const credit = snapshotFixture({ messageId: asMessageId(61), ordinal: 1, telegramDate: 0, text: "by Alice", origin: { kind: "absent" } });
+    database.raw.query(`INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, edit_date, snapshot_json, member_key, member_role, member_delivery_mode, album_key)
+      VALUES (?, 0, ?, ?, 1, ?, NULL, ?, 'credit:61', 'credit', 'copy', NULL)`).run(item.id, -100, 61, credit.telegramDate, JSON.stringify(credit));
+    database.raw.query("UPDATE queue_messages SET member_key = 'content:60', member_role = 'content', member_delivery_mode = 'copy' WHERE item_id = ? AND telegram_message_id = 60").run(item.id);
+    database.raw.query(`UPDATE queue_items SET representation_kind = 'prepared', preparation_state = 'ready', delivery_mode = 'copy', attribution_json = ?, nickname_revision_wanted = 1, nickname_revision_applied = 1 WHERE id = ?`)
+      .run(JSON.stringify({ ownership: "bot", placement: "separate", memberKey: "credit:61", generatedText: "by Alice", generatedStartUtf16: 0, generatedLengthUtf16: 8, appliedNicknameRevision: 1 }), item.id);
+
+    expect((await renewal.renewNext(36_000)).kind).toBe("renewed");
+
+    expect(queue.findItemById(item.id)?.sourceGeneration).toBe(1);
+    expect(queue.findItemById(item.id)?.contentVersion).toBe(2);
+    expect(queue.getMessages(item.id, 0).find((member) => member.telegramMessageId === asMessageId(60))?.removedAt).toBeDefined();
+    expect(queue.getCurrentMembers(item.id).map((member) => ({ key: member.memberKey, role: member.role, mode: member.deliveryMode }))).toEqual([{ key: "credit:61", role: "credit", mode: "copy" }]);
+    expect(deleted).toEqual([[61]]);
   });
 
   test("turns an old-generation age-limit failure into a terminal orphan", async () => {

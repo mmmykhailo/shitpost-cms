@@ -41,6 +41,13 @@ export const transferPreparedStep = async (input: {
       const transferInput = { targetChatId: input.targetChatId, sourceChatId: input.sourceChatId, messageIds: step.members.map((member) => member.messageId) };
       const ids = step.mode === "copy" ? await input.gateway.copyMessages(transferInput) : await input.gateway.forwardMessages(transferInput);
       if (ids.length !== step.members.length) throw { kind: "ambiguous_send_result", method: step.mode === "copy" ? "copyMessages" : "forwardMessages", description: `Expected ${step.members.length} outputs, received ${ids.length}`, knownOutputs: ids, requestMayHaveSucceeded: true };
+      const distinct = new Set<number>();
+      const invalid = ids.some((id) => !Number.isSafeInteger(id) || Number(id) <= 0 || distinct.has(Number(id)) || !distinct.add(Number(id)));
+      if (invalid) {
+        const evidence = [...new Set(ids.filter((id) => Number.isSafeInteger(id) && Number(id) > 0).map(Number))].map((id) => asMessageId(id));
+        for (const [index, id] of evidence.entries()) await accept(id, index);
+        throw { kind: "ambiguous_send_result", method: step.mode === "copy" ? "copyMessages" : "forwardMessages", description: "Transfer returned invalid or duplicate output IDs", knownOutputs: [], requestMayHaveSucceeded: true };
+      }
       for (const [index, id] of ids.entries()) await accept(id, index, step.members[index]);
       return outputs;
     } catch (error) {
@@ -57,6 +64,7 @@ export const transferPreparedStep = async (input: {
       if (step.mode === "copy") {
         if (!input.gateway.copyMessage) throw new Error("Single-message copy is unavailable in this Telegram gateway");
         outputId = await input.gateway.copyMessage({ targetChatId: input.targetChatId, sourceChatId: input.sourceChatId, messageId: member.messageId });
+        if (!Number.isSafeInteger(outputId) || Number(outputId) <= 0) throw { kind: "ambiguous_send_result", method: "copyMessage", description: "Telegram returned an invalid message ID", requestMayHaveSucceeded: true };
       } else {
         const output = await input.gateway.forwardMessage({ targetChatId: input.targetChatId, sourceChatId: input.sourceChatId, messageId: member.messageId });
         if (!Number.isSafeInteger(output.message_id) || output.message_id <= 0) throw { kind: "ambiguous_send_result", method: "forwardMessage", description: "Telegram returned an invalid message ID", requestMayHaveSucceeded: true };

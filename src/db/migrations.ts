@@ -410,6 +410,13 @@ const migrations: readonly Migration[] = [
       `CREATE INDEX queue_generated_events_operation_idx ON queue_generated_events(operation_family, operation_id)`,
     ],
   },
+  {
+    version: 5,
+    statements: [
+      `ALTER TABLE operation_outputs ADD COLUMN step_key TEXT`,
+      `ALTER TABLE operation_outputs ADD COLUMN source_member_key TEXT`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

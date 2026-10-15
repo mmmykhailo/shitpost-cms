@@ -1,10 +1,10 @@
 import type { AppDatabase } from "./database";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
-import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedPublicationContractV2, validatePublicationContract, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
+import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { inspectInlineCreditEdit } from "../domain/attribution";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
-import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PublicationContract, QueueItemStatus, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, QueueItemStatus, RenewalExecutionGuard, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -220,6 +220,16 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       `legacy:${snapshot.messageId}`,
       mode,
       snapshot.mediaGroupId ?? null,
+    );
+  };
+
+  const insertPreparedMember = (itemId: number, generation: number, value: PreparedMember): void => {
+    const member = validatePreparedMember(value, "renewal.member");
+    const snapshot = validateStoredMessageSnapshot(member.snapshot);
+    database.raw.query(`INSERT INTO queue_messages (item_id, source_generation, queue_chat_id, telegram_message_id, ordinal, telegram_date, edit_date, snapshot_json, member_key, member_role, member_delivery_mode, album_key, removed_at, removal_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`).run(
+      itemId, generation, snapshot.chatId, member.messageId, snapshot.ordinal, snapshot.telegramDate, snapshot.editDate ?? null,
+      JSON.stringify(snapshot), member.memberKey, member.role, member.deliveryMode, member.albumKey ?? null,
     );
   };
 
@@ -476,7 +486,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   });
 
   const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
-    const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending') AND maintenance_status = 'idle' AND physical_created_at <= ? AND (maintenance_retry_not_before IS NULL OR maintenance_retry_not_before <= ?) ORDER BY physical_created_at, logical_sequence LIMIT 1").get(eligibleBefore, now) as QueueRow | null;
+    const row = database.raw.query(`SELECT * FROM queue_items qi WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending')
+      AND maintenance_status = 'idle' AND preparation_operation_id IS NULL AND physical_created_at <= ?
+      AND (maintenance_retry_not_before IS NULL OR maintenance_retry_not_before <= ?)
+      AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = qi.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
+      AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations p WHERE p.item_id = qi.id AND p.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
+      ORDER BY physical_created_at, logical_sequence LIMIT 1`).get(eligibleBefore, now) as QueueRow | null;
     if (!row) return undefined;
     const item = rowToItem(row);
     const changed = database.raw.query("UPDATE queue_items SET maintenance_status = 'renewing', maintenance_operation_id = ?, maintenance_retry_not_before = NULL, attempts = attempts + 1 WHERE id = ? AND status = ? AND maintenance_status = 'idle' AND source_generation = ? AND content_version = ?").run(operationId, item.id, item.status, item.sourceGeneration, item.contentVersion);
@@ -547,7 +562,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const recoverExpiredOperations = (now: number, bootId?: string): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation, created_at FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number; created_at: number }>;
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation, created_at, plan_json, progress_json FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number; created_at: number; plan_json: string | null; progress_json: string | null }>;
     const recovered: number[] = [];
     const markRenewalUncertain = (itemId: number, operationId: string): void => {
       database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(itemId, operationId);
@@ -569,28 +584,83 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
           setOperationPhase(row.id, "failed", now, "startup_recovery");
           setOperationState(row.id, "failed", now, "startup_recovery");
         } else if (row.phase === "replacement_outputs_recorded") {
-          const oldMessages = getMessages(item.id, row.captured_source_generation).sort((left, right) => left.ordinal - right.ordinal);
-          let replacementIds: MessageId[] | undefined;
-          try { replacementIds = validateOrderedMessageIds(operationOutputIds(row.id, "replacement"), "renewal replacement IDs"); }
-          catch { replacementIds = undefined; }
-          const sourceIds = operationSourceIds(row.id);
-          const sourceEvidenceMatches = sourceIds.length === oldMessages.length && sourceIds.every((messageId, index) => messageId === oldMessages[index]?.telegramMessageId);
-          const exactCount = replacementIds !== undefined && row.expected_source_count !== null && row.expected_source_count === oldMessages.length && row.expected_source_count === replacementIds.length && sourceEvidenceMatches;
-          const guardMatches = item.maintenanceStatus === "renewing" && item.maintenanceOperationId === row.id && item.contentVersion === row.captured_content_version && item.sourceGeneration === row.captured_source_generation;
-          if (!exactCount || !guardMatches) {
-            markRenewalUncertain(item.id, row.id);
-          } else {
-            const nextGeneration = row.captured_source_generation + 1;
-            for (const [ordinal, message] of oldMessages.entries()) {
-              const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
-              insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds![ordinal]!, ordinal, telegramDate: row.created_at });
+          if (row.plan_json?.includes('"kind":"prepared_renewal"')) {
+            try {
+              const contract = validatePreparedRenewalContractV2(JSON.parse(row.plan_json) as unknown);
+              const progress = row.progress_json ? validateRenewalExecutionProgress(JSON.parse(row.progress_json) as unknown) : undefined;
+              const oldMessages = getMessages(item.id, row.captured_source_generation).sort((left, right) => left.ordinal - right.ordinal);
+              const activeAtClaim = oldMessages.filter((message) => message.removedAt === undefined);
+              const sourceEvidenceMatches = contract.sourceIds.length === activeAtClaim.length && contract.sourceIds.every((messageId, index) => messageId === activeAtClaim[index]?.telegramMessageId)
+                && operationSourceIds(row.id).join(",") === contract.sourceIds.join(",");
+              const expectedVersion = progress?.effectiveContentVersion;
+              const guardMatches = progress !== undefined && item.maintenanceStatus === "renewing" && item.maintenanceOperationId === row.id && item.contentVersion === expectedVersion && item.sourceGeneration === row.captured_source_generation;
+              const complete = progress !== undefined && progress.members.length === contract.expectedReplacementMessageCount && progress.members.every((member) => member.outcome !== "pending");
+              const sent = progress?.members.filter((member) => member.outcome === "sent") ?? [];
+              const outputs = replacementOutputs(row.id);
+              const outputByMember = new Map(outputs.filter((output) => output.sourceMemberKey !== undefined).map((output) => [output.sourceMemberKey!, output]));
+              const associationsMatch = outputs.length === sent.length && outputByMember.size === sent.length && sent.every((member) => member.outputIds.length === 1 && outputByMember.get(member.memberKey)?.messageId === member.outputIds[0]);
+              const memberStatusMatches = progress !== undefined && progress.members.every((member) => {
+                const source = oldMessages.find((candidate) => candidate.memberKey === member.memberKey);
+                return source !== undefined && (member.outcome === "confirmed_missing" ? source.removedAt !== undefined : source.removedAt === undefined);
+              });
+              if (!progress || !sourceEvidenceMatches || !guardMatches || !complete || !associationsMatch || !memberStatusMatches) {
+                markRenewalUncertain(item.id, row.id);
+              } else {
+                const planned = contract.steps.flatMap((step) => step.members.map((member) => ({ member, grouped: step.grouped })));
+                const nextGeneration = row.captured_source_generation + 1;
+                const outputMembers = planned.filter(({ member }) => progress.members.some((state) => state.memberKey === member.memberKey && state.outcome === "sent"));
+                for (const [ordinal, entry] of outputMembers.entries()) {
+                  const outputId = outputByMember.get(entry.member.memberKey)!.messageId;
+                  const { editDate: _editDate, mediaGroupId: _oldMediaGroupId, ...snapshotFields } = entry.member.snapshot;
+                  const snapshot = validateStoredMessageSnapshot({
+                    ...snapshotFields,
+                    chatId: item.queueChatId,
+                    messageId: outputId,
+                    ordinal,
+                    telegramDate: row.created_at,
+                    nativeOrigin: entry.member.deliveryMode === "copy" ? { kind: "absent" } : (entry.member.snapshot.nativeOrigin ?? entry.member.snapshot.origin),
+                  });
+                  const replacement: PreparedMember = { ...entry.member, messageId: outputId, snapshot };
+                  if (!entry.grouped) delete replacement.albumKey;
+                  insertPreparedMember(item.id, nextGeneration, replacement);
+                }
+                const newStatus = item.representationKind === "prepared" && item.attribution?.ownership === "bot" && (item.nicknameRevisionApplied ?? 0) !== (item.nicknameRevisionWanted ?? 0) ? "refresh_pending" : item.preparationState ?? "unprepared";
+                const firstId = outputMembers[0] ? outputByMember.get(outputMembers[0].member.memberKey)!.messageId : null;
+                const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, first_message_id = COALESCE(?, first_message_id), physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', preparation_state = ?, last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?")
+                  .run(nextGeneration, firstId, row.created_at, now, newStatus, item.id, row.id, expectedVersion, row.captured_source_generation);
+                if (Number(installed.changes) !== 1) markRenewalUncertain(item.id, row.id);
+                else {
+                  setOperationPhase(row.id, "generation_installed", now, "startup_recovery");
+                  setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+                }
+              }
+            } catch {
+              markRenewalUncertain(item.id, row.id);
             }
-            const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, row.created_at, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
-            if (Number(installed.changes) !== 1) {
+          } else {
+            const oldMessages = getMessages(item.id, row.captured_source_generation).sort((left, right) => left.ordinal - right.ordinal);
+            let replacementIds: MessageId[] | undefined;
+            try { replacementIds = validateOrderedMessageIds(operationOutputIds(row.id, "replacement"), "renewal replacement IDs"); }
+            catch { replacementIds = undefined; }
+            const sourceIds = operationSourceIds(row.id);
+            const sourceEvidenceMatches = sourceIds.length === oldMessages.length && sourceIds.every((messageId, index) => messageId === oldMessages[index]?.telegramMessageId);
+            const exactCount = replacementIds !== undefined && row.expected_source_count !== null && row.expected_source_count === oldMessages.length && row.expected_source_count === replacementIds.length && sourceEvidenceMatches;
+            const guardMatches = item.maintenanceStatus === "renewing" && item.maintenanceOperationId === row.id && item.contentVersion === row.captured_content_version && item.sourceGeneration === row.captured_source_generation;
+            if (!exactCount || !guardMatches) {
               markRenewalUncertain(item.id, row.id);
             } else {
-              setOperationPhase(row.id, "generation_installed", now, "startup_recovery");
-              setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+              const nextGeneration = row.captured_source_generation + 1;
+              for (const [ordinal, message] of oldMessages.entries()) {
+                const { editDate: _editDate, ...withoutEditDate } = message.snapshot;
+                insertSnapshot(item.id, nextGeneration, { ...withoutEditDate, messageId: replacementIds![ordinal]!, ordinal, telegramDate: row.created_at });
+              }
+              const installed = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', last_error_code = NULL, last_error = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, row.created_at, now, item.id, row.id, row.captured_content_version, row.captured_source_generation);
+              if (Number(installed.changes) !== 1) {
+                markRenewalUncertain(item.id, row.id);
+              } else {
+                setOperationPhase(row.id, "generation_installed", now, "startup_recovery");
+                setOperationState(row.id, "cleanup_pending", now, "startup_recovery");
+              }
             }
           }
         } else if (row.phase === "generation_installed" || row.phase === "old_source_cleanup_pending") {
@@ -628,23 +698,98 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return recovered;
   });
 
-  const recordOutput = (operationId: string, role: OperationOutputRole | "destination" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number): void => {
+  const recordOutput = (operationId: string, role: OperationOutputRole | "destination" | "temporary_preview", chatId: number, messageId: number, ordinal: number, now: number, association?: { stepKey?: string; sourceMemberKey?: string }): void => {
     if (!Number.isSafeInteger(chatId)) throw new InvalidTelegramOutputError("Invalid numeric Telegram output chat ID");
     if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new InvalidTelegramOutputError("Invalid numeric Telegram output ID");
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new InvalidTelegramOutputError("Invalid numeric Telegram output ordinal");
     const kind = role === "replacement" ? "replacement" : role === "temporary_preview" ? "temporary_preview" : "destination";
     const normalizedRole = role === "destination" ? "transferred" : role;
-    const result = database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now);
+    const result = database.raw.query("INSERT OR IGNORE INTO operation_outputs (operation_id, kind, role, chat_id, telegram_message_id, ordinal, recorded_at, step_key, source_member_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, kind, normalizedRole, chatId, messageId, ordinal, now, association?.stepKey ?? null, association?.sourceMemberKey ?? null);
     if (Number(result.changes) === 1) return;
-    const existing = database.raw.query("SELECT operation_id, kind, role, ordinal FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(chatId, messageId) as { operation_id: string; kind: string; role: string; ordinal: number } | null;
-    if (existing?.operation_id === operationId && existing.kind === kind && existing.role === normalizedRole && existing.ordinal === ordinal) return;
+    const existing = database.raw.query("SELECT operation_id, kind, role, ordinal, step_key, source_member_key FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(chatId, messageId) as { operation_id: string; kind: string; role: string; ordinal: number; step_key: string | null; source_member_key: string | null } | null;
+    if (existing?.operation_id === operationId && existing.kind === kind && existing.role === normalizedRole && existing.ordinal === ordinal
+      && (association?.stepKey === undefined || existing.step_key === association.stepKey)
+      && (association?.sourceMemberKey === undefined || existing.source_member_key === association.sourceMemberKey)) return;
     throw conflict(`Telegram output ${chatId}/${messageId} already belongs to another operation`);
   };
 
-  const recordReplacementOutput = (operationId: string, chatId: number, messageId: number, ordinal: number, now: number): void => database.transaction(() => {
-    recordOutput(operationId, "replacement", chatId, messageId, ordinal, now);
+  const recordReplacementOutput = (operationId: string, chatId: number, messageId: number, ordinal: number, now: number, association?: { stepKey?: string; sourceMemberKey?: string }): void => database.transaction(() => {
+    recordOutput(operationId, "replacement", chatId, messageId, ordinal, now, association);
     database.raw.query("INSERT OR REPLACE INTO generated_messages (chat_id, message_id, operation_id, kind, created_at, consumed_at) VALUES (?, ?, ?, 'renewal', ?, NULL)").run(chatId, messageId, operationId, now);
   });
+
+  const persistPreparedRenewalContract = (guard: OperationGuard, contract: PreparedRenewalContractV2, now: number): void => database.transaction(() => {
+    const validated = validatePreparedRenewalContractV2(contract);
+    const operation = database.raw.query("SELECT phase, type, item_id, captured_content_version, captured_source_generation FROM operations WHERE id = ?").get(guard.operationId) as { phase: string; type: string; item_id: number; captured_content_version: number; captured_source_generation: number } | null;
+    const item = findItemById(guard.itemId);
+    if (!operation || operation.type !== "renew" || operation.phase !== "claimed" || operation.item_id !== guard.itemId || operation.captured_content_version !== guard.capturedContentVersion || operation.captured_source_generation !== guard.capturedSourceGeneration
+      || !item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Prepared renewal contract guard conflict");
+    if (validated.capturedContentVersion !== guard.capturedContentVersion || validated.capturedSourceGeneration !== guard.capturedSourceGeneration || validated.capturedLogicalStatus !== item.status || validated.sourceIds.join(",") !== currentSourceIds(item.id).join(",")) throw conflict("Prepared renewal source set changed after claim");
+    const progress: RenewalExecutionProgress = { version: 1, effectiveContentVersion: guard.capturedContentVersion, members: validated.steps.flatMap((step) => step.members.map((member) => ({ memberKey: member.memberKey, outcome: "pending" as const, outputIds: [] }))) };
+    const result = database.raw.query(`UPDATE operations SET expected_source_count = ?, expected_output_count = ?, source_ids_json = ?, plan_json = ?, progress_json = ?, updated_at = ?
+      WHERE id = ? AND phase = 'claimed' AND state = 'running' AND item_id = ?`).run(validated.sourceIds.length, validated.expectedReplacementMessageCount, JSON.stringify(validated.sourceIds), JSON.stringify(validated), JSON.stringify(progress), now, guard.operationId, guard.itemId);
+    if (Number(result.changes) !== 1) throw conflict("Prepared renewal contract could not be persisted");
+  });
+
+  const renewalProgress = (operationId: string): RenewalExecutionProgress | undefined => {
+    const row = database.raw.query("SELECT progress_json FROM operations WHERE id = ? AND type = 'renew'").get(operationId) as { progress_json: string | null } | null;
+    if (!row?.progress_json) return undefined;
+    return validateRenewalExecutionProgress(JSON.parse(row.progress_json) as unknown);
+  };
+
+  const markRenewalMemberSent = (guard: RenewalExecutionGuard, memberKey: string, outputId: MessageId, now: number): void => database.transaction(() => {
+    const item = database.raw.query("SELECT content_version, source_generation, maintenance_status, maintenance_operation_id FROM queue_items WHERE id = ?").get(guard.itemId) as { content_version: number; source_generation: number; maintenance_status: MaintenanceStatus; maintenance_operation_id: string | null } | null;
+    const operation = database.raw.query("SELECT progress_json FROM operations WHERE id = ? AND type = 'renew' AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND state = 'running'").get(guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration) as { progress_json: string | null } | null;
+    if (!item || item.maintenance_status !== "renewing" || item.maintenance_operation_id !== guard.operationId || item.content_version !== guard.expectedContentVersion || item.source_generation !== guard.capturedSourceGeneration || !operation?.progress_json) throw conflict("Renewal member completion guard conflict");
+    const progress = validateRenewalExecutionProgress(JSON.parse(operation.progress_json) as unknown);
+    if (progress.effectiveContentVersion !== guard.expectedContentVersion) throw conflict("Renewal progress version does not match its execution guard");
+    const member = progress.members.find((candidate) => candidate.memberKey === memberKey);
+    if (!member || member.outcome !== "pending") throw conflict("Renewal member is not awaiting an output");
+    const mapped = database.raw.query("SELECT step_key, source_member_key FROM operation_outputs WHERE operation_id = ? AND kind = 'replacement' AND telegram_message_id = ?").get(guard.operationId, outputId) as { step_key: string | null; source_member_key: string | null } | null;
+    if (!mapped || mapped.source_member_key !== memberKey) throw conflict("Renewal output has no exact member association");
+    const members = progress.members.map((candidate) => candidate.memberKey === memberKey ? { ...candidate, outcome: "sent" as const, outputIds: [outputId] } : candidate);
+    const changed = database.raw.query("UPDATE operations SET progress_json = ?, updated_at = ? WHERE id = ? AND state = 'running'").run(JSON.stringify({ ...progress, members }), now, guard.operationId);
+    if (Number(changed.changes) !== 1) throw conflict("Renewal progress changed before recording output association");
+  });
+
+  const markRenewalMemberMissing = (guard: RenewalExecutionGuard, memberKey: string, evidence: { method: string; code?: number; description: string }, now: number): { remainingCount: number; itemRemoved: boolean; nextGuard: RenewalExecutionGuard } => database.transaction(() => {
+    const item = database.raw.query("SELECT content_version, source_generation, maintenance_status, maintenance_operation_id FROM queue_items WHERE id = ?").get(guard.itemId) as { content_version: number; source_generation: number; maintenance_status: MaintenanceStatus; maintenance_operation_id: string | null } | null;
+    const operation = database.raw.query("SELECT progress_json FROM operations WHERE id = ? AND type = 'renew' AND item_id = ? AND captured_content_version = ? AND captured_source_generation = ? AND state = 'running'").get(guard.operationId, guard.itemId, guard.capturedContentVersion, guard.capturedSourceGeneration) as { progress_json: string | null } | null;
+    if (!item || item.maintenance_status !== "renewing" || item.maintenance_operation_id !== guard.operationId || item.content_version !== guard.expectedContentVersion || item.source_generation !== guard.capturedSourceGeneration || !operation?.progress_json) throw conflict("Renewal missing-member guard conflict");
+    const progress = validateRenewalExecutionProgress(JSON.parse(operation.progress_json) as unknown);
+    if (progress.effectiveContentVersion !== guard.expectedContentVersion) throw conflict("Renewal progress version does not match its execution guard");
+    const member = progress.members.find((candidate) => candidate.memberKey === memberKey);
+    if (!member || member.outcome !== "pending") throw conflict("Renewal member is not awaiting a missing-source result");
+    const changedMember = database.raw.query(`UPDATE queue_messages SET removed_at = ?, removal_reason = 'confirmed_missing'
+      WHERE item_id = ? AND source_generation = ? AND member_key = ? AND removed_at IS NULL`).run(now, guard.itemId, guard.capturedSourceGeneration, memberKey);
+    if (Number(changedMember.changes) !== 1) throw conflict("Renewal source member was already removed or replaced");
+    const nextVersion = item.content_version + 1;
+    const members = progress.members.map((candidate) => candidate.memberKey === memberKey ? { ...candidate, outcome: "confirmed_missing" as const, outputIds: [], missingEvidence: evidence } : candidate);
+    const remainingRow = database.raw.query("SELECT COUNT(*) AS count FROM queue_messages WHERE item_id = ? AND source_generation = ? AND removed_at IS NULL").get(guard.itemId, guard.capturedSourceGeneration) as { count: number };
+    const remainingCount = Number(remainingRow.count);
+    if (remainingCount === 0) {
+      const terminalized = database.raw.query(`UPDATE queue_items SET content_version = ?, status = 'deleted_external', completed_at = ?, maintenance_status = 'idle', maintenance_operation_id = NULL, last_error_code = 'source_missing', last_error = ?,
+        attribution_json = CASE WHEN json_extract(attribution_json, '$.ownership') = 'bot' AND json_extract(attribution_json, '$.memberKey') = ? THEN json_object('ownership','admin','previousMemberKey',?) ELSE attribution_json END
+        WHERE id = ? AND maintenance_operation_id = ? AND content_version = ? AND source_generation = ?`).run(nextVersion, now, evidence.description, memberKey, memberKey, guard.itemId, guard.operationId, item.content_version, guard.capturedSourceGeneration);
+      if (Number(terminalized.changes) !== 1) throw conflict("Renewal terminal deletion lost its owner guard");
+      database.raw.query("UPDATE operations SET progress_json = ?, state = 'done', phase = 'completed', error_code = 'source_missing', error_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify({ ...progress, effectiveContentVersion: nextVersion, members }), JSON.stringify(evidence), now, guard.operationId);
+      return { remainingCount, itemRemoved: true, nextGuard: { ...guard, expectedContentVersion: nextVersion } };
+    }
+    const changedItem = database.raw.query(`UPDATE queue_items SET content_version = ?, first_message_id = (SELECT telegram_message_id FROM queue_messages WHERE item_id = ? AND source_generation = ? AND removed_at IS NULL ORDER BY ordinal, telegram_message_id LIMIT 1),
+      attribution_json = CASE WHEN json_extract(attribution_json, '$.ownership') = 'bot' AND json_extract(attribution_json, '$.memberKey') = ? THEN json_object('ownership','admin','previousMemberKey',?) ELSE attribution_json END,
+      preparation_state = CASE WHEN json_extract(attribution_json, '$.ownership') = 'bot' AND json_extract(attribution_json, '$.memberKey') = ? THEN 'ready' WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
+      WHERE id = ? AND maintenance_operation_id = ? AND content_version = ? AND source_generation = ?`)
+      .run(nextVersion, guard.itemId, guard.capturedSourceGeneration, memberKey, memberKey, memberKey, guard.itemId, guard.operationId, item.content_version, guard.capturedSourceGeneration);
+    if (Number(changedItem.changes) !== 1) throw conflict("Renewal source member removal lost its guard");
+    const changedProgress = database.raw.query("UPDATE operations SET progress_json = ?, updated_at = ? WHERE id = ? AND state = 'running'").run(JSON.stringify({ ...progress, effectiveContentVersion: nextVersion, members }), now, guard.operationId);
+    if (Number(changedProgress.changes) !== 1) throw conflict("Renewal progress changed while recording missing-source evidence");
+    return { remainingCount, itemRemoved: false, nextGuard: { ...guard, expectedContentVersion: nextVersion } };
+  });
+
+  const replacementOutputs = (operationId: string): Array<{ chatId: number; messageId: MessageId; ordinal: number; stepKey?: string; sourceMemberKey?: string }> => {
+    const rows = database.raw.query("SELECT chat_id, telegram_message_id, ordinal, step_key, source_member_key FROM operation_outputs WHERE operation_id = ? AND kind = 'replacement' ORDER BY ordinal, telegram_message_id").all(operationId) as Array<{ chat_id: number; telegram_message_id: number; ordinal: number; step_key: string | null; source_member_key: string | null }>;
+    return rows.map((row) => ({ chatId: row.chat_id, messageId: row.telegram_message_id as MessageId, ordinal: row.ordinal, ...(row.step_key === null ? {} : { stepKey: row.step_key }), ...(row.source_member_key === null ? {} : { sourceMemberKey: row.source_member_key }) }));
+  };
 
   const persistPublicationContract = (operationId: string, contract: PublicationContract, now: number): void => database.transaction(() => {
     const validated = validatePublicationContract(contract);
@@ -738,31 +883,54 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   const markReplacementOutputsRecorded = (guard: OperationGuard, now: number): void => database.transaction(() => {
     const operation = guardRow(guard);
     if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || operation.phase !== "replacement_pending") throw conflict("Renewal replacement guard conflict");
-    const expected = database.raw.query("SELECT expected_source_count FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null } | null;
+    const contractRow = database.raw.query("SELECT expected_source_count, plan_json, progress_json FROM operations WHERE id = ?").get(guard.operationId) as { expected_source_count: number | null; plan_json: string | null; progress_json: string | null } | null;
     const actual = operationOutputIds(guard.operationId, "replacement").length;
-    if (!expected || expected.expected_source_count !== actual) throw new Error("Renewal output count does not match contract");
+    if (!contractRow?.plan_json || !contractRow.plan_json.includes('"kind":"prepared_renewal"')) {
+      if (!contractRow || contractRow.expected_source_count !== actual) throw new Error("Renewal output count does not match contract");
+    } else {
+      const contract = validatePreparedRenewalContractV2(JSON.parse(contractRow.plan_json) as unknown);
+      const progress = contractRow.progress_json ? validateRenewalExecutionProgress(JSON.parse(contractRow.progress_json) as unknown) : undefined;
+      if (!progress || progress.members.some((member) => member.outcome === "pending")) throw new Error("Prepared renewal still has unresolved member steps");
+      const sent = progress.members.filter((member) => member.outcome === "sent");
+      const outputRows = replacementOutputs(guard.operationId);
+      if (actual !== sent.length || actual !== contract.expectedReplacementMessageCount - progress.members.filter((member) => member.outcome === "confirmed_missing").length
+        || sent.some((member) => member.outputIds.length !== 1 || !outputRows.some((output) => output.sourceMemberKey === member.memberKey && output.messageId === member.outputIds[0]))) {
+        throw new Error("Prepared renewal output associations do not match the complete member plan");
+      }
+    }
     setOperationState(guard.operationId, "outputs_recorded", now);
     setOperationPhase(guard.operationId, "replacement_outputs_recorded", now);
   });
 
-  const installRenewedGeneration = (guardOrItemId: OperationGuard | number, operationIdOrSnapshots: string | readonly StoredMessageSnapshot[], snapshotsOrNow: readonly StoredMessageSnapshot[] | number, maybeNow?: number, maybeSourceCreatedAt?: number): number => database.transaction(() => {
-    const guard: OperationGuard = typeof guardOrItemId === "number"
+  const installRenewedGeneration = (guardOrItemId: OperationGuard | RenewalExecutionGuard | number, operationIdOrSnapshots: string | readonly StoredMessageSnapshot[] | readonly PreparedMember[], snapshotsOrNow: readonly StoredMessageSnapshot[] | readonly PreparedMember[] | number, maybeNow?: number, maybeSourceCreatedAt?: number): number => database.transaction(() => {
+    const guard: OperationGuard | RenewalExecutionGuard = typeof guardOrItemId === "number"
       ? (() => {
         const item = findItemById(guardOrItemId);
         if (!item || typeof operationIdOrSnapshots !== "string") throw new Error("Renewal operation lease is no longer owned");
         return { operationId: operationIdOrSnapshots, itemId: guardOrItemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration };
       })()
       : guardOrItemId;
-    const replacementSnapshots = (typeof guardOrItemId === "number" ? snapshotsOrNow : operationIdOrSnapshots) as readonly StoredMessageSnapshot[];
+    const replacementValues = (typeof guardOrItemId === "number" ? snapshotsOrNow : operationIdOrSnapshots) as readonly (StoredMessageSnapshot | PreparedMember)[];
+    const preparedMembers = replacementValues.length > 0 && "snapshot" in replacementValues[0]!;
     const now = (typeof guardOrItemId === "number" ? maybeNow : snapshotsOrNow) as number;
     const sourceCreatedAt = (typeof guardOrItemId === "number" ? maybeSourceCreatedAt : maybeNow) ?? now;
     const operation = guardRow(guard);
     if (!operation || operation.type !== "renew" || operation.maintenanceStatus !== "renewing" || !["replacement_outputs_recorded", "claimed"].includes(operation.phase)) throw conflict("Renewal generation guard conflict");
     const item = findItemById(guard.itemId);
-    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Renewal generation CAS conflict");
+    const effectiveVersion = "expectedContentVersion" in guard ? guard.expectedContentVersion : guard.capturedContentVersion;
+    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== effectiveVersion || item.sourceGeneration !== guard.capturedSourceGeneration) throw conflict("Renewal generation CAS conflict");
     const nextGeneration = item.sourceGeneration + 1;
-    for (const snapshot of replacementSnapshots) insertSnapshot(item.id, nextGeneration, snapshot);
-    const result = database.raw.query("UPDATE queue_items SET source_generation = ?, physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending' WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?").run(nextGeneration, sourceCreatedAt, now, item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration);
+    if (preparedMembers) {
+      for (const member of replacementValues as readonly PreparedMember[]) insertPreparedMember(item.id, nextGeneration, member);
+    } else {
+      for (const snapshot of replacementValues as readonly StoredMessageSnapshot[]) insertSnapshot(item.id, nextGeneration, snapshot);
+    }
+    const progress = renewalProgress(guard.operationId);
+    const nextPreparationState = item.representationKind === "prepared" && item.attribution?.ownership === "bot" && (item.nicknameRevisionApplied ?? 0) !== (item.nicknameRevisionWanted ?? 0) ? "refresh_pending" : item.preparationState ?? "unprepared";
+    const firstMemberId = preparedMembers ? (replacementValues[0] as PreparedMember | undefined)?.messageId : (replacementValues[0] as StoredMessageSnapshot | undefined)?.messageId;
+    const result = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = COALESCE(?, first_message_id), physical_created_at = ?, last_renewed_at = ?, maintenance_status = 'renewal_cleanup_pending', preparation_state = ?
+      WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing' AND content_version = ? AND source_generation = ?`)
+      .run(nextGeneration, firstMemberId ?? null, sourceCreatedAt, now, nextPreparationState, item.id, guard.operationId, effectiveVersion, guard.capturedSourceGeneration);
     if (Number(result.changes) !== 1) throw conflict("Renewal generation install lost its lease");
     setOperationState(guard.operationId, "cleanup_pending", now);
     setOperationPhase(guard.operationId, "generation_installed", now);
@@ -773,7 +941,9 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const operation = database.raw.query("SELECT type, return_item_status FROM operations WHERE id = ? AND item_id = ?").get(operationId, itemId) as { type: string; return_item_status: QueueItemStatus | null } | null;
     if (!operation) throw new Error("Operation not found for retry");
     if (operation.type === "renew") {
-      const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = ?, last_error_code = ?, last_error = ? WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing'").run(retryNotBefore, errorCode, errorText, itemId, operationId);
+      const result = database.raw.query(`UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = ?, last_error_code = ?, last_error = ?,
+        preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' AND nickname_revision_applied <> nickname_revision_wanted THEN 'refresh_pending' ELSE preparation_state END
+        WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewing'`).run(retryNotBefore, errorCode, errorText, itemId, operationId);
       if (Number(result.changes) !== 1) throw new Error("Renewal retry guard conflict");
     } else {
       const result = database.raw.query("UPDATE queue_items SET status = 'queued', retry_not_before = ?, last_error_code = ?, last_error = ?, claimed_operation_id = NULL, claimed_at = NULL WHERE id = ? AND claimed_operation_id = ? AND status = 'publishing'").run(retryNotBefore, errorCode, errorText, itemId, operationId);
@@ -790,16 +960,19 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     setOperationPhase(operationId, "completed", now);
   });
 
-  const completeRenewalWithOrphans = (guard: OperationGuard, orphanIds: readonly number[], now: number, reason = "old_generation_cleanup_failed"): void => database.transaction(() => {
+  const completeRenewalWithOrphans = (guard: RenewalExecutionGuard | OperationGuard, orphanIds: readonly number[], now: number, reason = "old_generation_cleanup_failed"): void => database.transaction(() => {
     const operation = guardRow(guard);
     if (!operation || operation.type !== "renew" || !["generation_installed", "old_source_cleanup_pending"].includes(operation.phase)) throw new Error("Renewal cleanup guard conflict");
     const item = findItemById(guard.itemId);
-    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== guard.capturedContentVersion || item.sourceGeneration !== guard.capturedSourceGeneration + 1) throw new Error("Renewal completion CAS conflict");
+    const effectiveVersion = "expectedContentVersion" in guard ? guard.expectedContentVersion : guard.capturedContentVersion;
+    if (!item || item.maintenanceOperationId !== guard.operationId || item.contentVersion !== effectiveVersion || item.sourceGeneration !== guard.capturedSourceGeneration + 1) throw new Error("Renewal completion CAS conflict");
     const terminal = reason === "telegram_age_limit";
     const nextAttemptAt = reason === "permission_denied" ? now + 6 * 60 * 60_000 : now;
     const orphanInsert = database.raw.query("INSERT OR IGNORE INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, resolved_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     for (const id of orphanIds) orphanInsert.run(item.id, guard.capturedSourceGeneration, item.queueChatId, id, reason, now, now, null, terminal ? 1 : 0, terminal ? null : nextAttemptAt, terminal ? reason : null);
-    const result = database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewal_cleanup_pending' AND content_version = ? AND source_generation = ?").run(item.id, guard.operationId, guard.capturedContentVersion, guard.capturedSourceGeneration + 1);
+    const result = database.raw.query(`UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = NULL,
+      preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' AND nickname_revision_applied <> nickname_revision_wanted THEN 'refresh_pending' ELSE preparation_state END
+      WHERE id = ? AND maintenance_operation_id = ? AND maintenance_status = 'renewal_cleanup_pending' AND content_version = ? AND source_generation = ?`).run(item.id, guard.operationId, effectiveVersion, guard.capturedSourceGeneration + 1);
     if (Number(result.changes) !== 1) throw new Error("Renewal maintenance cleanup guard conflict");
     setOperationState(guard.operationId, "done", now, orphanIds.length > 0 ? reason : undefined);
     setOperationPhase(guard.operationId, "completed", now, orphanIds.length > 0 ? reason : undefined);
@@ -1067,9 +1240,14 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     operationForItem,
     operationOutputIds,
     operationSourceIds,
+    replacementOutputs,
+    renewalProgress,
     recoverExpiredOperations,
     recordOutput,
     recordReplacementOutput,
+    persistPreparedRenewalContract,
+    markRenewalMemberSent,
+    markRenewalMemberMissing,
     persistPublicationContract,
     persistPreparedPublicationContract,
     beginPublicationTransfer,

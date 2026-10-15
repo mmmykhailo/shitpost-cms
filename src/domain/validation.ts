@@ -1,4 +1,4 @@
-import type { AttributionDescriptor, ContentType, DeliveryMode, ExecutionProgress, MemberRole, MessageEntity, PreparationContractV1, PreparedMember, PreparedPublicationContractV2, PublicationContract, SemanticOrigin, StoredMessageSnapshot, TransferStep } from "../types";
+import type { AttributionDescriptor, ContentType, DeliveryMode, ExecutionProgress, MemberRole, MessageEntity, PreparationContractV1, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot, TransferStep } from "../types";
 import { asChatId, asMessageId, asUserId, type MessageId } from "../types";
 
 export class StoredDataValidationError extends Error {
@@ -328,6 +328,60 @@ export const validatePreparedPublicationContractV2 = (value: unknown): PreparedP
   const memberCount = steps.reduce((count, step) => count + step.members.length, 0);
   if (capturedContentVersion < 1 || capturedSourceGeneration < 0 || expectedOutputMessageCount < 1 || expectedOutputMessageCount !== memberCount) throw new StoredDataValidationError("Prepared publication counts or versions are inconsistent");
   return { version: 2, kind: "prepared_delivery", capturedContentVersion, capturedSourceGeneration, sourceIds, steps, expectedOutputMessageCount };
+};
+
+export const validatePreparedRenewalContractV2 = (value: unknown): PreparedRenewalContractV2 => {
+  const candidate = record(value);
+  if (candidate.version !== 2 || candidate.kind !== "prepared_renewal") throw new StoredDataValidationError("Prepared renewal contract version or kind is invalid");
+  if (!logicalStatuses.has(candidate.capturedLogicalStatus as PublicationContract["capturedLogicalStatus"])) throw new StoredDataValidationError("Prepared renewal logical status is invalid");
+  if (!Array.isArray(candidate.sourceIds) || !Array.isArray(candidate.steps) || candidate.steps.length === 0) throw new StoredDataValidationError("Prepared renewal contract requires source IDs and steps");
+  const sourceIds = candidate.sourceIds.map((id, index) => {
+    const parsed = integer(id, `renewal.sourceIds[${index}]`);
+    if (parsed <= 0) throw new StoredDataValidationError("Prepared renewal source IDs must be positive");
+    return asMessageId(parsed);
+  });
+  const steps = candidate.steps.map((step, index) => validateTransferStep(step, `renewal.steps[${index}]`));
+  const memberIds = steps.flatMap((step) => step.members.map((member) => member.messageId));
+  const memberKeys = steps.flatMap((step) => step.members.map((member) => member.memberKey));
+  const stepKeys = steps.map((step) => step.stepKey);
+  const capturedContentVersion = integer(candidate.capturedContentVersion, "renewal.capturedContentVersion");
+  const capturedSourceGeneration = integer(candidate.capturedSourceGeneration, "renewal.capturedSourceGeneration");
+  const expectedReplacementMessageCount = integer(candidate.expectedReplacementMessageCount, "renewal.expectedReplacementMessageCount");
+  if (capturedContentVersion < 1 || capturedSourceGeneration < 0 || expectedReplacementMessageCount !== memberIds.length || sourceIds.length !== memberIds.length) throw new StoredDataValidationError("Prepared renewal counts or versions are inconsistent");
+  if (new Set(memberKeys).size !== memberKeys.length || new Set(stepKeys).size !== stepKeys.length || sourceIds.some((id, index) => id !== memberIds[index])) throw new StoredDataValidationError("Prepared renewal member ordering or associations are inconsistent");
+  return { version: 2, kind: "prepared_renewal", capturedLogicalStatus: candidate.capturedLogicalStatus as PublicationContract["capturedLogicalStatus"], capturedContentVersion, capturedSourceGeneration, sourceIds, steps, expectedReplacementMessageCount };
+};
+
+export const validateRenewalExecutionProgress = (value: unknown): RenewalExecutionProgress => {
+  const candidate = record(value);
+  if (candidate.version !== 1 || !Array.isArray(candidate.members)) throw new StoredDataValidationError("Renewal progress version or members are invalid");
+  const effectiveContentVersion = integer(candidate.effectiveContentVersion, "renewal.progress.effectiveContentVersion");
+  if (effectiveContentVersion < 1) throw new StoredDataValidationError("Renewal progress content version must be positive");
+  const keys = new Set<string>();
+  const members = candidate.members.map((value, index) => {
+    const member = record(value);
+    const memberKey = optionalString(member.memberKey, `renewal.progress.members[${index}].memberKey`);
+    if (!memberKey || keys.has(memberKey) || !["pending", "sent", "confirmed_missing"].includes(String(member.outcome)) || !Array.isArray(member.outputIds)) throw new StoredDataValidationError(`Renewal progress member ${index} is invalid`);
+    keys.add(memberKey);
+    const outputIds = member.outputIds.map((id, outputIndex) => {
+      const parsed = integer(id, `renewal.progress.members[${index}].outputIds[${outputIndex}]`);
+      if (parsed <= 0) throw new StoredDataValidationError("Renewal progress output IDs must be positive");
+      return asMessageId(parsed);
+    });
+    const outcome = member.outcome as RenewalExecutionProgress["members"][number]["outcome"];
+    if ((outcome === "sent") !== (outputIds.length === 1) || (outcome === "confirmed_missing" && member.missingEvidence === undefined) || (outcome !== "confirmed_missing" && member.missingEvidence !== undefined)) throw new StoredDataValidationError(`Renewal progress outcome for ${memberKey} is inconsistent`);
+    const result: RenewalExecutionProgress["members"][number] = { memberKey, outcome, outputIds };
+    if (member.missingEvidence !== undefined) {
+      const evidence = record(member.missingEvidence);
+      const method = optionalString(evidence.method, "renewal.progress.missingEvidence.method");
+      const description = optionalString(evidence.description, "renewal.progress.missingEvidence.description");
+      const code = evidence.code === undefined ? undefined : integer(evidence.code, "renewal.progress.missingEvidence.code");
+      if (!method || description === undefined) throw new StoredDataValidationError("Renewal missing-source evidence is incomplete");
+      result.missingEvidence = { method, description, ...(code === undefined ? {} : { code }) };
+    }
+    return result;
+  });
+  return { version: 1, effectiveContentVersion, members };
 };
 
 export const validateExecutionProgress = (value: unknown): ExecutionProgress => {

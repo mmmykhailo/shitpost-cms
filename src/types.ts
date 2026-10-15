@@ -137,6 +137,30 @@ export type PreparedPublicationContractV2 = {
   expectedOutputMessageCount: number;
 };
 
+export type PreparedRenewalContractV2 = {
+  version: 2;
+  kind: "prepared_renewal";
+  capturedLogicalStatus: QueueItemStatus;
+  capturedContentVersion: number;
+  capturedSourceGeneration: number;
+  sourceIds: readonly MessageId[];
+  steps: readonly TransferStep[];
+  expectedReplacementMessageCount: number;
+};
+
+export type RenewalExecutionProgress = {
+  version: 1;
+  effectiveContentVersion: number;
+  members: readonly {
+    memberKey: string;
+    outcome: "pending" | "sent" | "confirmed_missing";
+    outputIds: readonly MessageId[];
+    missingEvidence?: { method: string; code?: number; description: string };
+  }[];
+};
+
+export type RenewalExecutionGuard = OperationGuard & { expectedContentVersion: number };
+
 export type ExecutionProgress = {
   version: 1;
   effectiveContentVersion: number;

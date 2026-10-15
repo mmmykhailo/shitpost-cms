@@ -16,17 +16,17 @@ afterEach(() => {
   }
 });
 
-describe("schema migration 4", () => {
+describe("schema migration 5", () => {
   test("creates the durable operation, preparation, hidden-author, quarantine, recovery, and schedule structures", () => {
     const directory = mkdtempSync(join(tmpdir(), "queuebot-migration-"));
     const database = createDatabase(join(directory, "bot.sqlite"));
     resources.push({ directory, close: database.close });
 
-    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(4);
+    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(5);
     const columns = (table: string): string[] => (database.raw.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
     expect(columns("queue_items")).toEqual(expect.arrayContaining(["maintenance_status", "maintenance_operation_id", "maintenance_retry_not_before", "preparation_state", "representation_kind", "delivery_mode", "attribution_json"]));
     expect(columns("operations")).toEqual(expect.arrayContaining(["boot_id", "phase", "return_item_status", "expected_source_count", "expected_output_count", "source_ids_json", "plan_json"]));
-    expect(columns("operation_outputs")).toContain("role");
+    expect(columns("operation_outputs")).toEqual(expect.arrayContaining(["role", "step_key", "source_member_key"]));
     expect(columns("queue_messages")).toEqual(expect.arrayContaining(["member_key", "member_role", "member_delivery_mode", "album_key", "removed_at"]));
     expect(columns("pending_queue_updates")).toEqual(expect.arrayContaining(["update_kind", "telegram_update_id", "captured_delivery_mode", "policy_captured_at"]));
     expect(columns("schedule_slots")).toContain("effective_at");
