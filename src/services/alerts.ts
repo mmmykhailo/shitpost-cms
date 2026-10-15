@@ -1,4 +1,5 @@
 import type { AlertRepository, AlertSeverity } from "../db/alert-repository";
+import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import type { Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
 import type { ChatId } from "../types";
@@ -23,7 +24,16 @@ export const resolutionTextForDedupeKey = (dedupeKey: string): string => {
   }
 };
 
-export const createAlertService = (input: { alert: AlertRepository; gateway: TelegramGateway; adminChatId: ChatId; logger: Logger }) => {
+type StoredAlertAction = { text: string; action: string; payload: unknown; itemVersion?: number };
+type StoredOnChangePayload = { text: string; actions?: StoredAlertAction[]; [key: string]: unknown };
+
+export const createAlertService = (input: {
+  alert: AlertRepository;
+  gateway: TelegramGateway;
+  adminChatId: ChatId;
+  logger: Logger;
+  createCallbackToken?: (action: string, payload: unknown, now: number, itemVersion?: number) => string;
+}) => {
   const raise = async (dedupeKey: string, severity: AlertSeverity, text: string, now: number): Promise<void> => {
     const raised = input.alert.raise(dedupeKey, severity, now);
     if (!raised.shouldSend) return;
@@ -41,11 +51,50 @@ export const createAlertService = (input: { alert: AlertRepository; gateway: Tel
     }
   };
 
+  const renderActions = (payload: StoredOnChangePayload, now: number): InlineKeyboardMarkup | undefined => {
+    if (!input.createCallbackToken || !payload.actions?.length) return undefined;
+    return { inline_keyboard: payload.actions.map((action) => [{
+      text: action.text,
+      callback_data: `v1:${input.createCallbackToken!(action.action, action.payload, now, action.itemVersion)}`,
+    }]) };
+  };
+
+  const sendOnChange = async (dedupeKey: string, severity: AlertSeverity, fingerprint: string, rawPayload: unknown, now: number): Promise<void> => {
+    const payload = rawPayload && typeof rawPayload === "object" && "text" in rawPayload && typeof (rawPayload as { text?: unknown }).text === "string"
+      ? rawPayload as StoredOnChangePayload
+      : { text: String(rawPayload) };
+    try {
+      const replyMarkup = renderActions(payload, now);
+      await input.gateway.sendAdminMessage({ chatId: input.adminChatId, text: `[${severity}] ${payload.text}`, ...(replyMarkup === undefined ? {} : { replyMarkup }) });
+    } catch (error) {
+      try { input.alert.markOnChangeDeliveryFailed(dedupeKey, fingerprint, now); }
+      catch (markError) { input.logger.error("admin_alert_retry_state_failed", { dedupeKey, error: markError instanceof Error ? markError.message : "unknown" }); }
+      input.logger.error("admin_alert_on_change_send_failed", { dedupeKey, error: error instanceof Error ? error.message : "unknown" });
+      return;
+    }
+    try {
+      if (!input.alert.markOnChangeSent(dedupeKey, fingerprint, now)) input.logger.warn("admin_alert_condition_changed_during_delivery", { dedupeKey });
+    } catch (error) {
+      input.logger.error("admin_alert_mark_sent_failed", { dedupeKey, error: error instanceof Error ? error.message : "unknown" });
+    }
+  };
+
+  const raiseOnChange = async (dedupeKey: string, severity: AlertSeverity, fingerprint: string, payload: unknown, now: number): Promise<void> => {
+    const raised = input.alert.raiseOnChange(dedupeKey, severity, fingerprint, payload, now);
+    if (raised.shouldSend) await sendOnChange(dedupeKey, severity, fingerprint, payload, now);
+  };
+
+  const retryPendingOnChange = async (now: number): Promise<number> => {
+    const pending = input.alert.pendingOnChange(now);
+    for (const entry of pending) await sendOnChange(entry.dedupeKey, entry.severity, entry.fingerprint, entry.payload, now);
+    return pending.length;
+  };
+
   const resolve = async (dedupeKey: string, text: string, now: number): Promise<void> => {
     if (!input.alert.resolve(dedupeKey, now)) return;
     try { await input.gateway.sendAdminMessage({ chatId: input.adminChatId, text: `Resolved: ${text}` }); }
     catch (error) { input.logger.error("admin_alert_resolution_send_failed", { dedupeKey, error: error instanceof Error ? error.message : "unknown" }); }
   };
 
-  return { raise, resolve, active: input.alert.active, counts: input.alert.counts };
+  return { raise, raiseOnChange, retryPendingOnChange, resolve, active: input.alert.active, counts: input.alert.counts };
 };

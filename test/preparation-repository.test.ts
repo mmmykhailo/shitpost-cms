@@ -74,6 +74,23 @@ describe("preparation repository", () => {
     expect(queue.currentSourceIds(1)).toEqual([asMessageId(702)]);
   });
 
+  test("installs a durable complete result after restart without resending", () => {
+    const { database, queue, preparation } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(74) }), 1_000, "copy", 900);
+    const claim = preparation.claimNextPreparation(2_000, "boot-a")!;
+    const members = queue.getCurrentMembers(1);
+    preparation.persistContract(claim.operationId, contractFor(1, claim.guard.capturedContentVersion, claim.guard.capturedSourceGeneration, members), 2_001);
+    preparation.setPhase(claim.operationId, "transfer_pending", 2_002);
+    const result = resultFor(members[0]!, 704);
+    preparation.recordOutput(claim.operationId, { chatId: -100, messageId: 704, ordinal: 0, outputKey: "prep-1:704", stepKey: "content", sourceMemberKey: members[0]!.memberKey, role: "content", snapshot: result.members[0]!.snapshot }, 2_003);
+    preparation.recordCompleteResult(claim.operationId, result, 2_004);
+
+    expect(preparation.recoverExpiredOperations(3_000, "boot-b")).toEqual({ requeued: 0, uncertain: 0, cleanupPending: 1 });
+    expect(queue.currentSourceIds(1)).toEqual([asMessageId(704)]);
+    expect(database.raw.query("SELECT preparation_state, representation_kind, source_generation FROM queue_items WHERE id = 1").get()).toEqual({ preparation_state: "ready", representation_kind: "prepared", source_generation: 1 });
+    expect(preparation.listCleanupPending()).toEqual([{ operationId: "prep-1", itemId: 1, sourceIds: [asMessageId(74)] }]);
+  });
+
   test("rejects an output ID already owned by another operation", () => {
     const { database, queue, preparation } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(73) }), 1_000);

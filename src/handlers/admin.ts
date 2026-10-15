@@ -511,6 +511,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     switch (resolved.action) {
       case "dashboard": return sendDashboard(ctx);
       case "queue": return sendQueue(ctx, typeof payload.offset === "number" ? payload.offset : 0);
+      case "queue_item": {
+        if (itemId === undefined) return sendQueue(ctx);
+        const active = deps.queue.listActive(10_000);
+        const index = active.findIndex((item) => item.id === itemId);
+        return sendQueue(ctx, index < 0 ? 0 : Math.floor(index / 10) * 10);
+      }
       case "schedule": return sendSchedule(ctx);
       case "whitelist": return sendWhitelist(ctx);
       case "authors": return sendAuthors(ctx);

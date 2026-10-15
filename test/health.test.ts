@@ -6,6 +6,7 @@ import { createAlertRepository } from "../src/db/alert-repository";
 import { createDatabase, type AppDatabase } from "../src/db/database";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
+import { createPreparationRepository } from "../src/db/preparation-repository";
 import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { createHealthService } from "../src/services/health";
 import { asChatId, asMessageId } from "../src/types";
@@ -34,6 +35,12 @@ describe("health service", () => {
       database.raw.query("INSERT INTO operations (id, type, item_id, state, captured_content_version, captured_source_generation, created_at, updated_at, phase) VALUES (?, 'publish', ?, 'done', 1, 0, ?, ?, 'completed')").run("health-operation", item.id, now - 2_000, now - 1_000);
       database.raw.query("INSERT INTO orphaned_sources (item_id, source_generation, chat_id, telegram_message_id, reason, first_attempt_at, last_attempt_at, attempt_count, next_attempt_at, terminal_reason) VALUES (?, 0, -100, 99, 'age_limit', ?, ?, 1, NULL, 'telegram_age_limit')").run(item.id, now - 20_000, now - 10_000);
       alerts.raise("health-alert", "critical", now - 500);
+      database.raw.query("UPDATE queue_items SET preparation_state = 'failed' WHERE id = ?").run(item.id);
+      const prepItem = queue.observeQueueSnapshot(snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(12) }), now - 50).item;
+      const preparation = createPreparationRepository(database);
+      const prepClaim = preparation.claimNextPreparation(now - 20, "health-prep");
+      expect(prepClaim?.itemId).toBe(prepItem.id);
+      preparation.markUncertain(prepClaim!.operationId, "ambiguous_send_result", "unknown output", now - 10);
 
       const service = createHealthService({
         database,
@@ -50,13 +57,13 @@ describe("health service", () => {
         rights: () => ({ queue: { status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: false }, target: { status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true } }),
       });
       const snapshot = service.snapshot();
-      expect(snapshot).toMatchObject({ databaseOk: true, leaseOwned: true, bootId: null, uptimeMs: 20_000, queueHead: item.id, lastSchedulerScanAt: now - 100, activeOperations: 0, uncertainOperations: 0, lastOperation: { type: "publish", phase: "completed", updatedAt: now - 1_000 } });
+      expect(snapshot).toMatchObject({ databaseOk: true, leaseOwned: true, bootId: null, uptimeMs: 20_000, queueHead: item.id, lastSchedulerScanAt: now - 100, activeOperations: 1, uncertainOperations: 1, lastOperation: { type: "publish", phase: "completed", updatedAt: now - 1_000 } });
       expect(snapshot.queueCounts.queued).toBe(1);
       expect(snapshot.pendingUpdates.ingested).toBe(1);
       expect(snapshot.orphanCounts.terminal).toBe(1);
       expect(snapshot.alerts.critical).toBe(1);
       expect(snapshot.nextSlotAt).toBeDefined();
-      expect(snapshot.renewalCapacity.totalMessages).toBe(1);
+      expect(snapshot.renewalCapacity.totalMessages).toBe(2);
       expect(snapshot.rights?.target.canEditMessages).toBe(true);
     } finally {
       database.close();

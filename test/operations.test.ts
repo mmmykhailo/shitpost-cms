@@ -50,6 +50,67 @@ describe("operations safety net", () => {
     expect(messages).toHaveLength(3);
   });
 
+  test("sends on-change issue alerts once per fingerprint and again after a material change or recurrence", async () => {
+    const database = openDatabase("queuebot-alert-on-change");
+    const messages: string[] = [];
+    const gateway = {
+      getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
+      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
+      sendAdminMessage: async ({ text }: { text: string }) => { messages.push(text); return asMessageId(messages.length); },
+    } satisfies TelegramGateway;
+    const service = createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") });
+    const payload = { text: "Queue item #1 needs review", actions: [{ text: "Review", action: "queue_item", payload: { itemId: 1 } }] };
+
+    await service.raiseOnChange("item_issue:1", "normal", "reason-a", { ...payload, operationId: "retry-1" }, 1_000);
+    await service.raiseOnChange("item_issue:1", "normal", "reason-a", { ...payload, operationId: "retry-2" }, 86_400_000);
+    expect(messages).toHaveLength(1);
+    await service.raiseOnChange("item_issue:1", "normal", "reason-b", { ...payload, text: "Queue item #1 needs an edit" }, 86_401_000);
+    expect(messages).toHaveLength(2);
+    await service.resolve("item_issue:1", "Queue item #1 was fixed", 86_402_000);
+    await service.raiseOnChange("item_issue:1", "normal", "reason-a", payload, 86_403_000);
+    expect(messages).toHaveLength(4);
+  });
+
+  test("retries failed on-change delivery with durable backoff and fresh single-use buttons", async () => {
+    const database = openDatabase("queuebot-alert-on-change-retry");
+    const sent: Array<{ text: string; markup?: unknown }> = [];
+    let fail = true;
+    let tokenNumber = 0;
+    const gateway = {
+      sendAdminMessage: async ({ text, replyMarkup }: { text: string; replyMarkup?: unknown }) => {
+        sent.push({ text, markup: replyMarkup });
+        if (fail) throw new Error("temporary Telegram failure");
+        return asMessageId(sent.length);
+      },
+    } as unknown as TelegramGateway;
+    const service = createAlertService({
+      alert: createAlertRepository(database),
+      gateway,
+      adminChatId: asChatId(99),
+      logger: createLogger("error"),
+      createCallbackToken: () => `token-${++tokenNumber}`,
+    });
+    const payload = { text: "Review item #7", actions: [{ text: "Review", action: "queue_item", payload: { itemId: 7 }, itemVersion: 3 }] };
+
+    await service.raiseOnChange("item_issue:7", "immediate", "stable-fingerprint", payload, 1_000);
+    const pendingAlert = createAlertRepository(database).find("item_issue:7");
+    expect(pendingAlert?.sentFingerprint).toBeUndefined();
+    expect(pendingAlert).toMatchObject({ deliveryAttempts: 1, deliveryRetryNotBefore: 31_000 });
+    expect(await createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") }).retryPendingOnChange(30_999)).toBe(0);
+
+    fail = false;
+    const restarted = createAlertService({
+      alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error"),
+      createCallbackToken: () => `token-${++tokenNumber}`,
+    });
+    expect(await restarted.retryPendingOnChange(31_000)).toBe(1);
+    const markup = sent[1]?.markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+    expect(markup.inline_keyboard[0]?.[0]?.callback_data).toBe("v1:token-2");
+    expect(createAlertRepository(database).find("item_issue:7")).toMatchObject({ sentFingerprint: "stable-fingerprint", deliveryAttempts: 0 });
+    await restarted.raiseOnChange("item_issue:7", "immediate", "stable-fingerprint", { ...payload, operationId: "new-retry-id" }, 86_400_000);
+    expect(sent).toHaveLength(2);
+  });
+
   test("labels alert resolutions with the exact publication item", async () => {
     const database = openDatabase("queuebot-alert-labels");
     const messages: string[] = [];

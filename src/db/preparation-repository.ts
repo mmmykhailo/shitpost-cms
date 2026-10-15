@@ -133,9 +133,9 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     if (Number(changed.changes) !== 1) throw conflict("Preparation completion guard conflict");
   });
 
-  const installPreparedGeneration = (operationId: string, now: number): { itemId: number; oldSourceIds: MessageId[]; preparationState: string } => database.transaction(() => {
-    const row = operation(operationId);
-    if (!row || row.phase !== "result_complete" || !row.result_json) throw conflict("Preparation result is not complete");
+  const installPreparedGenerationTx = (row: PreparationRow, now: number): { itemId: number; oldSourceIds: MessageId[]; preparationState: string } => {
+    const operationId = row.id;
+    if (row.phase !== "result_complete" || !row.result_json) throw conflict("Preparation result is not complete");
     assertOwner(operationId);
     const result = JSON.parse(row.result_json) as PreparationResult;
     const members = result.members.map((member) => validatePreparedMember(member, "result.member"));
@@ -163,6 +163,12 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const oldSourceIds = JSON.parse(row.source_ids_json) as MessageId[];
     database.raw.query("UPDATE queue_preparation_operations SET state = 'cleanup_pending', phase = 'source_cleanup_pending', target_source_generation = ?, updated_at = ? WHERE id = ?").run(generation, now, operationId);
     return { itemId: row.item_id, oldSourceIds, preparationState: nextPreparationState };
+  };
+
+  const installPreparedGeneration = (operationId: string, now: number): { itemId: number; oldSourceIds: MessageId[]; preparationState: string } => database.transaction(() => {
+    const row = operation(operationId);
+    if (!row) throw conflict("Preparation operation no longer exists");
+    return installPreparedGenerationTx(row, now);
   });
 
   const completeInPlacePreparation = (guard: PreparedExecutionGuard, preparedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number): void => database.transaction(() => {
@@ -261,6 +267,20 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
         database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL WHERE id = ? AND preparation_operation_id = ?").run(state, row.item_id, row.id);
         database.raw.query("UPDATE queue_preparation_operations SET state = 'failed', phase = 'failed', error_code = 'restart_before_mutation', updated_at = ? WHERE id = ?").run(now, row.id);
         requeued += 1;
+      } else if (row.phase === "result_complete") {
+        database.raw.exec("SAVEPOINT preparation_recovery_install");
+        try {
+          installPreparedGenerationTx(row, now);
+          database.raw.exec("RELEASE SAVEPOINT preparation_recovery_install");
+          cleanupPending += 1;
+        } catch (error) {
+          database.raw.exec("ROLLBACK TO SAVEPOINT preparation_recovery_install");
+          database.raw.exec("RELEASE SAVEPOINT preparation_recovery_install");
+          const description = error instanceof Error ? error.message : "Prepared result failed restart validation";
+          database.raw.query("UPDATE queue_items SET status = 'needs_review', preparation_state = 'uncertain', preparation_operation_id = NULL, last_error_code = 'preparation_restart_result_invalid', last_error = ? WHERE id = ? AND preparation_operation_id = ?").run(description, row.item_id, row.id);
+          database.raw.query("UPDATE queue_preparation_operations SET state = 'uncertain', phase = 'uncertain', error_code = 'preparation_restart_result_invalid', error_json = ?, updated_at = ? WHERE id = ?").run(asJson({ description }), now, row.id);
+          uncertain += 1;
+        }
       } else if (row.phase === "generation_installed" || row.phase === "source_cleanup_pending") {
         database.raw.query("UPDATE queue_preparation_operations SET state = 'cleanup_pending', boot_id = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?").run(bootId, now + leaseMs, now, row.id);
         cleanupPending += 1;
@@ -303,7 +323,7 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     if (!hasOutputs && cleanupConfirmed) throw conflict("No tracked preparation outputs exist for cleanup confirmation");
     const next = retry ? (row.kind === "refresh" ? "refresh_pending" : "unprepared") : "failed";
     const status = retry ? "queued" : "needs_review";
-    const changed = database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL, status = ?, retry_not_before = NULL WHERE id = ? AND preparation_operation_id IS NULL AND status = 'needs_review' AND preparation_state = 'uncertain'").run(next, status, row.item_id);
+    const changed = database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL, status = ?, retry_not_before = NULL, content_version = content_version + 1 WHERE id = ? AND preparation_operation_id IS NULL AND status = 'needs_review' AND preparation_state = 'uncertain'").run(next, status, row.item_id);
     if (Number(changed.changes) !== 1) throw conflict("Preparation item changed before uncertainty resolution");
     database.raw.query("UPDATE queue_preparation_operations SET state = ?, phase = ?, error_code = ?, updated_at = ? WHERE id = ? AND state = 'uncertain'").run(retry ? "failed" : "done", retry ? "failed" : "completed", retry ? "admin_retry" : "admin_discard", now, operationId);
     database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, operation_id, metadata_json, created_at) VALUES ('preparation_uncertainty_resolved', 'admin', ?, ?, ?, ?)")

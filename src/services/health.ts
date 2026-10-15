@@ -51,6 +51,7 @@ export const createHealthService = (input: {
     const capacity: RenewalCapacity = calculateRenewalCapacity({ now, sources, ...(cooldownUntil === undefined ? {} : { cooldownUntil }) });
     const app = input.database.raw.query("SELECT current_boot_id, created_at, last_clean_shutdown_at, last_scheduler_scan_at, last_successful_update_at FROM app_state WHERE id = 1").get() as { current_boot_id: string | null; created_at: number; last_clean_shutdown_at: number | null; last_scheduler_scan_at: number | null; last_successful_update_at: number | null };
     const operations = input.database.raw.query("SELECT COUNT(*) AS active, SUM(CASE WHEN phase = 'uncertain' THEN 1 ELSE 0 END) AS uncertain FROM operations WHERE state NOT IN ('done','failed')").get() as { active: number | null; uncertain: number | null };
+    const preparations = input.database.raw.query("SELECT COUNT(*) AS active, SUM(CASE WHEN state = 'uncertain' THEN 1 ELSE 0 END) AS uncertain FROM queue_preparation_operations WHERE state NOT IN ('done','failed')").get() as { active: number | null; uncertain: number | null };
     const lastOperation = input.database.raw.query("SELECT type, phase, updated_at FROM operations WHERE state IN ('done','failed') ORDER BY updated_at DESC LIMIT 1").get() as { type: string; phase: string; updated_at: number } | null;
     return {
       bootId: app.current_boot_id,
@@ -68,8 +69,8 @@ export const createHealthService = (input: {
       oldestPhysicalAgeMs: oldestPhysical,
       nextSlotAt: input.schedule.enabled() ? nextOccurrence(now, input.schedule.slots()) : undefined,
       lastSchedulerScanAt: app.last_scheduler_scan_at,
-      activeOperations: operations.active ?? 0,
-      uncertainOperations: operations.uncertain ?? 0,
+      activeOperations: (operations.active ?? 0) + (preparations.active ?? 0),
+      uncertainOperations: (operations.uncertain ?? 0) + (preparations.uncertain ?? 0),
       pendingUpdates: input.pending.countByState(),
       orphanCounts: input.orphan.counts(),
       renewalCapacity: capacity,

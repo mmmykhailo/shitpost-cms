@@ -73,9 +73,20 @@ export const createPublicationService = (input: {
   cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
-  onSharedFailure?: (error: NormalizedTelegramError) => Promise<void> | void;
+  onSharedFailure?: (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }) => Promise<void> | void;
+  onSharedRecovery?: () => Promise<void> | void;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
+
+  const reportSharedFailure = async (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }): Promise<void> => {
+    try { await input.onSharedFailure?.(error, context); }
+    catch (alertError) { input.logger.error("publication_shared_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
+  };
+
+  const reportSharedRecovery = async (): Promise<void> => {
+    try { await input.onSharedRecovery?.(); }
+    catch (alertError) { input.logger.error("publication_shared_recovery_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
+  };
 
   const tracked = async <T>(operationId: string, work: () => Promise<T>): Promise<T> => {
     const finish = input.operationTracker?.begin(operationId);
@@ -203,6 +214,7 @@ export const createPublicationService = (input: {
     if (error.kind === "rate_limited") {
       const retryAt = retryAtFor(error, now, input.cooldown);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
+      await reportSharedFailure(error, { itemId: claimed.item.id, operationId: claimed.operationId, retryAt });
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
     }
     if (error.kind === "ambiguous_send_result" || error.kind === "transient_network" || error.kind === "transient_server") {
@@ -271,6 +283,7 @@ export const createPublicationService = (input: {
       }
       input.queue.markPublicationOutputComplete(guard, destinationIds, input.clock.now());
       input.queue.markSourceCleanupPending(guard, input.clock.now());
+      await reportSharedRecovery();
     } catch (error) {
       const normalized = classifyTelegramError(error);
       const attributionWasSeparate = plan.kind === "copy_with_separate_byline";
@@ -355,6 +368,7 @@ export const createPublicationService = (input: {
       input.queue.recordCompleteBaseOutputs(guard, destinationIds.map((messageId, ordinal) => ({ chatId: input.targetChannelId, messageId, ordinal })), input.clock.now());
       input.queue.markPublicationOutputComplete(guard, destinationIds, input.clock.now());
       input.queue.markSourceCleanupPending(guard, input.clock.now());
+      await reportSharedRecovery();
     } catch (error) {
       const normalized = classifyTelegramError(error);
       if (normalized.kind === "source_missing" && members.length === 1 && destinationIds.length === 0) {
@@ -371,8 +385,7 @@ export const createPublicationService = (input: {
       if (normalized.kind === "permission_denied" || normalized.kind === "destination_unavailable") {
         const retryAt = input.clock.now() + 6 * 60 * 60_000;
         input.queue.setRetry(item.id, claimed.operationId, input.clock.now(), retryAt, normalized.kind, normalized.description);
-        try { await input.onSharedFailure?.(normalized); }
-        catch (alertError) { input.logger.error("publication_shared_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
+        await reportSharedFailure(normalized, { itemId: item.id, operationId: claimed.operationId, retryAt });
         return { kind: "failed", itemId: item.id, status: "shared_failure", error: normalized.description, operationId: claimed.operationId };
       }
       if (normalized.kind === "source_missing") {
