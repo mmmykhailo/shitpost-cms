@@ -2,7 +2,7 @@ import type { AppDatabase } from "./database";
 import { parseStoredMessageSnapshot } from "../domain/validation";
 import type { ChatId, DeliveryMode, MessageId, PendingQueueUpdateState, StoredMessageSnapshot } from "../types";
 
-export type PendingUpdateCapture = { updateKind?: "post" | "edit"; telegramUpdateId?: number; deliveryMode?: DeliveryMode; policyCapturedAt?: number };
+export type PendingUpdateCapture = { updateKind?: "post" | "edit"; telegramUpdateId?: number; deliveryMode?: DeliveryMode; policyCapturedAt?: number; unmatchedEditAt?: number; unmatchedEditUpdateId?: number };
 
 export type PendingQueueUpdateRecord = {
   queueChatId: ChatId;
@@ -18,6 +18,8 @@ export type PendingQueueUpdateRecord = {
   telegramUpdateId?: number;
   capturedDeliveryMode?: DeliveryMode;
   policyCapturedAt?: number;
+  unmatchedEditAt?: number;
+  unmatchedEditUpdateId?: number;
 };
 
 type PendingRow = {
@@ -34,6 +36,8 @@ type PendingRow = {
   telegram_update_id: number | null;
   captured_delivery_mode: DeliveryMode | null;
   policy_captured_at: number | null;
+  unmatched_edit_at: number | null;
+  unmatched_edit_update_id: number | null;
 };
 
 const rowToRecord = (row: PendingRow): PendingQueueUpdateRecord => {
@@ -52,6 +56,8 @@ const rowToRecord = (row: PendingRow): PendingQueueUpdateRecord => {
   if (row.telegram_update_id !== null) result.telegramUpdateId = row.telegram_update_id;
   if (row.captured_delivery_mode !== null) result.capturedDeliveryMode = row.captured_delivery_mode;
   if (row.policy_captured_at !== null) result.policyCapturedAt = row.policy_captured_at;
+  if (row.unmatched_edit_at !== null) result.unmatchedEditAt = row.unmatched_edit_at;
+  if (row.unmatched_edit_update_id !== null) result.unmatchedEditUpdateId = row.unmatched_edit_update_id;
   return result;
 };
 
@@ -64,22 +70,53 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
   };
 
   const upsert = (snapshot: StoredMessageSnapshot, receivedAt: number, processAfter = receivedAt + 2_000, capture: PendingUpdateCapture = {}): PendingQueueUpdateRecord => {
-    database.raw.query(`
-      INSERT INTO pending_queue_updates (queue_chat_id, telegram_message_id, media_group_id, snapshot_json, received_at, process_after, state, candidate_operation_id, last_error, update_kind, telegram_update_id, captured_delivery_mode, policy_captured_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?)
-      ON CONFLICT(queue_chat_id, telegram_message_id) DO UPDATE SET
-        media_group_id = excluded.media_group_id,
-        snapshot_json = excluded.snapshot_json,
-        received_at = MIN(pending_queue_updates.received_at, excluded.received_at),
-        process_after = excluded.process_after,
-        update_kind = CASE WHEN pending_queue_updates.update_kind = 'post' THEN 'post' ELSE excluded.update_kind END,
-        telegram_update_id = COALESCE(excluded.telegram_update_id, pending_queue_updates.telegram_update_id),
-        captured_delivery_mode = COALESCE(pending_queue_updates.captured_delivery_mode, excluded.captured_delivery_mode),
-        policy_captured_at = COALESCE(pending_queue_updates.policy_captured_at, excluded.policy_captured_at),
-        state = CASE WHEN pending_queue_updates.state IN ('ingested','consumed_generated','discarded') THEN 'pending' ELSE pending_queue_updates.state END,
-        last_error = NULL
-    `).run(snapshot.chatId, snapshot.messageId, snapshot.mediaGroupId ?? null, JSON.stringify(snapshot), receivedAt, processAfter, capture.updateKind ?? "post", capture.telegramUpdateId ?? snapshot.telegramUpdateId ?? null, capture.deliveryMode ?? null, capture.policyCapturedAt ?? null);
-    const result = find(snapshot.chatId, snapshot.messageId);
+    const updateKind = capture.updateKind ?? "post";
+    const updateId = capture.telegramUpdateId ?? snapshot.telegramUpdateId;
+    const markerAt = updateKind === "edit" ? (capture.unmatchedEditAt ?? receivedAt) : capture.unmatchedEditAt;
+    const markerUpdateId = updateKind === "edit" ? (capture.unmatchedEditUpdateId ?? updateId) : capture.unmatchedEditUpdateId;
+    if (!Number.isSafeInteger(receivedAt) || receivedAt < 0 || !Number.isSafeInteger(processAfter) || processAfter < 0) throw new Error("Pending update timestamps are invalid");
+    if (updateKind !== "post" && updateKind !== "edit") throw new Error("Pending update kind is invalid");
+    if (updateId !== undefined && (!Number.isSafeInteger(updateId) || updateId < 0)) throw new Error("Pending update ID is invalid");
+    if (markerAt !== undefined && (!Number.isSafeInteger(markerAt) || markerAt < 0)) throw new Error("Pending unmatched-edit timestamp is invalid");
+    if (markerUpdateId !== undefined && (!Number.isSafeInteger(markerUpdateId) || markerUpdateId < 0)) throw new Error("Pending unmatched-edit update ID is invalid");
+    const result = database.transaction(() => {
+      const previous = find(snapshot.chatId, snapshot.messageId);
+      let useIncomingSnapshot = previous === undefined;
+      if (previous) {
+        const oldUpdateId = previous.snapshot.telegramUpdateId ?? previous.telegramUpdateId;
+        const oldEditDate = previous.snapshot.editDate;
+        if (snapshot.editDate !== undefined && oldEditDate !== undefined && snapshot.editDate !== oldEditDate) useIncomingSnapshot = snapshot.editDate > oldEditDate;
+        else if (updateId !== undefined && oldUpdateId !== undefined && updateId !== oldUpdateId) useIncomingSnapshot = updateId > oldUpdateId;
+        else useIncomingSnapshot = receivedAt >= previous.receivedAt;
+      }
+      const savedSnapshot = useIncomingSnapshot ? snapshot : previous!.snapshot;
+      const keepMarker = previous?.unmatchedEditAt !== undefined && (markerAt === undefined || previous.unmatchedEditAt <= markerAt);
+      const savedMarkerAt = keepMarker ? previous!.unmatchedEditAt : markerAt;
+      const savedMarkerUpdateId = keepMarker ? previous!.unmatchedEditUpdateId : markerUpdateId;
+      database.raw.query(`
+        INSERT INTO pending_queue_updates (queue_chat_id, telegram_message_id, media_group_id, snapshot_json, received_at, process_after, state,
+          candidate_operation_id, last_error, update_kind, telegram_update_id, captured_delivery_mode, policy_captured_at, unmatched_edit_at, unmatched_edit_update_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(queue_chat_id, telegram_message_id) DO UPDATE SET
+          media_group_id = excluded.media_group_id,
+          snapshot_json = excluded.snapshot_json,
+          received_at = MIN(pending_queue_updates.received_at, excluded.received_at),
+          process_after = MAX(pending_queue_updates.process_after, excluded.process_after),
+          update_kind = CASE WHEN pending_queue_updates.update_kind = 'post' THEN 'post' ELSE excluded.update_kind END,
+          telegram_update_id = CASE WHEN excluded.telegram_update_id IS NULL THEN pending_queue_updates.telegram_update_id
+            WHEN pending_queue_updates.telegram_update_id IS NULL OR excluded.telegram_update_id > pending_queue_updates.telegram_update_id THEN excluded.telegram_update_id
+            ELSE pending_queue_updates.telegram_update_id END,
+          captured_delivery_mode = COALESCE(pending_queue_updates.captured_delivery_mode, excluded.captured_delivery_mode),
+          policy_captured_at = COALESCE(pending_queue_updates.policy_captured_at, excluded.policy_captured_at),
+          unmatched_edit_at = ?,
+          unmatched_edit_update_id = ?,
+          state = CASE WHEN pending_queue_updates.state IN ('ingested','consumed_generated','discarded') THEN 'pending' ELSE pending_queue_updates.state END,
+          last_error = NULL
+      `).run(snapshot.chatId, snapshot.messageId, savedSnapshot.mediaGroupId ?? null, JSON.stringify(savedSnapshot), receivedAt, processAfter, updateKind, updateId ?? null, capture.deliveryMode ?? null, capture.policyCapturedAt ?? null, savedMarkerAt ?? null, savedMarkerUpdateId ?? null, savedMarkerAt ?? null, savedMarkerUpdateId ?? null);
+      const updated = find(snapshot.chatId, snapshot.messageId);
+      if (!updated) throw new Error("Pending update disappeared after upsert");
+      return updated;
+    });
     if (!result) throw new Error("Pending update disappeared after upsert");
     return result;
   };

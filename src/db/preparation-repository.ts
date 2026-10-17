@@ -23,7 +23,7 @@ export type PreparationClaim = {
   sourceIds: MessageId[]; memberKeys: string[]; bootId: string;
 };
 
-export type PreparationResult = { members: readonly PreparedMember[]; attribution: AttributionDescriptor; nicknameRevisionApplied: number };
+export type PreparationResult = { members: readonly PreparedMember[]; attribution: AttributionDescriptor; nicknameRevisionApplied: number; nicknameRevisionAppliedKey?: string };
 export type PreparationOutput = { chatId: number; messageId: number; ordinal: number; outputKey: string; stepKey: string; sourceMemberKey?: string; role: "content" | "credit"; snapshot?: unknown };
 
 const asJson = (value: unknown): string => JSON.stringify(value);
@@ -51,6 +51,7 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
       FROM queue_items qi
       WHERE qi.status = 'queued'
         AND qi.preparation_state IN ('unprepared','refresh_pending')
+        AND (qi.editorial_frozen_at IS NULL OR qi.preparation_state = 'unprepared')
         AND qi.preparation_operation_id IS NULL
         AND qi.claimed_operation_id IS NULL
         AND qi.maintenance_status = 'idle'
@@ -125,10 +126,11 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const members = result.members.map((member) => validatePreparedMember(member, "result.member"));
     assertPreparedMembers(members);
     if (!Number.isSafeInteger(result.nicknameRevisionApplied) || result.nicknameRevisionApplied < 0) throw new Error("Invalid applied nickname revision");
+    if (result.nicknameRevisionAppliedKey !== undefined && (typeof result.nicknameRevisionAppliedKey !== "string" || result.nicknameRevisionAppliedKey.length === 0)) throw new Error("Invalid applied nickname key");
     const attribution = validateAttributionDescriptor(result.attribution);
     const outputIds = new Set((database.raw.query("SELECT telegram_message_id FROM queue_preparation_outputs WHERE operation_id = ? AND chat_id = (SELECT queue_chat_id FROM queue_items WHERE id = ?)").all(operationId, row.item_id) as Array<{ telegram_message_id: number }>).map((output) => output.telegram_message_id));
     if (members.some((member) => !outputIds.has(Number(member.messageId)))) throw conflict("Prepared result includes an output that was not durably recorded");
-    const normalized = { members, attribution, nicknameRevisionApplied: result.nicknameRevisionApplied };
+    const normalized = { members, attribution, nicknameRevisionApplied: result.nicknameRevisionApplied, ...(result.nicknameRevisionAppliedKey === undefined ? {} : { nicknameRevisionAppliedKey: result.nicknameRevisionAppliedKey }) };
     const changed = database.raw.query("UPDATE queue_preparation_operations SET state = 'outputs_recorded', phase = 'result_complete', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded') AND captured_content_version = ? AND captured_source_generation = ?").run(asJson(normalized), now, operationId, row.captured_content_version, row.captured_source_generation);
     if (Number(changed.changes) !== 1) throw conflict("Preparation completion guard conflict");
   });
@@ -140,7 +142,7 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const result = JSON.parse(row.result_json) as PreparationResult;
     const members = result.members.map((member) => validatePreparedMember(member, "result.member"));
     assertPreparedMembers(members);
-    const item = database.raw.query("SELECT queue_chat_id, content_version, source_generation, nickname_revision_wanted, status FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(row.item_id, operationId) as { queue_chat_id: number; content_version: number; source_generation: number; nickname_revision_wanted: number; status: QueueItemStatus } | null;
+    const item = database.raw.query("SELECT queue_chat_id, content_version, source_generation, nickname_revision_wanted, nickname_revision_wanted_key, editorial_frozen_at, status FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(row.item_id, operationId) as { queue_chat_id: number; content_version: number; source_generation: number; nickname_revision_wanted: number; nickname_revision_wanted_key: string | null; editorial_frozen_at: number | null; status: QueueItemStatus } | null;
     const progress = validateExecutionProgress(JSON.parse(row.progress_json) as unknown);
     if (!item || item.content_version !== progress.effectiveContentVersion || item.source_generation !== row.captured_source_generation || item.status !== "queued") throw conflict("Preparation install guard conflict");
     const outputRows = database.raw.query("SELECT telegram_message_id, source_member_key, role, snapshot_json FROM queue_preparation_outputs WHERE operation_id = ? AND chat_id = ?").all(operationId, item.queue_chat_id) as Array<{ telegram_message_id: number; source_member_key: string | null; role: string; snapshot_json: string | null }>;
@@ -155,10 +157,14 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`)
         .run(row.item_id, generation, item.queue_chat_id, member.messageId, ordinal, snapshot.telegramDate, snapshot.editDate ?? null, asJson(snapshot), member.memberKey, member.role, member.deliveryMode, member.albumKey ?? null);
     }
-    const nextPreparationState = result.attribution.ownership === "bot" && result.nicknameRevisionApplied !== item.nickname_revision_wanted ? "refresh_pending" : "ready";
+    const appliedKey = result.nicknameRevisionAppliedKey ?? item.nickname_revision_wanted_key ?? "none";
+    let wantedKey = item.nickname_revision_wanted_key ?? appliedKey;
+    let wantedRevision = item.nickname_revision_wanted;
+    if (item.editorial_frozen_at === null && result.attribution.ownership === "bot" && appliedKey === wantedKey && result.nicknameRevisionApplied > wantedRevision) wantedRevision = result.nicknameRevisionApplied;
+    const nextPreparationState = item.editorial_frozen_at !== null || result.attribution.ownership !== "bot" || (appliedKey === wantedKey && result.nicknameRevisionApplied === wantedRevision) ? "ready" : "refresh_pending";
     const primary = members.find((member) => member.role === "content") ?? members[0]!;
-    const installed = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = ?, content_type = ?, physical_created_at = ?, representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`)
-      .run(generation, primary.messageId, primary.snapshot.contentType, now, nextPreparationState, asJson(validateAttributionDescriptor(result.attribution)), result.nicknameRevisionApplied, now, row.item_id, operationId, progress.effectiveContentVersion, row.captured_source_generation);
+    const installed = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = ?, content_type = ?, physical_created_at = ?, representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, nickname_revision_applied_key = ?, nickname_revision_wanted = ?, nickname_revision_wanted_key = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`)
+      .run(generation, primary.messageId, primary.snapshot.contentType, now, nextPreparationState, asJson(validateAttributionDescriptor(result.attribution)), result.nicknameRevisionApplied, appliedKey, wantedRevision, wantedKey, now, row.item_id, operationId, progress.effectiveContentVersion, row.captured_source_generation);
     if (Number(installed.changes) !== 1) throw conflict("Prepared generation lost its guarded install");
     const oldSourceIds = JSON.parse(row.source_ids_json) as MessageId[];
     database.raw.query("UPDATE queue_preparation_operations SET state = 'cleanup_pending', phase = 'source_cleanup_pending', target_source_generation = ?, updated_at = ? WHERE id = ?").run(generation, now, operationId);
@@ -171,10 +177,10 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     return installPreparedGenerationTx(row, now);
   });
 
-  const completeInPlacePreparation = (guard: PreparedExecutionGuard, preparedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number): void => database.transaction(() => {
+  const completeInPlacePreparation = (guard: PreparedExecutionGuard, preparedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number, revisionKey?: string): { preparationState: string } => database.transaction(() => {
     const row = assertOwner(guard.operationId);
     const progress = validateExecutionProgress(JSON.parse(row.progress_json) as unknown);
-    const item = database.raw.query("SELECT queue_chat_id, nickname_revision_wanted, content_version, source_generation FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(guard.itemId, guard.operationId) as { queue_chat_id: number; nickname_revision_wanted: number; content_version: number; source_generation: number } | null;
+    const item = database.raw.query("SELECT queue_chat_id, nickname_revision_wanted, nickname_revision_wanted_key, content_version, source_generation, editorial_frozen_at FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(guard.itemId, guard.operationId) as { queue_chat_id: number; nickname_revision_wanted: number; nickname_revision_wanted_key: string | null; content_version: number; source_generation: number; editorial_frozen_at: number | null } | null;
     if (!item || row.kind !== "prepare" || item.content_version !== guard.expectedContentVersion || progress.effectiveContentVersion !== guard.expectedContentVersion || item.source_generation !== guard.capturedSourceGeneration) throw conflict("In-place preparation guard conflict");
     const capturedKeys = progress.members.map((member) => member.memberKey).sort();
     const preparedKeys = preparedMembers.map((member) => member.memberKey).sort();
@@ -184,24 +190,33 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
       const changed = database.raw.query("UPDATE queue_messages SET member_role = ?, member_delivery_mode = ?, album_key = ?, snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND member_key = ? AND telegram_message_id = ? AND removed_at IS NULL").run(member.role, member.deliveryMode, member.albumKey ?? null, asJson(snapshot), guard.itemId, guard.capturedSourceGeneration, member.memberKey, member.messageId);
       if (Number(changed.changes) !== 1) throw conflict("In-place prepared member changed");
     }
-    const nextState = attribution.ownership === "bot" && revision !== item.nickname_revision_wanted ? "refresh_pending" : "ready";
-    const installed = database.raw.query("UPDATE queue_items SET representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?").run(nextState, asJson(validateAttributionDescriptor(attribution)), revision, now, guard.itemId, guard.operationId, guard.expectedContentVersion, guard.capturedSourceGeneration);
+    const appliedKey = revisionKey ?? item.nickname_revision_wanted_key ?? "none";
+    const wantedKey = item.nickname_revision_wanted_key ?? appliedKey;
+    const wantedRevision = item.editorial_frozen_at === null && attribution.ownership === "bot" && appliedKey === wantedKey ? Math.max(item.nickname_revision_wanted, revision) : item.nickname_revision_wanted;
+    const nextState = item.editorial_frozen_at !== null || attribution.ownership !== "bot" || (appliedKey === wantedKey && revision === wantedRevision) ? "ready" : "refresh_pending";
+    const installed = database.raw.query("UPDATE queue_items SET representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, nickname_revision_applied_key = ?, nickname_revision_wanted = ?, nickname_revision_wanted_key = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?").run(nextState, asJson(validateAttributionDescriptor(attribution)), revision, appliedKey, wantedRevision, wantedKey, now, guard.itemId, guard.operationId, guard.expectedContentVersion, guard.capturedSourceGeneration);
     if (Number(installed.changes) !== 1) throw conflict("In-place prepared installation lost its guard");
-    database.raw.query("UPDATE queue_preparation_operations SET state = 'done', phase = 'completed', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded')").run(asJson({ members: preparedMembers, attribution, nicknameRevisionApplied: revision }), now, guard.operationId);
+    database.raw.query("UPDATE queue_preparation_operations SET state = 'done', phase = 'completed', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded')").run(asJson({ members: preparedMembers, attribution, nicknameRevisionApplied: revision, nicknameRevisionAppliedKey: appliedKey }), now, guard.operationId);
+    return { preparationState: nextState };
   });
 
-  const completeInPlaceRefresh = (guard: PreparedExecutionGuard, updatedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number): void => database.transaction(() => {
+  const completeInPlaceRefresh = (guard: PreparedExecutionGuard, updatedMembers: readonly PreparedMember[], attribution: AttributionDescriptor, revision: number, now: number, revisionKey?: string, contentChanged = true): { preparationState: string } => database.transaction(() => {
     const row = assertOwner(guard.operationId);
-    const item = database.raw.query("SELECT queue_chat_id, nickname_revision_wanted, content_version, source_generation FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(guard.itemId, guard.operationId) as { queue_chat_id: number; nickname_revision_wanted: number; content_version: number; source_generation: number } | null;
+    const item = database.raw.query("SELECT queue_chat_id, nickname_revision_wanted, nickname_revision_wanted_key, nickname_revision_applied_key, content_version, source_generation, editorial_frozen_at FROM queue_items WHERE id = ? AND preparation_operation_id = ?").get(guard.itemId, guard.operationId) as { queue_chat_id: number; nickname_revision_wanted: number; nickname_revision_wanted_key: string | null; nickname_revision_applied_key: string | null; content_version: number; source_generation: number; editorial_frozen_at: number | null } | null;
     if (!item || row.kind !== "refresh" || item.content_version !== guard.expectedContentVersion || item.source_generation !== guard.capturedSourceGeneration) throw conflict("In-place refresh guard conflict");
-    for (const member of updatedMembers) {
+    for (const member of contentChanged ? updatedMembers : []) {
       if (Number(member.messageId) <= 0 || member.snapshot.messageId !== member.messageId) throw new Error("Invalid refreshed member snapshot");
       const changed = database.raw.query("UPDATE queue_messages SET snapshot_json = ?, telegram_date = ?, edit_date = ? WHERE item_id = ? AND source_generation = ? AND member_key = ? AND telegram_message_id = ? AND removed_at IS NULL").run(asJson(validateStoredMessageSnapshot(member.snapshot)), member.snapshot.telegramDate, member.snapshot.editDate ?? null, guard.itemId, guard.capturedSourceGeneration, member.memberKey, member.messageId);
       if (Number(changed.changes) !== 1) throw conflict("Refreshed queue member changed");
     }
-    const nextState = attribution.ownership === "bot" && revision !== item.nickname_revision_wanted ? "refresh_pending" : "ready";
-    database.raw.query("UPDATE queue_items SET content_version = content_version + 1, attribution_json = ?, nickname_revision_applied = ?, preparation_state = ?, preparation_operation_id = NULL, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?").run(asJson(validateAttributionDescriptor(attribution)), revision, nextState, now, guard.itemId, guard.operationId, guard.expectedContentVersion, guard.capturedSourceGeneration);
-    database.raw.query("UPDATE queue_preparation_operations SET state = 'done', phase = 'completed', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded')").run(asJson({ members: updatedMembers, attribution, nicknameRevisionApplied: revision }), now, guard.operationId);
+    const appliedKey = revisionKey ?? item.nickname_revision_wanted_key ?? item.nickname_revision_applied_key ?? "none";
+    const wantedKey = item.nickname_revision_wanted_key ?? appliedKey;
+    const wantedRevision = item.editorial_frozen_at === null && attribution.ownership === "bot" && appliedKey === wantedKey ? Math.max(item.nickname_revision_wanted, revision) : item.nickname_revision_wanted;
+    const nextState = item.editorial_frozen_at !== null || attribution.ownership !== "bot" || (appliedKey === wantedKey && revision === wantedRevision) ? "ready" : "refresh_pending";
+    const versionExpression = contentChanged ? "content_version + 1" : "content_version";
+    database.raw.query(`UPDATE queue_items SET content_version = ${versionExpression}, attribution_json = ?, nickname_revision_applied = ?, nickname_revision_applied_key = ?, nickname_revision_wanted = ?, nickname_revision_wanted_key = ?, preparation_state = ?, preparation_operation_id = NULL, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`).run(asJson(validateAttributionDescriptor(attribution)), revision, appliedKey, wantedRevision, wantedKey, nextState, now, guard.itemId, guard.operationId, guard.expectedContentVersion, guard.capturedSourceGeneration);
+    database.raw.query("UPDATE queue_preparation_operations SET state = 'done', phase = 'completed', result_json = ?, updated_at = ? WHERE id = ? AND state IN ('running','outputs_recorded')").run(asJson({ members: updatedMembers, attribution, nicknameRevisionApplied: revision, nicknameRevisionAppliedKey: appliedKey }), now, guard.operationId);
+    return { preparationState: nextState };
   });
 
   const markFailed = (operationId: string, status: QueueItemStatus, code: string, description: string, now: number): void => database.transaction(() => {
@@ -230,7 +245,10 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
   });
 
   const markPreparationNeeded = (itemId: number, reason: "initial" | "refresh", now: number): void => {
-    database.raw.query("UPDATE queue_items SET preparation_state = CASE WHEN ? = 'refresh' THEN 'refresh_pending' ELSE 'unprepared' END, retry_not_before = NULL WHERE id = ? AND preparation_operation_id IS NULL AND status NOT IN ('done','deleted','deleted_external')").run(reason, itemId);
+    database.raw.query(`UPDATE queue_items SET preparation_state = CASE
+      WHEN editorial_frozen_at IS NOT NULL AND representation_kind = 'prepared' THEN 'ready'
+      WHEN ? = 'refresh' THEN 'refresh_pending' ELSE 'unprepared' END,
+      retry_not_before = NULL WHERE id = ? AND preparation_operation_id IS NULL AND status NOT IN ('done','deleted','deleted_external')`).run(reason, itemId);
     database.raw.query("UPDATE queue_items SET last_error = NULL, last_error_code = NULL WHERE id = ? AND preparation_operation_id IS NULL").run(itemId);
     void now;
   };

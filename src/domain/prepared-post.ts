@@ -9,6 +9,9 @@ export type PreparationReadiness = {
   retryNotBefore?: number;
   nicknameRevisionWanted: number;
   nicknameRevisionApplied: number;
+  nicknameRevisionWantedKey?: string;
+  nicknameRevisionAppliedKey?: string;
+  editorialFrozenAt?: number;
   attributionOwnership: "none" | "admin" | "bot";
   currentMembers: readonly PreparedMember[];
   hasConflictingOwner: boolean;
@@ -25,7 +28,11 @@ export const isPreparedPostReady = (item: PreparationReadiness, now: number): bo
   (item.retryNotBefore === undefined || item.retryNotBefore <= now) &&
   item.currentMembers.length > 0 &&
   item.currentMembers.every((member) => member.deliveryMode === "copy" || member.deliveryMode === "forward") &&
-  (item.attributionOwnership !== "bot" || item.nicknameRevisionApplied === item.nicknameRevisionWanted);
+  (item.attributionOwnership !== "bot" || item.editorialFrozenAt !== undefined || (
+    item.nicknameRevisionWantedKey !== undefined || item.nicknameRevisionAppliedKey !== undefined
+      ? item.nicknameRevisionWantedKey !== undefined && item.nicknameRevisionWantedKey === item.nicknameRevisionAppliedKey && item.nicknameRevisionApplied === item.nicknameRevisionWanted
+      : item.nicknameRevisionApplied === item.nicknameRevisionWanted
+  ));
 
 /** Validate the structural properties needed before a prepared bundle is installed. */
 export const assertPreparedMembers = (members: readonly PreparedMember[]): void => {
@@ -39,4 +46,3 @@ export const assertPreparedMembers = (members: readonly PreparedMember[]): void 
     ids.add(member.messageId);
   }
 };
-

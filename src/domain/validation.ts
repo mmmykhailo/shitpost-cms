@@ -305,6 +305,11 @@ export const validatePreparationContractV1 = (value: unknown): PreparationContra
     originalOrigin: validateSemanticOrigin(candidate.originalOrigin), deliveryMode: validateDeliveryMode(candidate.deliveryMode, "contract.deliveryMode"),
     capturedMembers, steps, targetNicknameRevision, attribution: validateAttributionDescriptor(candidate.attribution),
   };
+  const targetNicknameKey = optionalString(candidate.targetNicknameKey, "contract.targetNicknameKey");
+  if (targetNicknameKey !== undefined) {
+    if (targetNicknameKey.length === 0) throw new StoredDataValidationError("contract.targetNicknameKey must not be empty");
+    result.targetNicknameKey = targetNicknameKey;
+  }
   const targetName = optionalString(candidate.targetName, "contract.targetName");
   if (targetName !== undefined) result.targetName = targetName;
   const keys = new Set(capturedMembers.map((member) => member.memberKey));

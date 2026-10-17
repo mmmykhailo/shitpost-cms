@@ -42,6 +42,18 @@ const buildPreparedMetadataSteps = (members: readonly PreparedMember[]): Transfe
   return result;
 };
 
+const canonicalEditPayload = (snapshot: StoredMessageSnapshot, edit: "text" | "caption"): string => {
+  const payload: Record<string, unknown> = edit === "text"
+    ? { text: snapshot.text ?? "", entities: snapshot.entities ?? [], linkPreviewOptions: snapshot.linkPreviewOptions ?? {} }
+    : { caption: snapshot.caption ?? "", captionEntities: snapshot.captionEntities ?? [], showCaptionAboveMedia: snapshot.showCaptionAboveMedia ?? false };
+  const stable = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+    if (typeof value === "object" && value !== null) return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stable((value as Record<string, unknown>)[key])}`).join(",")}}`;
+    return JSON.stringify(value) ?? "null";
+  };
+  return stable(payload);
+};
+
 export type PreparationService = ReturnType<typeof createPreparationService>;
 
 export const createPreparationService = (input: {
@@ -113,7 +125,9 @@ export const createPreparationService = (input: {
     let mutationMayHaveStarted = false;
     const attribution = item.attribution ?? { ownership: "none" as const };
     let nextAttribution: AttributionDescriptor = attribution;
-    const revision = Math.max(item.nicknameRevisionWanted ?? 0, input.policy.aliasRevisionForOrigin(item.origin));
+    const creditPolicy = input.policy.resolveCreditPolicy(item.origin);
+    input.queue.reconcileNicknamePolicy(item.id, creditPolicy);
+    const revision = creditPolicy.revision;
     try {
       const contract: PreparationContractV1 = {
         version: 1, kind: "refresh", itemId: item.id,
@@ -121,12 +135,12 @@ export const createPreparationService = (input: {
         capturedSourceGeneration: claim.guard.capturedSourceGeneration,
         originalOrigin: item.origin, deliveryMode: item.deliveryMode ?? "copy",
         capturedMembers: members, steps: buildPreparedMetadataSteps(members),
-        targetNicknameRevision: revision, attribution,
+        targetNicknameRevision: revision, targetNicknameKey: creditPolicy.revisionKey, attribution,
       };
       input.preparation.persistContract(claim.operationId, contract, input.clock.now());
       if (attribution.ownership !== "bot") {
-        input.preparation.completeInPlaceRefresh(guard, members, attribution, revision, input.clock.now());
-        return { kind: "prepared", itemId: item.id, preparationState: "ready", operationId: claim.operationId };
+        const completed = input.preparation.completeInPlaceRefresh(guard, members, attribution, revision, input.clock.now(), creditPolicy.revisionKey);
+        return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
       }
 
       const target = members.find((member) => member.memberKey === attribution.memberKey);
@@ -138,8 +152,7 @@ export const createPreparationService = (input: {
         if (target.role !== "credit" || target.snapshot.text !== attribution.generatedText) {
           nextAttribution = { ownership: "admin", previousMemberKey: attribution.memberKey };
         } else {
-          const alias = input.policy.aliasForOrigin(item.origin);
-          const plan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
+          const plan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
           if (plan.kind !== "copy_with_separate_byline") throw new Error("Current origin no longer has a separate-credit policy");
           const text = separateByline(plan.name);
           nextSnapshot = { ...target.snapshot, text };
@@ -156,8 +169,7 @@ export const createPreparationService = (input: {
         if (ownership.decision !== "preserve_bot_ownership" || generatedFormattingChanged) {
           nextAttribution = generatedFormattingChanged ? { ownership: "admin", previousMemberKey: attribution.memberKey } : ownership.attribution;
         } else {
-          const alias = input.policy.aliasForOrigin(item.origin);
-          const plan = classifyPublicationPlan({ origin: item.origin, contentType: target.snapshot.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
+          const plan = classifyPublicationPlan({ origin: item.origin, contentType: target.snapshot.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
           if (plan.kind !== "copy_with_inline_byline") throw new Error("Current origin no longer has an inline-credit policy");
           const fullText = oldText ?? "";
           const base = fullText.slice(0, fullText.length - attribution.generatedText.length);
@@ -180,8 +192,13 @@ export const createPreparationService = (input: {
       }
 
       if (!target || !nextSnapshot || !edit) {
-        input.preparation.completeInPlaceRefresh(guard, members, nextAttribution, revision, input.clock.now());
-        return { kind: "prepared", itemId: item.id, preparationState: "ready", operationId: claim.operationId };
+        const completed = input.preparation.completeInPlaceRefresh(guard, members, nextAttribution, revision, input.clock.now(), creditPolicy.revisionKey);
+        return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
+      }
+
+      if (canonicalEditPayload(target.snapshot, edit) === canonicalEditPayload(nextSnapshot, edit)) {
+        const completed = input.preparation.completeInPlaceRefresh(guard, members, nextAttribution, revision, input.clock.now(), creditPolicy.revisionKey, false);
+        return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
       }
 
       input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, nextSnapshot, input.clock.now());
@@ -217,8 +234,8 @@ export const createPreparationService = (input: {
         }
       }
       if (updatedMembers === members) updatedMembers = members.map((member) => member.memberKey === target.memberKey ? { ...member, snapshot: nextSnapshot! } : member);
-      input.preparation.completeInPlaceRefresh(guard, updatedMembers, nextAttribution, revision, input.clock.now());
-      return { kind: "prepared", itemId: item.id, preparationState: "ready", operationId: claim.operationId };
+      const completed = input.preparation.completeInPlaceRefresh(guard, updatedMembers, nextAttribution, revision, input.clock.now(), creditPolicy.revisionKey);
+      return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
     } catch (error) {
       const normalized = classifyTelegramError(error);
       const description = error instanceof Error ? error.message : normalized.description;
@@ -241,21 +258,28 @@ export const createPreparationService = (input: {
     let mutationMayHaveStarted = false;
     let guard = claim.guard;
     try {
-      const item = input.queue.findItemById(claim.itemId);
+      let item = input.queue.findItemById(claim.itemId);
       if (!item) throw new Error("Claimed preparation item disappeared");
       const members = input.queue.getCapturedMembers(item.id, claim.guard.capturedSourceGeneration, claim.sourceIds);
       if (members.length === 0) throw new Error("Claimed preparation source set is empty");
+      if (item.editorialFrozenAt !== undefined) {
+        const adopted = input.preparation.completeInPlacePreparation(guard, members, item.attribution ?? { ownership: "none" }, item.nicknameRevisionApplied ?? item.nicknameRevisionWanted ?? 0, input.clock.now(), item.nicknameRevisionAppliedKey ?? item.nicknameRevisionWantedKey ?? "none");
+        return { kind: "prepared", itemId: item.id, preparationState: adopted.preparationState, operationId: claim.operationId };
+      }
+      const creditPolicy = input.policy.resolveCreditPolicy(item.origin);
+      input.queue.reconcileNicknamePolicy(item.id, creditPolicy);
+      item = input.queue.findItemById(item.id) ?? item;
       if (claim.kind === "refresh") return await refreshClaim(claim, item, members);
       const deliveryMode = item.deliveryMode;
       if (!deliveryMode) {
         input.preparation.markFailed(claim.operationId, "needs_review", "missing_captured_policy", "Queue policy was not captured for this item", input.clock.now());
         return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "missing_captured_policy", operationId: claim.operationId };
       }
-      const alias = input.policy.aliasForOrigin(item.origin);
+      const alias = creditPolicy.alias;
       const classifiedPlan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
       const hasAdminCredit = members.some((member) => member.role === "credit") && item.attribution?.ownership === "admin";
       const plan = hasAdminCredit ? (deliveryMode === "forward" ? { kind: "forward" as const } : { kind: "copy" as const }) : classifiedPlan;
-      const revision = Math.max(item.nicknameRevisionWanted ?? 0, input.policy.aliasRevisionForOrigin(item.origin));
+      const revision = creditPolicy.revision;
       if (plan.kind === "blocked") {
         const status = plan.reason === "unsupported_content" ? "blocked" : "needs_review";
         input.preparation.markFailed(claim.operationId, status, plan.reason, plan.reason, input.clock.now());
@@ -315,6 +339,7 @@ export const createPreparationService = (input: {
         capturedMembers: members,
         steps: contractSteps,
         targetNicknameRevision: revision,
+        targetNicknameKey: creditPolicy.revisionKey,
         attribution,
       };
       if (plan.kind === "copy_with_inline_byline" || plan.kind === "copy_with_separate_byline") contract.targetName = plan.name;
@@ -322,8 +347,8 @@ export const createPreparationService = (input: {
 
       if (!transformsSource) {
         const prepared = inPlacePreparedMembers(members, capturedPolicyMode);
-        input.preparation.completeInPlacePreparation(guard, prepared, attribution, revision, input.clock.now());
-        return { kind: "prepared", itemId: item.id, preparationState: "ready", operationId: claim.operationId };
+        const completed = input.preparation.completeInPlacePreparation(guard, prepared, attribution, revision, input.clock.now(), creditPolicy.revisionKey);
+        return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
       }
 
       const transferred: PreparedTransferOutput[] = [];
@@ -486,7 +511,7 @@ export const createPreparationService = (input: {
         }
       }
 
-      const result = { members: outputMembers, attribution, nicknameRevisionApplied: revision };
+      const result = { members: outputMembers, attribution, nicknameRevisionApplied: revision, nicknameRevisionAppliedKey: creditPolicy.revisionKey };
       input.preparation.recordCompleteResult(claim.operationId, result, input.clock.now());
       const installed = input.preparation.installPreparedGeneration(claim.operationId, input.clock.now());
       let cleanupError: string | undefined;

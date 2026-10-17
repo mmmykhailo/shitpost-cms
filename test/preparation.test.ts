@@ -58,6 +58,57 @@ const serviceFor = (h: ReturnType<typeof open>, gateway: TelegramGateway, cooldo
 });
 
 describe("preparation service", () => {
+  test("captures an existing identifiable alias at enqueue and converges after one preparation", async () => {
+    const h = open();
+    h.policy.observeAuthor(USER, NOW);
+    h.policy.setAlias(55, "Known Alias", 1, NOW + 1);
+    const resolved = h.policy.resolveCreditPolicy(USER);
+    h.queue.observeQueueSnapshot(
+      snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(99), origin: USER, text: "hello" }),
+      NOW + 2,
+      "copy",
+      NOW + 2,
+      () => ({ revisionKey: resolved.revisionKey, revision: resolved.revision }),
+    );
+    const fake = makeGateway();
+    const service = serviceFor(h, fake.gateway);
+
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(h.queue.findItemById(1)).toMatchObject({
+      nicknameRevisionWanted: 1,
+      nicknameRevisionApplied: 1,
+      nicknameRevisionWantedKey: resolved.revisionKey,
+      nicknameRevisionAppliedKey: resolved.revisionKey,
+      preparationState: "ready",
+    });
+    expect((await service.prepareNext()).kind).toBe("empty");
+    expect(fake.edits).toHaveLength(1);
+    expect(fake.edits[0]?.text).toBe("hello\n\nby Known Alias");
+  });
+
+  test("captures an existing exact hidden-sender alias at enqueue", async () => {
+    const h = open();
+    const hiddenOrigin = { kind: "hidden_user", senderUserName: "Case Sensitive" } as const;
+    h.policy.observeAuthor(hiddenOrigin, NOW);
+    const hidden = h.policy.listHiddenAuthors()[0]!;
+    h.policy.setHiddenAlias(hidden.hiddenAuthorId, "Hidden Alias", 3, NOW + 1);
+    const resolved = h.policy.resolveCreditPolicy(hiddenOrigin);
+    h.queue.observeQueueSnapshot(
+      snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(98), origin: hiddenOrigin, text: "hello" }),
+      NOW + 2,
+      "copy",
+      NOW + 2,
+      () => ({ revisionKey: resolved.revisionKey, revision: resolved.revision }),
+    );
+    const fake = makeGateway();
+    const service = serviceFor(h, fake.gateway);
+
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(h.queue.findItemById(1)).toMatchObject({ nicknameRevisionWanted: 1, nicknameRevisionApplied: 1, preparationState: "ready" });
+    expect((await service.prepareNext()).kind).toBe("empty");
+    expect(fake.edits[0]?.text).toBe("hello\n\nby Hidden Alias");
+  });
+
   test("copies an identifiable-user post once, adds its visible credit in the queue, and then removes the raw source", async () => {
     const h = open();
     const snapshot = snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(100), origin: USER, text: "hello" });
@@ -387,7 +438,7 @@ describe("preparation service", () => {
     expect(h.queue.findItemById(1)?.status).toBe("deleted_external");
   });
 
-  test("preserves an admin-owned credit when a later nickname update arrives", async () => {
+  test("freezes the whole post after an admin body edit even when the generated suffix is unchanged", async () => {
     const h = open();
     h.policy.observeAuthor(USER, NOW);
     h.queue.observeQueueSnapshot(snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(210), text: "hello", origin: USER }), NOW, "copy", NOW);
@@ -395,14 +446,31 @@ describe("preparation service", () => {
     const service = serviceFor(h, fake.gateway);
     expect((await service.prepareNext()).kind).toBe("prepared");
     const member = h.queue.getCurrentMembers(1)[0]!;
-    h.queue.updateSnapshot(asChatId(-100), member.messageId, { ...member.snapshot, text: "my edited text" });
+    const editedText = "my edited text\n\nby Alice Example";
+    h.queue.acceptAdminQueueEdit({ chatId: -100, messageId: member.messageId, snapshot: { ...member.snapshot, text: editedText, editDate: NOW + 1_000, telegramUpdateId: 2 }, receivedAt: NOW + 1_000, updateId: 2 });
     h.policy.setAlias(55, "New Alias", 1, NOW + 2);
     h.preparation.markPreparationNeeded(1, "refresh", NOW + 3);
 
-    expect((await service.prepareNext()).kind).toBe("prepared");
-    expect(h.queue.getCurrentMembers(1)[0]?.snapshot.text).toBe("my edited text");
-    expect(h.queue.findItemById(1)?.attribution).toMatchObject({ ownership: "admin" });
+    expect((await service.prepareNext()).kind).toBe("empty");
+    expect(h.queue.getCurrentMembers(1)[0]?.snapshot.text).toBe(editedText);
+    expect(h.queue.findItemById(1)).toMatchObject({ editorialFreezeReason: "admin_edit", preparationState: "ready" });
     expect(fake.edits).toHaveLength(1);
+  });
+
+  test("adopts a raw edited submission exactly as shown without adding a credit", async () => {
+    const h = open();
+    h.policy.observeAuthor(USER, NOW);
+    const source = snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(211), text: "original", origin: USER });
+    h.queue.observeQueueSnapshot(source, NOW, "copy", NOW);
+    h.queue.acceptAdminQueueEdit({ chatId: -100, messageId: source.messageId, snapshot: { ...source, text: "admin rendition", editDate: NOW + 1_000, telegramUpdateId: 3 }, receivedAt: NOW + 1_000, updateId: 3 });
+    const fake = makeGateway();
+
+    expect((await serviceFor(h, fake.gateway).prepareNext()).kind).toBe("prepared");
+    expect(fake.copied).toEqual([]);
+    expect(fake.edits).toEqual([]);
+    expect(fake.sentText).toEqual([]);
+    expect(h.queue.getCurrentMembers(1)[0]?.snapshot.text).toBe("admin rendition");
+    expect(h.queue.findItemById(1)).toMatchObject({ editorialFreezeReason: "admin_edit", representationKind: "prepared", preparationState: "ready" });
   });
 
   test("reports cleanup work after source deletion fails and retries cleanup only", async () => {

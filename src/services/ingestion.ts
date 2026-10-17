@@ -27,24 +27,29 @@ export const createIngestionService = (input: {
   const captureDeliveryMode = (snapshot: StoredMessageSnapshot): DeliveryMode =>
     snapshot.origin.kind === "channel" && input.policy.isChannelWhitelisted(snapshot.origin.chatId) ? "forward" : "copy";
 
-  const ingestLogicalSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode = captureDeliveryMode(snapshot), policyCapturedAt = now): IngestionResult => {
-    input.policy.observeAuthor(snapshot.origin, now);
+  const ingestLogicalSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode = captureDeliveryMode(snapshot), policyCapturedAt = now, unmatchedEdit?: { receivedAt: number; updateId?: number }): IngestionResult => {
+    const resolveInitialPolicy = (origin = snapshot.origin) => {
+      input.policy.observeAuthor(origin, now);
+      const policy = input.policy.resolveCreditPolicy(origin);
+      return { revisionKey: policy.revisionKey, revision: policy.revision };
+    };
     if (snapshot.mediaGroupId !== undefined) {
       const existing = input.queue.findBySource(snapshot.chatId, snapshot.messageId);
       if (existing) return { accepted: false, itemId: existing.id, ignoredReason: "duplicate" };
       const album = input.queue.findCollectingAlbum(snapshot.chatId, snapshot.mediaGroupId);
       if (album) {
-        const item = input.queue.addAlbumMember(album.id, snapshot, now);
+        const item = input.queue.addAlbumMember(album.id, snapshot, now, () => resolveInitialPolicy(album.origin));
         return { accepted: true, itemId: item.id };
       }
       const finalizedAlbum = input.queue.findAlbum(snapshot.chatId, snapshot.mediaGroupId);
       if (finalizedAlbum) {
+        input.policy.observeAuthor(snapshot.origin, now);
         const item = input.queue.addLateAlbumMember(finalizedAlbum.id, snapshot);
         input.logger.warn("late_album_member_requires_review", { itemId: item.id, messageId: snapshot.messageId });
         return { accepted: true, itemId: item.id };
       }
     }
-    const result = input.queue.observeQueueSnapshot(snapshot, now, deliveryMode, policyCapturedAt);
+    const result = input.queue.observeQueueSnapshot(snapshot, now, deliveryMode, policyCapturedAt, resolveInitialPolicy, unmatchedEdit);
     return result.inserted
       ? { accepted: true, itemId: result.item.id }
       : { accepted: false, itemId: result.item.id, ignoredReason: "duplicate" };
@@ -82,24 +87,27 @@ export const createIngestionService = (input: {
       input.logger.debug("expected_generated_edit_matched", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: expected.operationId, family: expected.family });
       return { accepted: false, ignoredReason: "generated_message" };
     }
-    const existing = input.queue.findBySource(snapshot.chatId, snapshot.messageId);
+    const now = input.now();
+    const known = input.queue.findKnownSource(snapshot.chatId, snapshot.messageId);
     if (!input.pending) {
-      if (!existing) {
+      if (!known || !known.current || known.removed) {
         input.logger.debug("edit_for_unknown_queue_message", { chatId: snapshot.chatId, messageId: snapshot.messageId });
         return { accepted: false, ignoredReason: "duplicate" };
       }
-      input.policy.observeAuthor(snapshot.origin, input.now());
-      input.queue.updateSnapshot(snapshot.chatId, snapshot.messageId, snapshot);
-      return { accepted: true, itemId: existing.id };
+      input.policy.observeAuthor(snapshot.origin, now);
+      const result = input.queue.acceptAdminQueueEdit({ chatId: snapshot.chatId, messageId: snapshot.messageId, snapshot, receivedAt: now, ...(telegramUpdateId === undefined ? {} : { updateId: telegramUpdateId }) });
+      if (result.kind === "accepted" || result.kind === "collision") return { accepted: true, itemId: result.item.id };
+      return { accepted: false, ignoredReason: "duplicate", ...(result.kind === "obsolete" ? { itemId: result.itemId } : result.kind === "stale" ? { itemId: result.item.id } : {}) };
     }
     // Persist first. If the process stops after this write, the finalizer can
     // replay the edit from SQLite without relying on Telegram update replay.
-    input.pending.upsert(snapshot, input.now(), input.now(), { updateKind: "edit", ...(telegramUpdateId === undefined ? {} : { telegramUpdateId }) });
-    if (!existing) return { accepted: false, ignoredReason: "pending_update" };
-    input.policy.observeAuthor(snapshot.origin, input.now());
-    const updated = input.queue.updateSnapshot(snapshot.chatId, snapshot.messageId, snapshot);
-    input.pending.markState(snapshot.chatId, snapshot.messageId, "ingested", input.now());
-    return { accepted: true, itemId: updated?.id ?? existing.id };
+    input.pending.upsert(snapshot, now, now, { updateKind: "edit", ...(telegramUpdateId === undefined ? {} : { telegramUpdateId }) });
+    if (!known) return { accepted: false, ignoredReason: "pending_update" };
+    if (!known.current || known.removed) return { accepted: false, ignoredReason: "pending_update", itemId: known.itemId };
+    input.policy.observeAuthor(snapshot.origin, now);
+    const result = input.queue.acceptAdminQueueEdit({ chatId: snapshot.chatId, messageId: snapshot.messageId, snapshot, receivedAt: now, pendingUpdate: true, ...(telegramUpdateId === undefined ? {} : { updateId: telegramUpdateId }) });
+    if (result.kind === "accepted" || result.kind === "collision") return { accepted: true, itemId: result.item.id };
+    return { accepted: false, ignoredReason: "pending_update", ...(result.kind === "obsolete" ? { itemId: result.itemId } : result.kind === "stale" ? { itemId: result.item.id } : {}) };
   };
 
   const finalizePendingUpdates = (): number[] => {
@@ -107,21 +115,47 @@ export const createIngestionService = (input: {
     const now = input.now();
     const ingested: number[] = [];
     for (const pending of input.pending.due(now)) {
-      const event = input.events?.consume(pending.queueChatId, pending.telegramMessageId, pending.updateKind === "edit" ? "edit" : "post", pending.snapshot.contentFingerprint, now);
+      const unmatchedEditAt = pending.unmatchedEditAt ?? (pending.updateKind === "edit" ? pending.receivedAt : undefined);
+      const event = unmatchedEditAt === undefined ? input.events?.consume(pending.queueChatId, pending.telegramMessageId, pending.updateKind === "edit" ? "edit" : "post", pending.snapshot.contentFingerprint, now) : undefined;
       if (event) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, event.operationId);
         input.logger.debug("expected_generated_update_matched", { chatId: pending.queueChatId, messageId: pending.telegramMessageId, operationId: event.operationId, family: event.family });
         continue;
       }
-      const generated = input.generated.consume(pending.queueChatId, pending.telegramMessageId);
+      const generated = unmatchedEditAt === undefined ? input.generated.consume(pending.queueChatId, pending.telegramMessageId) : undefined;
       if (generated) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, generated.operationId);
         input.logger.debug("generated_queue_message_suppressed", { chatId: pending.queueChatId, messageId: pending.telegramMessageId, operationId: generated.operationId, kind: generated.kind });
         continue;
       }
       const preparationOutput = input.queue.preparationOutputOperation(pending.queueChatId, pending.telegramMessageId);
-      if (preparationOutput) {
+      if (preparationOutput && unmatchedEditAt === undefined) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, preparationOutput.operationId);
+        continue;
+      }
+      if (unmatchedEditAt !== undefined) {
+        const known = input.queue.findKnownSource(pending.queueChatId, pending.telegramMessageId);
+        if (known?.current && !known.removed) {
+          input.policy.observeAuthor(pending.snapshot.origin, now);
+          const accepted = input.queue.acceptAdminQueueEdit({ chatId: pending.queueChatId, messageId: pending.telegramMessageId, snapshot: pending.snapshot, receivedAt: unmatchedEditAt, ...(pending.unmatchedEditUpdateId === undefined ? {} : { updateId: pending.unmatchedEditUpdateId }), pendingUpdate: true });
+          if (accepted.kind === "accepted" || accepted.kind === "collision") ingested.push(accepted.item.id);
+          continue;
+        }
+        if (known && (!known.current || known.removed)) {
+          input.pending.markState(pending.queueChatId, pending.telegramMessageId, "discarded", now, undefined, "Edited queue source is obsolete or removed");
+          continue;
+        }
+        if (preparationOutput) {
+          const accepted = input.queue.acceptProvisionalPreparationEdit({ chatId: pending.queueChatId, messageId: pending.telegramMessageId, snapshot: pending.snapshot, receivedAt: unmatchedEditAt, ...(pending.unmatchedEditUpdateId === undefined ? {} : { updateId: pending.unmatchedEditUpdateId }), pendingUpdate: true });
+          if (accepted.itemId !== undefined) ingested.push(accepted.itemId);
+          continue;
+        }
+        if (pending.updateKind === "post") {
+          const result = ingestLogicalSnapshot(pending.snapshot, now, pending.capturedDeliveryMode ?? captureDeliveryMode(pending.snapshot), pending.policyCapturedAt ?? pending.receivedAt, { receivedAt: unmatchedEditAt, ...(pending.unmatchedEditUpdateId === undefined ? {} : { updateId: pending.unmatchedEditUpdateId }) });
+          if (result.itemId !== undefined) ingested.push(result.itemId);
+        } else {
+          input.pending.markState(pending.queueChatId, pending.telegramMessageId, "discarded", now, undefined, "Edited channel post is not a new queue submission");
+        }
         continue;
       }
       if (pending.candidateOperationId && input.queue.preparationOperationState(pending.candidateOperationId) === "uncertain") continue;

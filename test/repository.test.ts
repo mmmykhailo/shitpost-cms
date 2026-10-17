@@ -66,6 +66,46 @@ describe("queue repository", () => {
     expect(queue.getCurrentSnapshotSet(1)[0]?.origin).toEqual(origin);
   });
 
+  test("an edit before publication request initiation releases the claim and keeps the item queued", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(25), text: "before" }), 1_000);
+    queue.claimPublication("pre-send-edit", "publish", 1_001);
+
+    const accepted = queue.acceptAdminQueueEdit({
+      chatId: -100,
+      messageId: 25,
+      snapshot: snapshotFixture({ messageId: asMessageId(25), text: "admin version", editDate: 1_002, telegramUpdateId: 2 }),
+      receivedAt: 1_002,
+      updateId: 2,
+    });
+
+    expect(accepted.kind).toBe("accepted");
+    expect(queue.findItemById(1)).toMatchObject({ status: "queued", editorialFreezeReason: "admin_edit" });
+    expect(queue.findItemById(1)?.claimedOperationId).toBeUndefined();
+    expect(queue.getCurrentSnapshotSet(1)[0]?.text).toBe("admin version");
+    expect((database.raw.query("SELECT state, phase FROM operations WHERE id = 'pre-send-edit'").get() as { state: string; phase: string })).toEqual({ state: "failed", phase: "admin_edit_superseded" });
+  });
+
+  test("an edit after publication transfer begins preserves uncertain operation evidence for review", () => {
+    const { database, queue } = open();
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(29), text: "before" }), 1_000);
+    queue.claimPublication("in-flight-edit", "publish", 1_001);
+    queue.setOperationPhase("in-flight-edit", "transfer_pending", 1_002);
+
+    const accepted = queue.acceptAdminQueueEdit({
+      chatId: -100,
+      messageId: 29,
+      snapshot: snapshotFixture({ messageId: asMessageId(29), text: "admin version", editDate: 1_003, telegramUpdateId: 3 }),
+      receivedAt: 1_003,
+      updateId: 3,
+    });
+
+    expect(accepted.kind).toBe("collision");
+    expect(queue.findItemById(1)).toMatchObject({ status: "needs_review", preparationState: "uncertain", editorialFreezeReason: "admin_edit", claimedOperationId: "in-flight-edit" });
+    expect(queue.getCurrentSnapshotSet(1)[0]?.text).toBe("admin version");
+    expect((database.raw.query("SELECT state, phase FROM operations WHERE id = 'in-flight-edit'").get() as { state: string; phase: string })).toEqual({ state: "uncertain", phase: "admin_edit_collision" });
+  });
+
   test("startup recovery releases a claimed publication that never began transfer", () => {
     const { database, queue } = open();
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(22) }), 1_000);

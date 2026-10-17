@@ -472,6 +472,11 @@ const migrations: readonly Migration[] = [
            editorial_freeze_reason = 'legacy_unverified'
        WHERE status NOT IN ('done','deleted','deleted_external')
          AND representation_kind = 'prepared' AND editorial_frozen_at IS NULL`,
+      `UPDATE queue_items SET preparation_state = 'ready'
+       WHERE editorial_frozen_at IS NOT NULL AND representation_kind = 'prepared' AND preparation_state = 'refresh_pending'
+         AND status = 'queued' AND preparation_operation_id IS NULL AND claimed_operation_id IS NULL AND maintenance_status = 'idle'
+         AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
+         AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations p WHERE p.item_id = queue_items.id AND p.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`,
       `UPDATE queue_generated_events
        SET state = 'obsolete'
        WHERE event_kind = 'edit' AND state = 'pending'

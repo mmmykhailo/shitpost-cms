@@ -101,6 +101,42 @@ describe("ingestion service", () => {
     expect(current.pending.find(-100, 551)).toMatchObject({ state: "discarded", updateKind: "edit", telegramUpdateId: 55 });
   });
 
+  test("preserves an unmatched edit coalesced with a post row and freezes the adopted submission", () => {
+    current = open();
+    const post = snapshotFixture({ messageId: asMessageId(552), text: "original" });
+    const edited = { ...post, text: "admin version", editDate: 10_501, telegramUpdateId: 2 };
+    current.pending.upsert(post, 10_000, 12_000, { updateKind: "post", telegramUpdateId: 1, deliveryMode: "copy", policyCapturedAt: 10_000 });
+    const coalesced = current.pending.upsert(edited, 10_500, 12_000, { updateKind: "edit", telegramUpdateId: 2 });
+
+    expect(coalesced).toMatchObject({ updateKind: "post", unmatchedEditAt: 10_500, unmatchedEditUpdateId: 2, snapshot: { text: "admin version" } });
+    current.advance(2_001);
+
+    expect(current.service.finalizePendingUpdates()).toEqual([1]);
+    expect(current.pending.find(-100, 552)?.state).toBe("ingested");
+    expect(current.queue.findItemById(1)).toMatchObject({
+      editorialFreezeReason: "admin_edit",
+      editorialFreezeMessageId: asMessageId(552),
+      editorialFreezeUpdateId: 2,
+    });
+    expect(current.queue.getCurrentMembers(1)[0]?.snapshot.text).toBe("admin version");
+  });
+
+  test("does not let an older pending replay replace the latest edit snapshot or freeze provenance", () => {
+    current = open();
+    const post = snapshotFixture({ messageId: asMessageId(553), text: "original" });
+    current.pending.upsert(post, 10_000, 12_000, { updateKind: "post", telegramUpdateId: 1 });
+    const newest = { ...post, text: "newest", editDate: 10_800, telegramUpdateId: 8 };
+    current.pending.upsert(newest, 10_800, 12_800, { updateKind: "edit", telegramUpdateId: 8 });
+    const older = { ...post, text: "older replay", editDate: 10_700, telegramUpdateId: 7 };
+
+    expect(current.pending.upsert(older, 10_900, 12_900, { updateKind: "edit", telegramUpdateId: 7 })).toMatchObject({
+      updateKind: "post",
+      unmatchedEditAt: 10_800,
+      unmatchedEditUpdateId: 8,
+      snapshot: { text: "newest", telegramUpdateId: 8 },
+    });
+  });
+
   test("quarantines an update while renewal output is unresolved, then suppresses it when registered", () => {
     current = open();
     current.service.observe(snapshotFixture({ messageId: asMessageId(502), telegramDate: 0 }), 1);

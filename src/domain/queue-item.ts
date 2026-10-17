@@ -22,6 +22,12 @@ export type QueueItemRecord = {
   preparationOperationId?: string;
   nicknameRevisionWanted?: number;
   nicknameRevisionApplied?: number;
+  nicknameRevisionWantedKey?: string;
+  nicknameRevisionAppliedKey?: string;
+  editorialFrozenAt?: number;
+  editorialFreezeReason?: "admin_edit" | "admin_delete" | "legacy_edit_evidence" | "legacy_unverified";
+  editorialFreezeMessageId?: MessageId;
+  editorialFreezeUpdateId?: number;
   attribution?: AttributionDescriptor;
   attempts: number;
   enqueuedAt: number;

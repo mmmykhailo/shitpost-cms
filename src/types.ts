@@ -123,6 +123,7 @@ export type PreparationContractV1 = {
   capturedMembers: readonly PreparedMember[];
   steps: readonly TransferStep[];
   targetNicknameRevision: number;
+  targetNicknameKey?: string;
   targetName?: string;
   attribution: AttributionDescriptor;
 };
