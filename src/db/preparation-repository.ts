@@ -16,7 +16,7 @@ type PreparationRow = {
   id: string; item_id: number; kind: "prepare" | "refresh"; state: string; phase: string; boot_id: string; lease_expires_at: number;
   captured_content_version: number; captured_source_generation: number; target_source_generation: number | null;
   source_ids_json: string; contract_json: string; progress_json: string; result_json: string | null; return_item_status: QueueItemStatus;
-  error_code: string | null; error_json: string | null; created_at: number; updated_at: number;
+  error_code: string | null; error_json: string | null; created_at: number; updated_at: number; request_evidence_version: number;
 };
 
 export type PreparationClaim = {
@@ -71,8 +71,8 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const progress: ExecutionProgress = { version: 1, effectiveContentVersion: row.content_version, members: members.map((member) => ({ memberKey: member.member_key!, outcome: "pending", outputIds: [] })) };
     const changed = database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = ? WHERE id = ? AND status = 'queued' AND preparation_state IN ('unprepared','refresh_pending') AND preparation_operation_id IS NULL AND claimed_operation_id IS NULL AND maintenance_status = 'idle' AND content_version = ? AND source_generation = ?").run(state, id, row.id, row.content_version, row.source_generation);
     if (Number(changed.changes) !== 1) return undefined;
-    database.raw.query(`INSERT INTO queue_preparation_operations (id, item_id, kind, state, phase, boot_id, lease_expires_at, captured_content_version, captured_source_generation, target_source_generation, source_ids_json, contract_json, progress_json, result_json, return_item_status, created_at, updated_at)
-      VALUES (?, ?, ?, 'running', 'claimed', ?, ?, ?, ?, NULL, ?, '{}', ?, NULL, ?, ?, ?)`)
+    database.raw.query(`INSERT INTO queue_preparation_operations (id, item_id, kind, state, phase, boot_id, lease_expires_at, captured_content_version, captured_source_generation, target_source_generation, source_ids_json, contract_json, progress_json, result_json, return_item_status, created_at, updated_at, request_evidence_version)
+      VALUES (?, ?, ?, 'running', 'claimed', ?, ?, ?, ?, NULL, ?, '{}', ?, NULL, ?, ?, ?, 1)`)
       .run(id, row.id, kind, bootId, now + leaseMs, row.content_version, row.source_generation, asJson(sourceIds), asJson(progress), row.status, now, now);
     return { operationId: id, itemId: row.id, kind, guard: { operationId: id, itemId: row.id, capturedContentVersion: row.content_version, capturedSourceGeneration: row.source_generation, expectedContentVersion: row.content_version }, sourceIds, memberKeys: members.map((member) => member.member_key!), bootId };
   });
@@ -283,7 +283,11 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const rows = database.raw.query("SELECT * FROM queue_preparation_operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at <= ? OR boot_id <> ?)").all(now, bootId) as PreparationRow[];
     let requeued = 0; let uncertain = 0; let cleanupPending = 0;
     for (const row of rows) {
-      if (row.phase === "claimed") {
+      const requestRows = database.raw.query("SELECT state, known_output_ids_json FROM preparation_request_attempts WHERE operation_id = ? ORDER BY request_ordinal").all(row.id) as Array<{ state: string; known_output_ids_json: string | null }>;
+      const outputCount = Number((database.raw.query("SELECT COUNT(*) AS count FROM queue_preparation_outputs WHERE operation_id = ?").get(row.id) as { count: number }).count);
+      const onlyDefiniteNoOutputRejections = requestRows.length > 0 && requestRows.every((request) => request.state === "rejected" && (request.known_output_ids_json === null || request.known_output_ids_json === "[]"));
+      const requestEvidenceProvesNoMutation = row.request_evidence_version === 1 && outputCount === 0 && (requestRows.length === 0 || onlyDefiniteNoOutputRejections);
+      if (row.phase === "claimed" || requestEvidenceProvesNoMutation) {
         const state = row.kind === "refresh" ? "refresh_pending" : "unprepared";
         database.raw.query("UPDATE queue_items SET preparation_state = ?, preparation_operation_id = NULL WHERE id = ? AND preparation_operation_id = ?").run(state, row.item_id, row.id);
         database.raw.query("UPDATE queue_preparation_operations SET state = 'failed', phase = 'failed', error_code = 'restart_before_mutation', updated_at = ? WHERE id = ?").run(now, row.id);

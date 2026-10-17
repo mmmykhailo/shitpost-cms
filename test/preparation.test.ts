@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createPreparationRepository } from "../src/db/preparation-repository";
+import { createPreparationRequestRepository } from "../src/db/preparation-request-repository";
 import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createPreparationService } from "../src/services/preparation";
 import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
@@ -18,7 +19,8 @@ const open = () => {
   const queue = createQueueRepository(resource.database);
   const policy = createPolicyRepository(resource.database);
   const preparation = createPreparationRepository(resource.database, { operationId: (() => { let next = 1; return () => `prep-${next++}`; })() });
-  return { ...resource, queue, policy, preparation };
+  const requestEvidence = createPreparationRequestRepository(resource.database);
+  return { ...resource, queue, policy, preparation, requestEvidence };
 };
 
 afterEach(() => { while (resources.length) resources.pop()!.close(); });
@@ -48,6 +50,7 @@ const makeGateway = () => {
 const serviceFor = (h: ReturnType<typeof open>, gateway: TelegramGateway, cooldown?: TelegramCooldown) => createPreparationService({
   queue: h.queue,
   preparation: h.preparation,
+  requestEvidence: h.requestEvidence,
   policy: h.policy,
   gateway,
   queueChannelId: asChatId(-100),
@@ -122,6 +125,9 @@ describe("preparation service", () => {
     expect(fake.copied).toEqual([100]);
     expect(fake.edits).toEqual([{ messageId: 500, text: "hello\n\nby Alice Example" }]);
     expect(fake.deleted).toEqual([[100]]);
+    expect(h.requestEvidence.listForOperation("prep-1").map((attempt) => [attempt.method, attempt.state])).toEqual([
+      ["copyMessage", "accepted"], ["editMessageText", "accepted"], ["deleteMessages", "accepted"],
+    ]);
     const [prepared] = h.queue.getCurrentMembers(1);
     expect(prepared).toMatchObject({ messageId: asMessageId(500), deliveryMode: "copy", role: "content", snapshot: { text: "hello\n\nby Alice Example", origin: USER, nativeOrigin: { kind: "absent" } } });
   });

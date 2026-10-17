@@ -16,6 +16,9 @@ import { createGeneratedEventRepository } from "./db/generated-event-repository"
 import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
 import { createTelegramCooldownRepository } from "./db/telegram-cooldown-repository";
+import { createTelegramAdmissionRepository } from "./db/telegram-admission-repository";
+import { createOperationRequestRepository } from "./db/operation-request-repository";
+import { createPreparationRequestRepository } from "./db/preparation-request-repository";
 import { createRuntimeLease } from "./db/runtime";
 import { createTelegramGateway, type BotMembership, type TelegramGateway } from "./telegram";
 import { createIngestionService } from "./services/ingestion";
@@ -36,7 +39,8 @@ import { registerAdminHandlers } from "./handlers/admin";
 import { registerQueueChannelHandlers } from "./handlers/queue-channel";
 import { adminChatIdFromUserId, createRecoveryService } from "./services/recovery";
 import { createRuntimeStatusWriter } from "./runtime-status";
-import { createTelegramCooldown, installTelegramCooldownTransformer } from "./telegram-cooldown";
+import { createTelegramCooldown } from "./telegram-cooldown";
+import { createTelegramAdmission } from "./services/telegram-admission";
 import { systemClock, type Clock, type UserId } from "./types";
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
@@ -149,7 +153,17 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
 
   const bot = options.bot ?? new Bot(config.botToken);
   const telegramCooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
-  installTelegramCooldownTransformer(bot.api, telegramCooldown, clock);
+  const telegramAdmission = createTelegramAdmission({
+    repository: createTelegramAdmissionRepository(database),
+    cooldown: telegramCooldown,
+    clock,
+    logger,
+    queueChatId: Number(config.queueChannelId),
+    targetChatId: Number(config.targetChannelId),
+  });
+  telegramAdmission.install(bot.api);
+  const operationRequest = createOperationRequestRepository(database);
+  const preparationRequest = createPreparationRequestRepository(database);
   const adminChatId = adminChatIdFromUserId(config.adminUserId);
   const gateway = options.gateway ?? createTelegramGateway(bot.api, adminChatId);
   const alerts = createAlertService({
@@ -172,6 +186,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
       stopped = true;
+      telegramAdmission.stop();
       operationTracker.stopAccepting();
       supervisor.requestStop();
       logger.info("shutdown_started", { signal });
@@ -256,13 +271,14 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   }
 
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, events: generatedEvents, pending, logger, now: clock.now });
-  const preparation = createPreparationService({ queue, preparation: preparationRepository, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
   const publicationCoordinator = createPublicationCoordinator();
   const publisher = createPublicationService({
     queue, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
     coordinator: publicationCoordinator,
     schedule,
+    requestEvidence: operationRequest,
     onSharedFailure: async (error, context) => {
       const key = error.kind === "rate_limited" ? "shared_issue:flood_wait" : `shared_issue:${error.kind}`;
       const fingerprint = createHash("sha256").update(JSON.stringify({ kind: error.kind })).digest("hex");
@@ -280,7 +296,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
       }
     },
   });
-  const renewal = createRenewalService({ queue, policy, generated, events: generatedEvents, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const renewal = createRenewalService({ queue, policy, generated, events: generatedEvents, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown, requestEvidence: operationRequest });
   const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger, bootId });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });

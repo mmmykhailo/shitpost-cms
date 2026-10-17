@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { Api } from "grammy";
 import { createDatabase } from "../src/db/database";
 import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
+import { createTelegramAdmissionRepository } from "../src/db/telegram-admission-repository";
 import { createFakeClock } from "../src/clock";
 import { classifyTelegramError } from "../src/errors";
-import { createTelegramCooldown, installTelegramCooldownTransformer } from "../src/telegram-cooldown";
+import { createTelegramCooldown } from "../src/telegram-cooldown";
+import { createTelegramAdmission } from "../src/services/telegram-admission";
+import { createLogger } from "../src/logger";
 
 const resources: Array<{ directory: string; close(): void }> = [];
 
@@ -78,29 +81,28 @@ describe("Telegram cooldown repository", () => {
   });
 
   test("records raw 429 waits, blocks later mutation methods, then allows requests after the full wait", async () => {
-    const { repository } = open();
+    const { database, repository } = open();
     const clock = createFakeClock(100_000);
     const cooldown = createTelegramCooldown({ repository, clock });
     let sendCount = 0;
     const { api, calls } = createApi((method) => method === "sendMessage" && sendCount++ === 0
       ? { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 1_800 } }
       : { ok: true, result: true });
-    installTelegramCooldownTransformer(api, cooldown, clock);
+    let floodObservations = 0;
+    const admission = createTelegramAdmission({ repository: createTelegramAdmissionRepository(database), cooldown, clock, logger: createLogger("error"), onRealFloodWait: () => { floodObservations += 1; } });
+    admission.install(api);
 
     const firstError = await rejected(() => api.sendMessage(42, "first"));
     expect(classifyTelegramError(firstError)).toMatchObject({ kind: "rate_limited", retryAfterSeconds: 1_800 });
     expect(repository.readNotBefore()).toBe(1_900_000);
-    const secondError = await rejected(() => api.editMessageText(42, 10, "second"));
-    expect(classifyTelegramError(secondError)).toMatchObject({ kind: "rate_limited", retryAfterSeconds: 1_800 });
-    expect(calls).toEqual(["sendMessage"]);
-
-    clock.advance(1_800_000);
-    await api.sendMessage(42, "after cooldown");
-    expect(calls).toEqual(["sendMessage", "sendMessage"]);
+    await api.editMessageText(42, 10, "second");
+    expect(clock.now()).toBe(1_900_000);
+    expect(floodObservations).toBe(1);
+    expect(calls).toEqual(["sendMessage", "editMessageText"]);
   });
 
   test("keeps read-only and callback-control requests available during a mutation cooldown", async () => {
-    const { repository } = open();
+    const { database, repository } = open();
     const clock = createFakeClock(200_000);
     const cooldown = createTelegramCooldown({ repository, clock });
     const { api, calls } = createApi((method) => method === "sendMessage"
@@ -108,7 +110,7 @@ describe("Telegram cooldown repository", () => {
       : method === "getChat"
         ? { ok: true, result: { id: -100, type: "channel", title: "Queue" } }
         : { ok: true, result: true });
-    installTelegramCooldownTransformer(api, cooldown, clock);
+    createTelegramAdmission({ repository: createTelegramAdmissionRepository(database), cooldown, clock, logger: createLogger("error") }).install(api);
 
     await rejected(() => api.sendMessage(42, "limited"));
     await api.getChat(-100);
@@ -118,11 +120,11 @@ describe("Telegram cooldown repository", () => {
   });
 
   test("does not turn network failures into a shared flood wait or a second send", async () => {
-    const { repository } = open();
+    const { database, repository } = open();
     const clock = createFakeClock(300_000);
     const cooldown = createTelegramCooldown({ repository, clock });
     const { api, calls } = createApi(() => new TypeError("network disconnected"));
-    installTelegramCooldownTransformer(api, cooldown, clock);
+    createTelegramAdmission({ repository: createTelegramAdmissionRepository(database), cooldown, clock, logger: createLogger("error") }).install(api);
 
     const error = await rejected(() => api.sendMessage(42, "uncertain"));
 

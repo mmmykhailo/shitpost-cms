@@ -75,6 +75,8 @@ export type AnswerCallbackInput = {
 };
 
 export type TelegramGateway = {
+  /** The API adapter dispatches mutations through the shared admission transformer. */
+  dispatchManaged?: true;
   getBotIdentity(): Promise<BotIdentity>;
   getChat(chatIdOrHandle: ChatRef): Promise<ResolvedChat>;
   getBotMembership(chatId: ChatId, botId: UserId): Promise<BotMembership>;
@@ -240,6 +242,7 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
   };
 
   return {
+    dispatchManaged: true,
     getBotIdentity: async () => optionalBotFields(await call("getMe", () => api.getMe())),
     getChat: async (chatIdOrHandle) => optionalChatFields(await call("getChat", () => api.getChat(chatIdOrHandle))),
     getBotMembership: async (chatId, botId) => {

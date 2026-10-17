@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { QueueRepository } from "../db/repositories";
 import type { Logger } from "../logger";
-import { classifyTelegramError } from "../errors";
+import { classifyTelegramError, TelegramLocalDeferralError } from "../errors";
 import type { Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedPublicationContractV2, TransferStep } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
@@ -9,6 +9,8 @@ import type { ChatId } from "../types";
 import type { OperationTracker } from "./task-supervisor";
 import { transferPreparedStep } from "./prepared-transfer";
 import type { PublicationCoordinator } from "./publication-coordinator";
+import type { OperationRequestRepository } from "../db/operation-request-repository";
+import { withTelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
 
 export type PublicationOutcome =
   | { kind: "empty" }
@@ -43,7 +45,9 @@ const deliverySteps = (members: readonly PreparedMember[]): TransferStep[] => {
 };
 
 const retryAtFor = (error: NormalizedTelegramError, now: number, cooldown?: TelegramCooldown): number => {
+  if (error.kind === "local_deferral") return error.retryAt ?? now;
   if (error.kind === "rate_limited") {
+    if (cooldown !== undefined && cooldown.notBefore() > now) return cooldown.notBefore();
     if (cooldown !== undefined) return cooldown.extendForRetryAfter(error.retryAfterSeconds, now);
     return now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1_000);
   }
@@ -65,7 +69,8 @@ export const createPublicationService = (input: {
   operationId?: () => string;
   operationTracker?: OperationTracker;
   coordinator?: PublicationCoordinator;
-  schedule?: { cancelUnsentRuns(reason: string, now: number): number };
+  schedule?: { cancelUnsentRuns(reason: string, now: number): number; claimCanDispatch(claim: ScheduledPublicationContext, now: number): boolean };
+  requestEvidence?: OperationRequestRepository;
   onSharedFailure?: (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }) => Promise<void> | void;
   onSharedRecovery?: () => Promise<void> | void;
 }) => {
@@ -99,6 +104,7 @@ export const createPublicationService = (input: {
       knownOutputCount: context.knownOutputCount ?? evidence?.knownDestinationIds.length ?? 0,
       errorKind: error.kind,
       telegramMethod: error.method,
+      errorDescription: error.description,
     });
   };
 
@@ -109,16 +115,61 @@ export const createPublicationService = (input: {
     capturedSourceGeneration: claimed.capturedSourceGeneration,
   });
 
+  const requestScoped = <T>(options: {
+    family: "publication" | "cleanup";
+    priority: "publication" | "urgent_maintenance";
+    operationId: string;
+    itemId: number;
+    method: string;
+    targetChatId: ChatId;
+    stepKey?: string;
+    deadlineAt?: number;
+    beforeDispatch?: () => void;
+  }, work: () => Promise<T>): Promise<T> => {
+    let requestId: string | undefined;
+    const scope = {
+      family: options.family,
+      priority: options.priority,
+      operationId: options.operationId,
+      itemId: options.itemId,
+      ...(options.stepKey === undefined ? {} : { stepKey: options.stepKey }),
+      ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
+      beforeDispatch: () => {
+        options.beforeDispatch?.();
+        requestId = input.requestEvidence?.begin({ operationId: options.operationId, method: options.method, targetChatId: Number(options.targetChatId), ...(options.stepKey === undefined ? {} : { stepKey: options.stepKey }), now: input.clock.now() });
+      },
+      onResult: (result: TelegramRequestResult) => {
+        if (!requestId || !input.requestEvidence) return;
+        input.requestEvidence.finish(requestId, { state: result.state, ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }), ...(result.knownOutputIds === undefined ? {} : { knownOutputIds: result.knownOutputIds }) }, input.clock.now());
+        requestId = undefined;
+      },
+    } as const;
+    if (input.gateway.dispatchManaged === true) return withTelegramMutationScope(scope, work);
+    return withTelegramMutationScope(scope, async () => {
+      scope.beforeDispatch?.();
+      try {
+        const result = await work();
+        scope.onResult?.({ state: "accepted" });
+        return result;
+      } catch (error) {
+        const normalized = classifyTelegramError(error);
+        const definitive = ["rate_limited", "source_missing", "permission_denied", "destination_unavailable", "unsupported_content", "invalid_content_or_entities", "content_protected", "telegram_age_limit", "unknown_permanent"].includes(normalized.kind);
+        scope.onResult?.({ state: definitive ? "rejected" : "unknown", errorKind: normalized.kind, ...(normalized.knownOutputs === undefined ? {} : { knownOutputIds: normalized.knownOutputs }) });
+        throw error;
+      }
+    });
+  };
+
   const failClaim = async (claimed: Claimed, error: NormalizedTelegramError, context: { expectedOutputCount?: number; knownOutputCount?: number } = {}): Promise<PublicationOutcome> => {
     const now = input.clock.now();
     if (error.kind === "source_missing") {
       input.queue.markMissing(claimed.item.id, claimed.operationId, now);
       return { kind: "deleted_external", itemId: claimed.item.id, operationId: claimed.operationId };
     }
-    if (error.kind === "rate_limited") {
+    if (error.kind === "rate_limited" || error.kind === "local_deferral") {
       const retryAt = retryAtFor(error, now, input.cooldown);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
-      await reportSharedFailure(error, { itemId: claimed.item.id, operationId: claimed.operationId, retryAt });
+      if (error.kind === "rate_limited") await reportSharedFailure(error, { itemId: claimed.item.id, operationId: claimed.operationId, retryAt });
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
     }
     if (error.kind === "ambiguous_send_result" || error.kind === "transient_network" || error.kind === "transient_server") {
@@ -135,7 +186,7 @@ export const createPublicationService = (input: {
     return { kind: "failed", itemId: claimed.item.id, status, error: error.description, operationId: claimed.operationId };
   };
 
-  const publishPreparedClaimed = async (claimed: Claimed): Promise<PublicationOutcome> => {
+  const publishPreparedClaimed = async (claimed: Claimed, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome> => {
     const item = claimed.item;
     const guard = guardFor(claimed);
     const members = input.queue.getCurrentMembers(item.id);
@@ -157,9 +208,9 @@ export const createPublicationService = (input: {
       expectedOutputMessageCount: members.length,
     };
     const destinationIds: MessageId[] = [];
+    let transferStarted = false;
     try {
       input.queue.persistPreparedPublicationContract(claimed.operationId, contract, input.clock.now());
-      input.queue.beginPublicationTransfer(guard, input.clock.now());
       let offset = 0;
       for (const step of steps) {
         const baseOrdinal = offset;
@@ -169,6 +220,19 @@ export const createPublicationService = (input: {
           sourceChatId: input.queueChannelId,
           step,
           beforeRequest: () => input.queue.setOperationPhase(claimed.operationId, "transfer_pending", input.clock.now()),
+          runRequest: ({ method, targetChatId, stepKey, work }) => {
+            return requestScoped({
+              family: "publication", priority: "publication", operationId: claimed.operationId, itemId: item.id, method, targetChatId, stepKey,
+              ...(scheduled === undefined || transferStarted ? {} : { deadlineAt: scheduled.deadlineAt }),
+              beforeDispatch: () => {
+                if (scheduled !== undefined && !input.schedule?.claimCanDispatch(scheduled, input.clock.now())) throw new TelegramLocalDeferralError("cancelled", input.clock.now(), "Scheduled publication was cancelled before dispatch");
+                if (!transferStarted) {
+                  input.queue.beginPublicationTransfer(guard, input.clock.now());
+                  transferStarted = true;
+                }
+              },
+            }, work);
+          },
           recordOutput: (output) => {
             input.queue.recordOutput(claimed.operationId, "transferred", input.targetChannelId, output.messageId, baseOrdinal + output.ordinal, input.clock.now());
             destinationIds.push(output.messageId);
@@ -210,7 +274,7 @@ export const createPublicationService = (input: {
     }
 
     try {
-      await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
+      await requestScoped({ family: "cleanup", priority: "urgent_maintenance", operationId: claimed.operationId, itemId: item.id, method: "deleteMessages", targetChatId: input.queueChannelId }, () => input.gateway.deleteMessages(input.queueChannelId, sourceIds));
       input.queue.markCompleted(item.id, claimed.operationId, input.clock.now());
       return { kind: "published", itemId: item.id, destinationMessageIds: destinationIds, operationId: claimed.operationId };
     } catch (error) {
@@ -232,7 +296,7 @@ export const createPublicationService = (input: {
       const sourceIds = input.queue.operationSourceIds(operation.id);
       if (sourceIds.length === 0) return { kind: "uncertain", itemId, operationId: operation.id };
       try {
-        await input.gateway.deleteMessages(input.queueChannelId, sourceIds);
+        await requestScoped({ family: "cleanup", priority: "urgent_maintenance", operationId: operation.id, itemId, method: "deleteMessages", targetChatId: input.queueChannelId }, () => input.gateway.deleteMessages(input.queueChannelId, sourceIds));
         input.queue.markCompleted(itemId, operation.id, input.clock.now());
         return { kind: "published", itemId, destinationMessageIds: input.queue.operationOutputIds(operation.id, "destination"), operationId: operation.id };
       } catch (error) {
@@ -267,10 +331,10 @@ export const createPublicationService = (input: {
     const attempted: number[] = [];
     for (const candidate of candidates) {
       const operationId = newOperationId();
-      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted, scheduled);
+      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted, scheduled, input.requestEvidence === undefined ? 0 : 1);
       attempted.push(candidate.itemId);
       if (!claimed) continue;
-      const outcome = await tracked(operationId, () => publishPreparedClaimed(claimed));
+      const outcome = await tracked(operationId, () => publishPreparedClaimed(claimed, scheduled));
       if (outcome.kind === "published" || outcome.kind === "cleanup_pending" || outcome.kind === "uncertain" || outcome.kind === "retry_scheduled") return outcome;
       if (outcome.kind === "failed" && outcome.status === "shared_failure") return outcome;
       lastDefinite = outcome;

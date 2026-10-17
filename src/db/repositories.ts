@@ -4,6 +4,7 @@ import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from ".
 import { validateSlotCount } from "../domain/schedule";
 import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { inspectInlineCreditEdit } from "../domain/attribution";
+import { RENEWAL_ITEM_RETRY_MS } from "../domain/renewal-policy";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
 import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, QueueItemStatus, RenewalExecutionGuard, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
@@ -662,7 +663,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return row ? rowToItem(row) : undefined;
   };
 
-  const claimReadyPublication = (operationId: string, type: "publish" | "manual_publish", now: number, expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, bootId?: string, excludedIds: readonly number[] = [], scheduled?: { occurrenceAt: number; deadlineAt: number; claimToken: string }): ClaimedItem | undefined => database.transaction(() => {
+  const claimReadyPublication = (operationId: string, type: "publish" | "manual_publish", now: number, expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, bootId?: string, excludedIds: readonly number[] = [], scheduled?: { occurrenceAt: number; deadlineAt: number; claimToken: string }, requestEvidenceVersion = 0): ClaimedItem | undefined => database.transaction(() => {
     if (scheduled) {
       const run = database.raw.query(`SELECT sr.retry_deadline_at, sr.claim_token, sr.cancelled_at
         FROM schedule_runs sr JOIN settings s ON s.key = 'schedule_enabled'
@@ -691,7 +692,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))
         AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations po WHERE po.item_id = queue_items.id AND po.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`).run(operationId, now, ready.id, ready.contentVersion, ready.sourceGeneration, now);
     if (Number(changed.changes) !== 1) return undefined;
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, ?, ?, 'running', 'claimed', ?, 'queued', ?, ?, ?, ?, ?, ?)").run(operationId, type, ready.id, currentBootId ?? bootId ?? operationId, ready.contentVersion, ready.sourceGeneration, operationId, now + 300_000, now, now);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at, request_evidence_version) VALUES (?, ?, ?, 'running', 'claimed', ?, 'queued', ?, ?, ?, ?, ?, ?, ?)").run(operationId, type, ready.id, currentBootId ?? bootId ?? operationId, ready.contentVersion, ready.sourceGeneration, operationId, now + 300_000, now, now, requestEvidenceVersion);
     if (scheduled) {
       const run = database.raw.query("SELECT attempt_count FROM schedule_runs WHERE occurrence_at = ? AND status = 'running' AND claim_token = ? AND cancelled_at IS NULL").get(scheduled.occurrenceAt, scheduled.claimToken) as { attempt_count: number } | null;
       if (!run) throw new Error("Scheduled publication claim was lost before operation association");
@@ -716,7 +717,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return { item: claimed, operationId, capturedContentVersion: head.contentVersion, capturedSourceGeneration: head.sourceGeneration };
   });
 
-  const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId?: string): ClaimedItem | undefined => database.transaction(() => {
+  const claimRenewal = (operationId: string, now: number, eligibleBefore: number, bootId?: string, requestEvidenceVersion = 0): ClaimedItem | undefined => database.transaction(() => {
     const row = database.raw.query(`SELECT * FROM queue_items qi WHERE status NOT IN ('done','deleted','deleted_external','collecting','publishing','published_cleanup_pending')
       AND maintenance_status = 'idle' AND preparation_operation_id IS NULL AND physical_created_at <= ?
       AND (maintenance_retry_not_before IS NULL OR maintenance_retry_not_before <= ?)
@@ -728,7 +729,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const changed = database.raw.query("UPDATE queue_items SET maintenance_status = 'renewing', maintenance_operation_id = ?, maintenance_retry_not_before = NULL, attempts = attempts + 1 WHERE id = ? AND status = ? AND maintenance_status = 'idle' AND source_generation = ? AND content_version = ?").run(operationId, item.id, item.status, item.sourceGeneration, item.contentVersion);
     if (Number(changed.changes) !== 1) return undefined;
     const sourceIds = currentSourceIds(item.id);
-    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, expected_source_count, captured_content_version, captured_source_generation, source_ids_json, lease_owner, lease_expires_at, created_at, updated_at) VALUES (?, 'renew', ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, item.id, currentBootId ?? bootId ?? operationId, item.status, sourceIds.length, item.contentVersion, item.sourceGeneration, JSON.stringify(sourceIds), operationId, now + 300_000, now, now);
+    database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, expected_source_count, captured_content_version, captured_source_generation, source_ids_json, lease_owner, lease_expires_at, created_at, updated_at, request_evidence_version) VALUES (?, 'renew', ?, 'running', 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(operationId, item.id, currentBootId ?? bootId ?? operationId, item.status, sourceIds.length, item.contentVersion, item.sourceGeneration, JSON.stringify(sourceIds), operationId, now + 300_000, now, now, requestEvidenceVersion);
     const claimed = findItemById(item.id);
     if (!claimed) throw new Error("Queue item disappeared during renewal claim");
     return { item: claimed, operationId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration };
@@ -793,7 +794,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   };
 
   const recoverExpiredOperations = (now: number, bootId?: string): number[] => database.transaction(() => {
-    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation, created_at, plan_json, progress_json FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number; created_at: number; plan_json: string | null; progress_json: string | null }>;
+    const rows = database.raw.query("SELECT id, item_id, type, phase, state, expected_output_count, expected_source_count, captured_content_version, captured_source_generation, created_at, plan_json, progress_json, request_evidence_version FROM operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND ((lease_expires_at IS NULL OR lease_expires_at <= ?) OR (? IS NOT NULL AND (boot_id IS NULL OR boot_id <> ?)))").all(now, bootId ?? null, bootId ?? null) as Array<{ id: string; item_id: number; type: string; phase: string; state: string; expected_output_count: number | null; expected_source_count: number | null; captured_content_version: number; captured_source_generation: number; created_at: number; plan_json: string | null; progress_json: string | null; request_evidence_version: number }>;
     const recovered: number[] = [];
     const markRenewalUncertain = (itemId: number, operationId: string): void => {
       database.raw.query("UPDATE queue_items SET maintenance_status = 'uncertain_renewal', last_error_code = 'startup_recovery', last_error = 'Renewal requires explicit physical resolution' WHERE id = ? AND maintenance_operation_id = ?").run(itemId, operationId);
@@ -806,10 +807,81 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       setOperationPhase(operationId, "uncertain", now, "startup_recovery");
       setOperationState(operationId, "uncertain", now, "startup_recovery");
     };
+    const recoverCompletePublicationOutput = (item: QueueItemRecord, row: typeof rows[number]): boolean => {
+      if (!["publish", "manual_publish"].includes(row.type) || item.status !== "publishing" || item.claimedOperationId !== row.id
+        || !["transfer_pending", "base_outputs_recorded", "attribution_pending", "output_complete"].includes(row.phase)
+        || row.plan_json === null) return false;
+      try {
+        const contract = validatePreparedPublicationContractV2(JSON.parse(row.plan_json) as unknown);
+        const expectedCount = contract.expectedOutputMessageCount;
+        const ids = new Array<number | undefined>(expectedCount);
+        const chats = new Array<number | undefined>(expectedCount);
+        const existing = database.raw.query("SELECT chat_id, telegram_message_id, ordinal FROM operation_outputs WHERE operation_id = ? AND kind = 'destination' ORDER BY ordinal").all(row.id) as Array<{ chat_id: number; telegram_message_id: number; ordinal: number }>;
+        for (const output of existing) {
+          if (output.ordinal < 0 || output.ordinal >= expectedCount) return false;
+          ids[output.ordinal] = output.telegram_message_id;
+          chats[output.ordinal] = output.chat_id;
+        }
+        let offset = 0;
+        const stepOffsets = new Map(contract.steps.map((step) => {
+          const current = offset;
+          offset += step.members.length;
+          return [step.stepKey, { start: current, count: step.members.length }] as const;
+        }));
+        const requests = database.raw.query(`SELECT request_ordinal, target_chat_id, step_key, state, known_output_ids_json
+          FROM operation_request_attempts WHERE operation_id = ? AND step_key IS NOT NULL ORDER BY request_ordinal`).all(row.id) as Array<{ request_ordinal: number; target_chat_id: number; step_key: string; state: string; known_output_ids_json: string | null }>;
+        for (const request of requests) {
+          if (request.state === "rejected" || request.known_output_ids_json === null) continue;
+          const step = stepOffsets.get(request.step_key);
+          if (!step) return false;
+          const outputIds = JSON.parse(request.known_output_ids_json) as unknown;
+          if (!Array.isArray(outputIds)) return false;
+          for (const [index, messageId] of outputIds.entries()) {
+            if (!Number.isSafeInteger(messageId) || Number(messageId) <= 0 || index >= step.count) return false;
+            const ordinal = step.start + index;
+            if (ids[ordinal] !== undefined && ids[ordinal] !== messageId) return false;
+            ids[ordinal] = Number(messageId);
+            chats[ordinal] = request.target_chat_id;
+          }
+        }
+        if (ids.length !== expectedCount || ids.some((id) => id === undefined) || chats.some((chatId) => chatId === undefined) || new Set(chats).size !== 1) return false;
+        const guard: OperationGuard = { operationId: row.id, itemId: item.id, capturedContentVersion: row.captured_content_version, capturedSourceGeneration: row.captured_source_generation };
+        const outputs = ids.map((messageId, ordinal) => ({ chatId: chats[ordinal]!, messageId: messageId!, ordinal }));
+        if (row.phase === "transfer_pending") recordCompleteBaseOutputs(guard, outputs, now);
+        const phase = database.raw.query("SELECT phase FROM operations WHERE id = ?").get(row.id) as { phase: string };
+        if (phase.phase === "base_outputs_recorded" || phase.phase === "attribution_pending") markPublicationOutputComplete(guard, ids as number[], now);
+        const completedPhase = database.raw.query("SELECT phase FROM operations WHERE id = ?").get(row.id) as { phase: string };
+        if (completedPhase.phase === "output_complete") markSourceCleanupPending(guard, now);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     for (const row of rows) {
       const item = findItemById(row.item_id);
       if (!item) continue;
       if (row.type === "renew") {
+        if (row.request_evidence_version === 1 && operationOutputIds(row.id, "replacement").length === 0) {
+          const requests = database.raw.query("SELECT state, error_kind, known_output_ids_json FROM operation_request_attempts WHERE operation_id = ? ORDER BY request_ordinal").all(row.id) as Array<{ state: string; error_kind: string | null; known_output_ids_json: string | null }>;
+          const noRequestStarted = requests.length === 0;
+          const onlyDefiniteNoOutputRejections = requests.length > 0 && requests.every((request) => request.state === "rejected" && (request.known_output_ids_json === null || request.known_output_ids_json === "[]"));
+          if (noRequestStarted || onlyDefiniteNoOutputRejections) {
+            let retryAt = now + RENEWAL_ITEM_RETRY_MS;
+            if (requests.some((request) => request.error_kind === "rate_limited")) {
+              const setting = database.raw.query("SELECT value_json FROM settings WHERE key = 'telegram_mutation_not_before'").get() as { value_json: string } | null;
+              if (setting) {
+                try { const parsed: unknown = JSON.parse(setting.value_json); if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0) retryAt = Math.max(now, parsed); }
+                catch { /* Keep the ordinary bounded maintenance retry. */ }
+              }
+            }
+            database.raw.query(`UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL, maintenance_retry_not_before = ?, last_error_code = 'startup_recovered_rejection', last_error = 'Renewal had no possibly-sent replacement request'
+              WHERE id = ? AND maintenance_status = 'renewing' AND maintenance_operation_id = ?`).run(retryAt, item.id, row.id);
+            setOperationPhase(row.id, "failed", now, "startup_recovered_rejection");
+            setOperationState(row.id, "failed", now, "startup_recovered_rejection");
+            recovered.push(item.id);
+            continue;
+          }
+        }
         if (row.phase === "claimed") {
           database.raw.query("UPDATE queue_items SET maintenance_status = 'idle', maintenance_operation_id = NULL WHERE id = ? AND maintenance_operation_id = ?").run(item.id, row.id);
           setOperationPhase(row.id, "failed", now, "startup_recovery");
@@ -904,7 +976,35 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         recovered.push(item.id);
         continue;
       }
-      if (row.phase === "claimed" && item.status === "publishing") {
+      if (["publish", "manual_publish"].includes(row.type) && row.request_evidence_version === 1 && item.status === "publishing"
+        && item.claimedOperationId === row.id && operationOutputIds(row.id, "destination").length === 0) {
+        const requests = database.raw.query("SELECT state, error_kind FROM operation_request_attempts WHERE operation_id = ? ORDER BY request_ordinal").all(row.id) as Array<{ state: string; error_kind: string | null }>;
+        if (requests.length > 0 && requests.every((request) => request.state === "rejected")) {
+          let retryAt: number | null = null;
+          if (requests.some((request) => request.error_kind === "rate_limited")) {
+            const setting = database.raw.query("SELECT value_json FROM settings WHERE key = 'telegram_mutation_not_before'").get() as { value_json: string } | null;
+            if (setting) {
+              try { const parsed: unknown = JSON.parse(setting.value_json); if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0) retryAt = parsed; }
+              catch { retryAt = null; }
+            }
+          }
+          database.raw.query(`UPDATE queue_items SET status = 'queued', retry_not_before = COALESCE(?, retry_not_before), claimed_operation_id = NULL, claimed_at = NULL,
+            last_error_code = 'startup_recovered_rejection', last_error = 'Telegram definitively rejected the prior request before producing output'
+            WHERE id = ? AND status = 'publishing' AND claimed_operation_id = ?`).run(retryAt, item.id, row.id);
+          setOperationPhase(row.id, "failed", now, "startup_recovered_rejection");
+          setOperationState(row.id, "failed", now, "startup_recovered_rejection");
+          recovered.push(item.id);
+          continue;
+        }
+      }
+      if (recoverCompletePublicationOutput(item, row)) {
+        recovered.push(item.id);
+        continue;
+      }
+      const noPublicationRequestStarted = ["publish", "manual_publish"].includes(row.type) && row.request_evidence_version === 1
+        && (database.raw.query("SELECT 1 AS found FROM operation_request_attempts WHERE operation_id = ? LIMIT 1").get(row.id) === null)
+        && operationOutputIds(row.id, "destination").length === 0;
+      if ((row.phase === "claimed" || row.phase === "transfer_pending") && item.status === "publishing" && (row.phase === "claimed" || noPublicationRequestStarted)) {
         database.raw.query("UPDATE queue_items SET status = 'queued', claimed_operation_id = NULL, claimed_at = NULL, last_error_code = 'startup_recovery' WHERE id = ? AND claimed_operation_id = ?").run(item.id, row.id);
         setOperationPhase(row.id, "failed", now, "startup_recovery");
         setOperationState(row.id, "failed", now, "startup_recovery");
@@ -1798,7 +1898,8 @@ export const createScheduleRepository = (database: AppDatabase) => {
             AND ((CAST(strftime('%H', occurrence_at / 1000, 'unixepoch') AS INTEGER) * 60) + CAST(strftime('%M', occurrence_at / 1000, 'unixepoch') AS INTEGER)) = ?)
           OR (status = 'running'
             AND ((CAST(strftime('%H', occurrence_at / 1000, 'unixepoch') AS INTEGER) * 60) + CAST(strftime('%M', occurrence_at / 1000, 'unixepoch') AS INTEGER)) = ?
-            AND NOT EXISTS (SELECT 1 FROM schedule_publication_attempts spa WHERE spa.occurrence_at = schedule_runs.occurrence_at)))`).run(now, now, minuteOfDay, minuteOfDay);
+            AND NOT EXISTS (SELECT 1 FROM schedule_publication_attempts spa JOIN operation_request_attempts ora ON ora.operation_id = spa.operation_id
+              WHERE spa.occurrence_at = schedule_runs.occurrence_at AND ora.state IN ('in_flight','accepted','unknown'))))`).run(now, now, minuteOfDay, minuteOfDay);
       database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('schedule_slot_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ minuteOfDay }), now);
     }
   });
@@ -1856,6 +1957,10 @@ export const createScheduleRepository = (database: AppDatabase) => {
     const row = database.raw.query("SELECT retry_deadline_at FROM schedule_runs WHERE occurrence_at = ? AND claim_token = ?").get(occurrenceAt, claimToken) as { retry_deadline_at: number };
     return { occurrenceAt, deadlineAt: row.retry_deadline_at, claimToken };
   });
+  const claimCanDispatch = (claim: { occurrenceAt: number; deadlineAt: number; claimToken: string }, now: number): boolean => Boolean(database.raw.query(`SELECT 1 AS valid FROM schedule_runs sr
+    WHERE sr.occurrence_at = ? AND sr.status = 'running' AND sr.claim_token = ? AND sr.cancelled_at IS NULL
+      AND sr.retry_deadline_at = ? AND sr.retry_deadline_at > ?
+      AND EXISTS (SELECT 1 FROM settings WHERE key = 'schedule_enabled' AND json_extract(value_json, '$') = 1)`).get(claim.occurrenceAt, claim.claimToken, claim.deadlineAt, now));
   const deferRun = (claimToken: string, retryAt: number, now: number, reason: string): boolean => {
     const row = database.raw.query("SELECT occurrence_at, retry_deadline_at FROM schedule_runs WHERE status = 'running' AND claim_token = ? AND cancelled_at IS NULL").get(claimToken) as { occurrence_at: number; retry_deadline_at: number } | null;
     if (!row || retryAt >= row.retry_deadline_at || now >= row.retry_deadline_at) return false;
@@ -1878,7 +1983,8 @@ export const createScheduleRepository = (database: AppDatabase) => {
   const cancelUnsentRows = (reason: string, now: number): number => {
     const result = database.raw.query(`UPDATE schedule_runs SET status = 'failed', cancelled_at = ?, cancel_reason = ?, completed_at = ?, error_code = ?, retry_not_before = NULL, claim_token = NULL, claim_boot_id = NULL
       WHERE cancelled_at IS NULL AND (status = 'pending' OR (status = 'running'
-        AND NOT EXISTS (SELECT 1 FROM schedule_publication_attempts spa WHERE spa.occurrence_at = schedule_runs.occurrence_at)))`).run(now, reason, now, reason);
+        AND NOT EXISTS (SELECT 1 FROM schedule_publication_attempts spa JOIN operation_request_attempts ora ON ora.operation_id = spa.operation_id
+          WHERE spa.occurrence_at = schedule_runs.occurrence_at AND ora.state IN ('in_flight','accepted','unknown'))))`).run(now, reason, now, reason);
     return Number(result.changes);
   };
   const cancelPendingRuns = (reason: string, now: number): number => database.transaction(() => cancelPendingRows(reason, now));
@@ -1949,5 +2055,5 @@ export const createScheduleRepository = (database: AppDatabase) => {
     return row.last_scheduler_scan_at ?? undefined;
   };
   const setLastScan = (now: number): void => { database.raw.query("UPDATE app_state SET last_scheduler_scan_at = ? WHERE id = 1").run(now); };
-  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, markRunning, duePending, nextPendingWake, claimRun, deferRun, finishRun, cancelPendingRuns, cancelUnsentRuns, cancelOlderPendingRuns, expirePendingRuns, associatedAttempts, recoverInterruptedRuns, lastScan, setLastScan };
+  return { slots, enabled, setEnabled, addSlot, removeSlot, materialize, run, markRun, markRunning, duePending, nextPendingWake, claimRun, claimCanDispatch, deferRun, finishRun, cancelPendingRuns, cancelUnsentRuns, cancelOlderPendingRuns, expirePendingRuns, associatedAttempts, recoverInterruptedRuns, lastScan, setLastScan };
 };

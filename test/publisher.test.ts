@@ -7,6 +7,7 @@ import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-re
 import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { createPublicationService } from "../src/services/publisher";
 import { createPublicationCoordinator } from "../src/services/publication-coordinator";
+import { createOperationRequestRepository } from "../src/db/operation-request-repository";
 import { createTelegramCooldown } from "../src/telegram-cooldown";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
@@ -51,11 +52,12 @@ const open = (gateway: TelegramGateway) => {
   const queue = createQueueRepository(database);
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
+  const requestEvidence = createOperationRequestRepository(database);
   const clock = createFakeClock(10_000);
   const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
-  const service = createPublicationService({ queue, schedule, coordinator: createPublicationCoordinator(), gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
+  const service = createPublicationService({ queue, schedule, requestEvidence, coordinator: createPublicationCoordinator(), gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
   resources.push({ directory, close: database.close });
-  return { database, queue, policy, schedule, service, clock, cooldown };
+  return { database, queue, policy, schedule, requestEvidence, service, clock, cooldown };
 };
 
 const ready = (run: ReturnType<typeof open>, itemId = 1, mode: "copy" | "forward" = "copy"): void => markQueueItemPrepared(run.database, itemId, mode, run.clock.now());
@@ -101,6 +103,10 @@ describe("publication service", () => {
     expect((await run.service.publishNext("publish", undefined, claim)).kind).toBe("published");
     expect(run.schedule.run(occurrence)).toMatchObject({ status: "running", attemptCount: 1, itemId: 1, operationId: "op-1" });
     expect(run.schedule.associatedAttempts(occurrence)).toMatchObject([{ attemptNo: 1, operationId: "op-1", itemId: 1, operationState: "done", outputIds: [1000] }]);
+    expect(run.requestEvidence.listForOperation("op-1").map((request) => ({ method: request.method, state: request.state, targetChatId: request.targetChatId }))).toEqual([
+      { method: "copyMessage", state: "accepted", targetChatId: -200 },
+      { method: "deleteMessages", state: "accepted", targetChatId: -100 },
+    ]);
   });
 
   test("manual confirmed output cancels scheduled work that has not started sending", async () => {
@@ -118,6 +124,71 @@ describe("publication service", () => {
 
     expect((await run.service.publishNext("manual_publish")).kind).toBe("published");
     expect(run.schedule.run(occurrence)).toMatchObject({ status: "failed", cancelReason: "manual_publication" });
+  });
+
+  test("startup adopts an exact destination output persisted in the request journal", () => {
+    const occurrence = Date.parse("2026-10-06T00:00:00Z");
+    const fake = fakeGateway();
+    const run = open(fake.gateway);
+    run.clock.advance(occurrence + 20_000 - run.clock.now());
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(121) }), occurrence - 2_000);
+    ready(run, 1);
+    run.schedule.addSlot(0, 1, occurrence - 1);
+    run.schedule.setEnabled(true, 1, run.clock.now());
+    run.schedule.materialize(occurrence);
+    const scheduleClaim = run.schedule.claimRun(occurrence, "test-boot", run.clock.now())!;
+    const operation = run.queue.claimReadyPublication("journalled-output", "publish", run.clock.now(), undefined, undefined, [], scheduleClaim, 1)!;
+    const member = run.queue.getCurrentMembers(operation.item.id)[0]!;
+    run.queue.persistPreparedPublicationContract(operation.operationId, {
+      version: 2,
+      kind: "prepared_delivery",
+      capturedContentVersion: operation.capturedContentVersion,
+      capturedSourceGeneration: operation.capturedSourceGeneration,
+      sourceIds: [member.messageId],
+      steps: [{ stepKey: "member:0", mode: "copy", grouped: false, members: [member] }],
+      expectedOutputMessageCount: 1,
+    }, run.clock.now());
+    run.queue.beginPublicationTransfer({ operationId: operation.operationId, itemId: operation.item.id, capturedContentVersion: operation.capturedContentVersion, capturedSourceGeneration: operation.capturedSourceGeneration }, run.clock.now());
+    const requestId = run.requestEvidence.begin({ operationId: operation.operationId, method: "copyMessage", targetChatId: -200, stepKey: "member:0", now: run.clock.now() });
+    run.requestEvidence.finish(requestId, { state: "accepted", knownOutputIds: [903] }, run.clock.now());
+
+    run.queue.recoverExpiredOperations(run.clock.now(), "next-boot");
+    expect(run.queue.findItemById(1)?.status).toBe("published_cleanup_pending");
+    expect(run.queue.operationOutputIds(operation.operationId, "destination")).toEqual([asMessageId(903)]);
+    run.schedule.recoverInterruptedRuns(run.clock.now());
+    expect(run.schedule.run(occurrence)).toMatchObject({ status: "published", operationId: operation.operationId, itemId: 1 });
+  });
+
+  test("startup retries a definitively rejected no-output request with its original run deadline", () => {
+    const occurrence = Date.parse("2026-10-06T00:00:00Z");
+    const fake = fakeGateway();
+    const run = open(fake.gateway);
+    run.clock.advance(occurrence + 20_000 - run.clock.now());
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(122) }), occurrence - 2_000);
+    ready(run, 1);
+    run.schedule.addSlot(0, 1, occurrence - 1);
+    run.schedule.setEnabled(true, 1, run.clock.now());
+    run.schedule.materialize(occurrence);
+    const scheduleClaim = run.schedule.claimRun(occurrence, "test-boot", run.clock.now())!;
+    const operation = run.queue.claimReadyPublication("rejected-output", "publish", run.clock.now(), undefined, undefined, [], scheduleClaim, 1)!;
+    run.queue.persistPreparedPublicationContract(operation.operationId, {
+      version: 2,
+      kind: "prepared_delivery",
+      capturedContentVersion: operation.capturedContentVersion,
+      capturedSourceGeneration: operation.capturedSourceGeneration,
+      sourceIds: [asMessageId(122)],
+      steps: [{ stepKey: "member:0", mode: "copy", grouped: false, members: [run.queue.getCurrentMembers(1)[0]!] }],
+      expectedOutputMessageCount: 1,
+    }, run.clock.now());
+    run.queue.beginPublicationTransfer({ operationId: operation.operationId, itemId: 1, capturedContentVersion: operation.capturedContentVersion, capturedSourceGeneration: operation.capturedSourceGeneration }, run.clock.now());
+    const requestId = run.requestEvidence.begin({ operationId: operation.operationId, method: "copyMessage", targetChatId: -200, stepKey: "member:0", now: run.clock.now() });
+    run.requestEvidence.finish(requestId, { state: "rejected", errorKind: "rate_limited" }, run.clock.now());
+
+    run.queue.recoverExpiredOperations(run.clock.now(), "next-boot");
+    run.schedule.recoverInterruptedRuns(run.clock.now());
+    expect(run.queue.findItemById(1)?.status).toBe("queued");
+    expect(run.schedule.run(occurrence)).toMatchObject({ status: "pending", retryDeadlineAt: occurrence + 300_000 });
+    expect(run.schedule.duePending(run.clock.now())).toHaveLength(1);
   });
 
   test("classifies transfer rate limits and missing sources without deleting prematurely", async () => {

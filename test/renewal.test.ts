@@ -6,6 +6,7 @@ import { createDatabase } from "../src/db/database";
 import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createOrphanRepository } from "../src/db/orphan-repository";
+import { createOperationRequestRepository } from "../src/db/operation-request-repository";
 import { createOrphanCleanupService } from "../src/services/orphan-cleanup";
 import { createRenewalService } from "../src/services/renewal";
 import { createTelegramCooldown } from "../src/telegram-cooldown";
@@ -50,6 +51,7 @@ const open = (gateway: TelegramGateway) => {
   const queue = createQueueRepository(database);
   const clock = createFakeClock(100_000);
   const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
+  const requestEvidence = createOperationRequestRepository(database);
   const renewal = createRenewalService({
     queue,
     policy: createPolicyRepository(database),
@@ -60,9 +62,10 @@ const open = (gateway: TelegramGateway) => {
     logger: createLogger("error"),
     cooldown,
     operationId: (() => { let i = 0; return () => `renew-${++i}`; })(),
+    requestEvidence,
   });
   resources.push({ directory, close: database.close });
-  return { queue, renewal, database, cooldown, clock };
+  return { queue, renewal, database, cooldown, clock, requestEvidence };
 };
 
 afterEach(() => {
@@ -185,6 +188,27 @@ describe("renewal service", () => {
     const orphanCleanup = createOrphanCleanupService({ orphan: createOrphanRepository(database), gateway: fake.gateway, clock: createFakeClock(100_000), logger: createLogger("error") });
     expect((await orphanCleanup.runOnce()).resolved).toBe(1);
     expect((database.raw.query("SELECT COUNT(*) AS count FROM orphaned_sources WHERE resolved_at IS NULL").get() as { count: number }).count).toBe(0);
+  });
+
+  test("journals each renewal mutation request and cleanup with its operation", async () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, renewal, requestEvidence } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(899), telegramDate: 0 }), 1);
+
+    expect((await renewal.renewNext(0)).kind).toBe("renewed");
+    expect(requestEvidence.listForOperation("renew-1").map((attempt) => [attempt.method, attempt.state])).toEqual([
+      ["copyMessage", "accepted"], ["deleteMessages", "accepted"],
+    ]);
+  });
+
+  test("recovers a versioned renewal claim with no started request as safe maintenance", () => {
+    const fake = gatewayWithDeleteFailure("transient_network", false);
+    const { queue, database } = open(fake.gateway);
+    queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(898), telegramDate: 0 }), 1);
+    const claim = queue.claimRenewal("renew-crash", 100_000, 100_000, "boot-a", 1)!;
+
+    expect(queue.recoverExpiredOperations(100_020, "boot-b")).toEqual([claim.item.id]);
+    expect(database.raw.query("SELECT maintenance_status, maintenance_operation_id, maintenance_retry_not_before FROM queue_items WHERE id = ?").get(claim.item.id)).toEqual({ maintenance_status: "idle", maintenance_operation_id: null, maintenance_retry_not_before: 160_020 });
   });
 
   test("dates a replacement from immediately before the transfer request", async () => {

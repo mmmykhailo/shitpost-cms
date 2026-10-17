@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { fingerprintSnapshotContent } from "../domain/message";
 import { validatePreparedRenewalContractV2 } from "../domain/validation";
 import { RENEWAL_ITEM_RETRY_MS } from "../domain/renewal-policy";
-import { classifyTelegramError } from "../errors";
+import { classifyTelegramError, TelegramLocalDeferralError } from "../errors";
 import type { QueueRepository, PolicyRepository, GeneratedMessageRepository } from "../db/repositories";
 import type { Logger } from "../logger";
 import type { ChatId, Clock, MessageId, NormalizedTelegramError, OperationGuard, PreparedMember, PreparedRenewalContractV2, RenewalExecutionGuard, StoredMessageSnapshot, TransferStep } from "../types";
@@ -11,6 +11,8 @@ import type { TelegramCooldown } from "../telegram-cooldown";
 import type { OperationTracker } from "./task-supervisor";
 import type { createGeneratedEventRepository } from "../db/generated-event-repository";
 import { transferPreparedStep } from "./prepared-transfer";
+import type { OperationRequestRepository } from "../db/operation-request-repository";
+import { withTelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
 
 export type RenewalOutcome =
   | { kind: "nothing_due" }
@@ -35,8 +37,69 @@ export const createRenewalService = (input: {
   operationId?: () => string;
   operationTracker?: OperationTracker;
   events?: ReturnType<typeof createGeneratedEventRepository>;
+  requestEvidence?: OperationRequestRepository;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
+
+  const resultIds = (value: unknown): number[] => {
+    if (Array.isArray(value)) return value.filter((id): id is number => typeof id === "number" && Number.isSafeInteger(id) && id > 0);
+    if (typeof value === "object" && value !== null) {
+      const id = (value as Record<string, unknown>).message_id ?? (value as Record<string, unknown>).messageId;
+      return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? [id] : [];
+    }
+    return [];
+  };
+
+  const runRequest = async <T>(request: {
+    operationId: string;
+    itemId: number;
+    method: string;
+    targetChatId: number;
+    stepKey?: string;
+    family?: "renewal" | "cleanup";
+    beforeDispatch?: () => void;
+    work: () => Promise<T>;
+  }): Promise<T> => {
+    let requestId: string | undefined;
+    const beforeDispatch = (): void => {
+      request.beforeDispatch?.();
+      requestId = input.requestEvidence?.begin({ operationId: request.operationId, method: request.method, targetChatId: request.targetChatId, ...(request.stepKey === undefined ? {} : { stepKey: request.stepKey }), now: input.clock.now() });
+    };
+    const onResult = (result: TelegramRequestResult): void => {
+      if (requestId === undefined || input.requestEvidence === undefined) return;
+      input.requestEvidence.finish(requestId, result, input.clock.now());
+    };
+    const scope = {
+      family: request.family ?? "renewal" as const,
+      priority: request.family === "cleanup" ? "urgent_maintenance" as const : "background" as const,
+      operationId: request.operationId,
+      itemId: request.itemId,
+      ...(request.stepKey === undefined ? {} : { stepKey: request.stepKey }),
+      beforeDispatch,
+      onResult,
+    };
+    if (input.gateway.dispatchManaged === true) return withTelegramMutationScope(scope, request.work);
+    beforeDispatch();
+    try {
+      const value = await request.work();
+      const ids = resultIds(value);
+      onResult({ state: "accepted", ...(ids.length === 0 ? {} : { knownOutputIds: ids }) });
+      return value;
+    } catch (error) {
+      const normalized = classifyTelegramError(error, request.method);
+      const definitive = new Set(["rate_limited", "source_missing", "permission_denied", "destination_unavailable", "unsupported_content", "invalid_content_or_entities", "content_protected", "telegram_age_limit", "unknown_permanent"]);
+      onResult({ state: definitive.has(normalized.kind) ? "rejected" : "unknown", errorKind: normalized.kind, ...(normalized.knownOutputs === undefined ? {} : { knownOutputIds: normalized.knownOutputs.map(Number) }) });
+      if (normalized.kind === "rate_limited") input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, input.clock.now());
+      throw error;
+    }
+  };
+
+  const assertReplacementDispatchable = (claimed: NonNullable<ReturnType<QueueRepository["claimRenewal"]>>, guard: RenewalExecutionGuard): void => {
+    const current = input.queue.findItemById(claimed.item.id);
+    if (!current || current.maintenanceOperationId !== claimed.operationId || current.maintenanceStatus !== "renewing" || current.contentVersion !== guard.expectedContentVersion || current.sourceGeneration !== claimed.capturedSourceGeneration) {
+      throw new TelegramLocalDeferralError("protection_changed", input.clock.now(), "Queue item changed before renewal dispatch");
+    }
+  };
 
   const tracked = async <T>(operationId: string, work: () => Promise<T>): Promise<T> => {
     const finish = input.operationTracker?.begin(operationId);
@@ -98,9 +161,15 @@ export const createRenewalService = (input: {
       input.queue.markMissing(claimed.item.id, claimed.operationId, now);
       return { kind: "deleted_external", itemId: claimed.item.id };
     }
+    if (error.kind === "local_deferral") {
+      const retryAt = error.retryAt ?? now + 1_000;
+      input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
+      return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt };
+    }
     if (error.kind === "rate_limited") {
-      const retryAt = input.cooldown?.extendForRetryAfter(error.retryAfterSeconds, now)
-        ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000);
+      const retryAt = input.gateway.dispatchManaged === true
+        ? (input.cooldown?.notBefore() ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000))
+        : (input.cooldown?.extendForRetryAfter(error.retryAfterSeconds, now) ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1000));
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt };
     }
@@ -121,9 +190,8 @@ export const createRenewalService = (input: {
     operationGuard: RenewalExecutionGuard | OperationGuard = guardFor(claimed),
   ): Promise<RenewalOutcome> => {
     const guard = operationGuard;
-    input.queue.setOperationPhase(claimed.operationId, "old_source_cleanup_pending", input.clock.now());
     try {
-      await input.gateway.deleteMessages(input.queueChannelId, oldSourceIds);
+      await runRequest({ operationId: claimed.operationId, itemId: claimed.item.id, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "old-source-generation", beforeDispatch: () => input.queue.setOperationPhase(claimed.operationId, "old_source_cleanup_pending", input.clock.now()), work: () => input.gateway.deleteMessages(input.queueChannelId, oldSourceIds) });
       input.queue.completeRenewalWithOrphans(guard, [], input.clock.now());
       return { kind: "renewed", itemId: claimed.item.id, generation };
     } catch (error) {
@@ -132,7 +200,7 @@ export const createRenewalService = (input: {
         input.queue.completeRenewalWithOrphans(guard, [], input.clock.now());
         return { kind: "renewed", itemId: claimed.item.id, generation };
       }
-      if (normalized.kind === "rate_limited") input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, input.clock.now());
+      if (normalized.kind === "rate_limited" && input.gateway.dispatchManaged !== true) input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, input.clock.now());
       // The replacement generation is already durable. Keep it current and
       // make each old ID independently retryable instead of wedging the item.
       input.queue.completeRenewalWithOrphans(guard, oldSourceIds, input.clock.now(), normalized.kind === "permission_denied" ? "permission_denied" : normalized.kind);
@@ -177,7 +245,11 @@ export const createRenewalService = (input: {
             targetChatId: input.queueChannelId,
             sourceChatId: input.queueChannelId,
             step,
-            beforeRequest: () => input.queue.setOperationPhase(claimed.operationId, "replacement_pending", input.clock.now()),
+            beforeRequest: () => undefined,
+            runRequest: (request) => runRequest({ operationId: claimed.operationId, itemId: claimed.item.id, method: request.method, targetChatId: Number(request.targetChatId), stepKey: request.stepKey, beforeDispatch: () => {
+              assertReplacementDispatchable(claimed, guard);
+              input.queue.setOperationPhase(claimed.operationId, "replacement_pending", input.clock.now());
+            }, work: request.work }),
             recordOutput: (output) => {
               const ordinal = globalOrdinal++;
               input.queue.recordReplacementOutput(claimed.operationId, output.chatId, output.messageId, ordinal, input.clock.now(), { stepKey: output.stepKey, ...(output.sourceMemberKey === undefined ? {} : { sourceMemberKey: output.sourceMemberKey }) });
@@ -237,7 +309,7 @@ export const createRenewalService = (input: {
 
   const renewNextAttempt = async (minimumAgeMs: number): Promise<{ outcome: RenewalOutcome; sourceCount: number }> => {
     const now = input.clock.now();
-    const claimed = input.queue.claimRenewal(newOperationId(), now, now - minimumAgeMs);
+    const claimed = input.queue.claimRenewal(newOperationId(), now, now - minimumAgeMs, undefined, input.requestEvidence === undefined ? 0 : 1);
     if (!claimed) return { outcome: { kind: "nothing_due" }, sourceCount: 0 };
     const sourceCount = input.queue.getMessages(claimed.item.id, claimed.capturedSourceGeneration).length;
     return { outcome: await renewClaimedTracked(claimed), sourceCount };

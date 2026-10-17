@@ -22,7 +22,7 @@ describe("schema migrations", () => {
     const database = createDatabase(join(directory, "bot.sqlite"));
     resources.push({ directory, close: database.close });
 
-    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(10);
+    expect((database.raw.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(11);
     const columns = (table: string): string[] => (database.raw.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
     expect(columns("queue_items")).toEqual(expect.arrayContaining(["maintenance_status", "maintenance_operation_id", "maintenance_retry_not_before", "preparation_state", "representation_kind", "delivery_mode", "attribution_json", "editorial_frozen_at", "editorial_freeze_reason", "nickname_revision_wanted_key", "nickname_revision_applied_key"]));
     expect(columns("operations")).toEqual(expect.arrayContaining(["boot_id", "phase", "return_item_status", "expected_source_count", "expected_output_count", "source_ids_json", "plan_json"]));
@@ -99,7 +99,7 @@ describe("schema migrations", () => {
     expect((legacy.query("SELECT status FROM queue_items WHERE id = ?").get(uncertain) as { status: string }).status).toBe("uncertain_publish");
     expect((legacy.query("SELECT state FROM operations WHERE id = 'uncertain-op'").get() as { state: string }).state).toBe("uncertain");
     expect((legacy.query("SELECT retry_deadline_at FROM schedule_runs WHERE occurrence_at = 1000").get() as { retry_deadline_at: number }).retry_deadline_at).toBe(301000);
-    expect((legacy.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(10);
+    expect((legacy.query("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version).toBe(11);
     expect((legacy.query("PRAGMA foreign_key_check").all() as unknown[])).toHaveLength(0);
     legacy.close();
     rmSync(directory, { recursive: true, force: true });

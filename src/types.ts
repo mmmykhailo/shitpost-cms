@@ -276,6 +276,7 @@ export type PublicationPlan =
   | { kind: "blocked"; reason: "unknown_origin" | "unsupported_content" | "mixed_album_origin" };
 
 export type NormalizedTelegramErrorKind =
+  | "local_deferral"
   | "rate_limited"
   | "transient_network"
   | "transient_server"
@@ -299,15 +300,26 @@ export type NormalizedTelegramError = {
   knownOutputs?: readonly MessageId[];
   /** True when a creation request may have reached Telegram. */
   requestMayHaveSucceeded?: boolean;
+  localDeferralReason?: "shared_cooldown" | "deadline" | "cancelled" | "protection_changed" | "shutdown";
+  retryAt?: number;
   cause?: unknown;
 };
 
 export type Clock = {
   now(): number;
-  sleep(milliseconds: number): Promise<void>;
+  sleep(milliseconds: number, signal?: AbortSignal): Promise<void>;
 };
 
 export const systemClock: Clock = {
   now: () => Date.now(),
-  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  sleep: (milliseconds, signal) => new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const timer = setTimeout(done, milliseconds);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  }),
 };

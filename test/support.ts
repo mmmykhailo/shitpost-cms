@@ -43,10 +43,18 @@ export const createControlledClock = (initialTime: number): ControlledClock => {
   const sleepers: Array<{ deadline: number; resolve(): void }> = [];
   return {
     now: () => current,
-    sleep: (milliseconds) => new Promise<void>((resolve) => {
+    sleep: (milliseconds, signal) => new Promise<void>((resolve) => {
       if (!Number.isFinite(milliseconds)) throw new Error("Sleep duration must be finite");
+      if (signal?.aborted) { resolve(); return; }
       if (milliseconds <= 0) { resolve(); return; }
-      sleepers.push({ deadline: current + milliseconds, resolve });
+      const sleeper = { deadline: current + milliseconds, resolve: (): void => { signal?.removeEventListener("abort", abort); resolve(); } };
+      const abort = (): void => {
+        const index = sleepers.indexOf(sleeper);
+        if (index >= 0) sleepers.splice(index, 1);
+        sleeper.resolve();
+      };
+      sleepers.push(sleeper);
+      signal?.addEventListener("abort", abort, { once: true });
     }),
     advance: (milliseconds) => {
       if (!Number.isFinite(milliseconds) || milliseconds < 0) throw new Error("Clock advance must be a nonnegative finite number");

@@ -5,13 +5,15 @@ import { classifyPublicationPlan, isInlineCaptionContent, isSeparateBylineConten
 import { fingerprintSnapshotContent } from "../domain/message";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
 import type { PreparationRepository } from "../db/preparation-repository";
+import type { PreparationRequestRepository } from "../db/preparation-request-repository";
 import type { Logger } from "../logger";
-import { classifyTelegramError } from "../errors";
+import { classifyTelegramError, TelegramLocalDeferralError } from "../errors";
 import type { AttributionDescriptor, Clock, DeliveryMode, MessageId, PreparationContractV1, PreparedMember, StoredMessageSnapshot, TransferStep } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
 import type { OperationTracker } from "./task-supervisor";
 import { transferPreparedStep, type PreparedTransferOutput } from "./prepared-transfer";
+import { withTelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
 
 export type PreparationOutcome =
   | { kind: "empty" }
@@ -59,6 +61,7 @@ export type PreparationService = ReturnType<typeof createPreparationService>;
 export const createPreparationService = (input: {
   queue: QueueRepository;
   preparation: PreparationRepository;
+  requestEvidence?: PreparationRequestRepository;
   policy: PolicyRepository;
   gateway: TelegramGateway;
   queueChannelId: Parameters<TelegramGateway["deleteMessages"]>[0];
@@ -68,9 +71,74 @@ export const createPreparationService = (input: {
   cooldown?: TelegramCooldown;
   operationTracker?: OperationTracker;
 }) => {
-  const retryAt = (error: ReturnType<typeof classifyTelegramError>, now: number): number => error.kind === "rate_limited"
-    ? (input.cooldown?.extendForRetryAfter(error.retryAfterSeconds, now) ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1_000))
-    : now + 60_000;
+  const retryAt = (error: ReturnType<typeof classifyTelegramError>, now: number): number => error.kind === "local_deferral"
+    ? (error.retryAt ?? now + 1_000)
+    : error.kind === "rate_limited"
+      ? (input.gateway.dispatchManaged === true
+        ? (input.cooldown?.notBefore() ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1_000))
+        : (input.cooldown?.extendForRetryAfter(error.retryAfterSeconds, now) ?? now + Math.ceil(Math.max(1, error.retryAfterSeconds ?? 60) * 1_000)))
+      : now + 60_000;
+
+  const resultIds = (value: unknown): number[] => {
+    if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return [value];
+    if (Array.isArray(value)) return value.filter((id): id is number => typeof id === "number" && Number.isSafeInteger(id) && id > 0);
+    if (typeof value === "object" && value !== null) {
+      const record = value as Record<string, unknown>;
+      const id = record.message_id ?? record.messageId;
+      return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? [id] : [];
+    }
+    return [];
+  };
+
+  const runRequest = async <T>(request: {
+    operationId: string;
+    itemId: number;
+    method: string;
+    targetChatId: number;
+    stepKey?: string;
+    family?: "preparation" | "cleanup";
+    beforeDispatch?: () => void;
+    work: () => Promise<T>;
+  }): Promise<T> => {
+    let requestId: string | undefined;
+    const beforeDispatch = (): void => {
+      request.beforeDispatch?.();
+      requestId = input.requestEvidence?.begin({ operationId: request.operationId, method: request.method, targetChatId: request.targetChatId, ...(request.stepKey === undefined ? {} : { stepKey: request.stepKey }), now: input.clock.now() });
+    };
+    const onResult = (result: TelegramRequestResult): void => {
+      if (requestId === undefined || input.requestEvidence === undefined) return;
+      input.requestEvidence.finish(requestId, result, input.clock.now());
+    };
+    const scope = {
+      family: request.family ?? "preparation" as const,
+      priority: request.family === "cleanup" ? "urgent_maintenance" as const : "background" as const,
+      operationId: request.operationId,
+      itemId: request.itemId,
+      ...(request.stepKey === undefined ? {} : { stepKey: request.stepKey }),
+      beforeDispatch,
+      onResult,
+    };
+    if (input.gateway.dispatchManaged === true) return withTelegramMutationScope(scope, request.work);
+    beforeDispatch();
+    try {
+      const value = await request.work();
+      onResult({ state: "accepted", ...(resultIds(value).length === 0 ? {} : { knownOutputIds: resultIds(value) }) });
+      return value;
+    } catch (error) {
+      const normalized = classifyTelegramError(error, request.method);
+      const definitive = new Set(["rate_limited", "source_missing", "permission_denied", "destination_unavailable", "unsupported_content", "invalid_content_or_entities", "content_protected", "telegram_age_limit", "unknown_permanent"]);
+      onResult({ state: definitive.has(normalized.kind) ? "rejected" : "unknown", errorKind: normalized.kind, ...(normalized.knownOutputs === undefined ? {} : { knownOutputIds: normalized.knownOutputs.map(Number) }) });
+      if (normalized.kind === "rate_limited") input.cooldown?.extendForRetryAfter(normalized.retryAfterSeconds, input.clock.now());
+      throw error;
+    }
+  };
+
+  const assertDispatchable = (claim: { itemId: number; guard: { capturedContentVersion: number; capturedSourceGeneration: number } }, expectedContentVersion = claim.guard.capturedContentVersion): void => {
+    const current = input.queue.findItemById(claim.itemId);
+    if (!current || current.contentVersion !== expectedContentVersion || current.sourceGeneration !== claim.guard.capturedSourceGeneration || current.editorialFrozenAt !== undefined) {
+      throw new TelegramLocalDeferralError("protection_changed", input.clock.now(), "Queue item changed or became protected before preparation dispatch");
+    }
+  };
 
   const buildSteps = (members: readonly PreparedMember[], mode: DeliveryMode): TransferStep[] => {
     const steps: TransferStep[] = [];
@@ -202,21 +270,28 @@ export const createPreparationService = (input: {
       }
 
       const editEventId = input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, nextSnapshot, input.clock.now());
-      input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
-      input.preparation.markEditRequestStarted(editEventId, input.clock.now());
-      mutationMayHaveStarted = true;
       try {
         let receipt;
         if (edit === "text") {
           const request = { chatId: input.queueChannelId, messageId: target.messageId, text: nextSnapshot.text ?? "" } as Parameters<TelegramGateway["editText"]>[0];
           if (nextSnapshot.entities !== undefined) request.entities = nextSnapshot.entities;
           if (nextSnapshot.linkPreviewOptions?.isDisabled !== undefined) request.linkPreviewIsDisabled = nextSnapshot.linkPreviewOptions.isDisabled;
-          receipt = await input.gateway.editText(request);
+          receipt = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "editMessageText", targetChatId: Number(input.queueChannelId), stepKey: `edit:${target.memberKey}`, beforeDispatch: () => {
+            assertDispatchable(claim, guard.expectedContentVersion);
+            input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+            input.preparation.markEditRequestStarted(editEventId, input.clock.now());
+            mutationMayHaveStarted = true;
+          }, work: () => input.gateway.editText(request) });
         } else {
           const request = { chatId: input.queueChannelId, messageId: target.messageId, caption: nextSnapshot.caption ?? "" } as Parameters<TelegramGateway["editCaption"]>[0];
           if (nextSnapshot.captionEntities !== undefined) request.captionEntities = nextSnapshot.captionEntities;
           if (nextSnapshot.showCaptionAboveMedia !== undefined) request.showCaptionAboveMedia = nextSnapshot.showCaptionAboveMedia;
-          receipt = await input.gateway.editCaption(request);
+          receipt = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "editMessageCaption", targetChatId: Number(input.queueChannelId), stepKey: `edit:${target.memberKey}`, beforeDispatch: () => {
+            assertDispatchable(claim, guard.expectedContentVersion);
+            input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+            input.preparation.markEditRequestStarted(editEventId, input.clock.now());
+            mutationMayHaveStarted = true;
+          }, work: () => input.gateway.editCaption(request) });
         }
         if (receipt.messageId !== target.messageId) throw { kind: "ambiguous_send_result", description: "Telegram edit response identified a different message", requestMayHaveSucceeded: true };
         const response = input.preparation.markEditRequestAccepted(editEventId, input.clock.now(), receipt.editDate);
@@ -226,6 +301,7 @@ export const createPreparationService = (input: {
         }
       } catch (error) {
         const normalized = classifyTelegramError(error, edit === "text" ? "editMessageText" : "editMessageCaption");
+        if (normalized.kind === "local_deferral") throw error;
         const noOp = normalized.description.toLowerCase().includes("message is not modified");
         const eventResult = normalized.kind === "rate_limited" || normalized.kind === "source_missing" || normalized.kind === "invalid_content_or_entities" || noOp
           ? input.preparation.markEditRequestRejected(editEventId, input.clock.now())
@@ -375,7 +451,12 @@ export const createPreparationService = (input: {
             targetChatId: input.queueChannelId,
             sourceChatId: input.queueChannelId,
             step,
-            beforeRequest: () => { mutationMayHaveStarted = true; input.preparation.setPhase(claim.operationId, "transfer_pending", input.clock.now()); },
+            beforeRequest: () => undefined,
+            runRequest: (request) => runRequest({ operationId: claim.operationId, itemId: item.id, method: request.method, targetChatId: Number(request.targetChatId), stepKey: request.stepKey, beforeDispatch: () => {
+              assertDispatchable(claim, guard.expectedContentVersion);
+              mutationMayHaveStarted = true;
+              input.preparation.setPhase(claim.operationId, "transfer_pending", input.clock.now());
+            }, work: request.work }),
             recordOutput: (output) => {
               knownOutputIds.push(output.messageId);
               input.preparation.recordOutput(claim.operationId, { ...output, outputKey: `${claim.operationId}:${output.messageId}`, ...(output.sourceMemberKey === undefined ? {} : { sourceMemberKey: output.sourceMemberKey }) }, input.clock.now());
@@ -384,6 +465,7 @@ export const createPreparationService = (input: {
           transferred.push(...outputs);
         } catch (error) {
           const normalized = classifyTelegramError(error);
+          if (normalized.kind === "local_deferral") throw error;
           if (normalized.kind === "source_missing" && !step.grouped && step.members.length === 1) {
             const missing = input.preparation.markMemberMissing(guard, step.members[0]!.memberKey, { method: normalized.method ?? "copyMessage", ...(normalized.code === undefined ? {} : { code: normalized.code }), description: normalized.description }, input.clock.now());
             guard = missing.nextGuard;
@@ -391,7 +473,7 @@ export const createPreparationService = (input: {
             continue;
           }
           if (normalized.kind === "rate_limited") {
-            if (!await cleanupKnownOutputs(knownOutputIds)) {
+            if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
               input.preparation.markUncertain(claim.operationId, "cleanup_after_rate_limit_failed", "Known preparation outputs could not be removed after a rate limit", input.clock.now());
               return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
             }
@@ -399,7 +481,7 @@ export const createPreparationService = (input: {
             input.preparation.scheduleRetry(claim.operationId, retry, normalized.kind, normalized.description, input.clock.now());
             return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
           }
-          if (["unsupported_content", "invalid_content_or_entities", "permission_denied", "content_protected"].includes(normalized.kind) && await cleanupKnownOutputs(knownOutputIds)) {
+          if (["unsupported_content", "invalid_content_or_entities", "permission_denied", "content_protected"].includes(normalized.kind) && await cleanupKnownOutputs(claim, knownOutputIds)) {
             const status = normalized.kind === "invalid_content_or_entities" ? "needs_edit" : normalized.kind === "unsupported_content" ? "blocked" : "needs_review";
             input.preparation.markFailed(claim.operationId, status, normalized.kind, normalized.description, input.clock.now());
             return { kind: "blocked", itemId: item.id, status, reason: normalized.kind, operationId: claim.operationId };
@@ -429,7 +511,7 @@ export const createPreparationService = (input: {
         const targetIndex = outputMembers.findIndex((member) => member.memberKey === inline!.memberKey);
         const target = outputMembers[targetIndex];
         if (!target) {
-          if (await cleanupKnownOutputs(knownOutputIds)) {
+          if (await cleanupKnownOutputs(claim, knownOutputIds)) {
             input.preparation.markFailed(claim.operationId, "needs_review", "byline_member_missing", "The source member for the generated credit disappeared", input.clock.now());
             return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "byline_member_missing", operationId: claim.operationId };
           }
@@ -452,21 +534,28 @@ export const createPreparationService = (input: {
         if (inline.placement === "inline_caption" && inline.captionEntities === undefined && oldCaptionEntities !== undefined) delete snapshot.captionEntities;
         snapshot.contentFingerprint = fingerprintSnapshotContent(snapshot);
         const editEventId = input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, snapshot, input.clock.now());
-        input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
-        input.preparation.markEditRequestStarted(editEventId, input.clock.now());
-        mutationMayHaveStarted = true;
         try {
           let receipt;
           if (edit === "text") {
             const editInput = { chatId: input.queueChannelId, messageId: target.messageId, text: snapshot.text ?? "" } as Parameters<TelegramGateway["editText"]>[0];
             if (snapshot.entities !== undefined) editInput.entities = snapshot.entities;
             if (snapshot.linkPreviewOptions?.isDisabled !== undefined) editInput.linkPreviewIsDisabled = snapshot.linkPreviewOptions.isDisabled;
-            receipt = await input.gateway.editText(editInput);
+            receipt = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "editMessageText", targetChatId: Number(input.queueChannelId), stepKey: `edit:${target.memberKey}`, beforeDispatch: () => {
+              assertDispatchable(claim, guard.expectedContentVersion);
+              input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+              input.preparation.markEditRequestStarted(editEventId, input.clock.now());
+              mutationMayHaveStarted = true;
+            }, work: () => input.gateway.editText(editInput) });
           } else {
             const editInput = { chatId: input.queueChannelId, messageId: target.messageId, caption: snapshot.caption ?? "" } as Parameters<TelegramGateway["editCaption"]>[0];
             if (snapshot.captionEntities !== undefined) editInput.captionEntities = snapshot.captionEntities;
             if (snapshot.showCaptionAboveMedia !== undefined) editInput.showCaptionAboveMedia = snapshot.showCaptionAboveMedia;
-            receipt = await input.gateway.editCaption(editInput);
+            receipt = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "editMessageCaption", targetChatId: Number(input.queueChannelId), stepKey: `edit:${target.memberKey}`, beforeDispatch: () => {
+              assertDispatchable(claim, guard.expectedContentVersion);
+              input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+              input.preparation.markEditRequestStarted(editEventId, input.clock.now());
+              mutationMayHaveStarted = true;
+            }, work: () => input.gateway.editCaption(editInput) });
           }
           if (receipt.messageId !== target.messageId) throw { kind: "ambiguous_send_result", description: "Telegram edit response identified a different message", requestMayHaveSucceeded: true };
           const response = input.preparation.markEditRequestAccepted(editEventId, input.clock.now(), receipt.editDate);
@@ -477,6 +566,7 @@ export const createPreparationService = (input: {
           outputMembers[targetIndex] = { ...target, snapshot };
         } catch (error) {
           const normalized = classifyTelegramError(error);
+          if (normalized.kind === "local_deferral") throw error;
           const noOp = normalized.description.toLowerCase().includes("message is not modified");
           const eventResult = normalized.kind === "rate_limited" || normalized.kind === "source_missing" || normalized.kind === "invalid_content_or_entities" || noOp
             ? input.preparation.markEditRequestRejected(editEventId, input.clock.now())
@@ -489,7 +579,7 @@ export const createPreparationService = (input: {
             outputMembers[targetIndex] = { ...target, snapshot };
           } else if (["rate_limited", "transient_network", "transient_server", "ambiguous_send_result"].includes(normalized.kind)) {
             if (normalized.kind === "rate_limited") {
-              if (!await cleanupKnownOutputs(knownOutputIds)) {
+              if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
                 input.preparation.markUncertain(claim.operationId, "cleanup_after_rate_limit_failed", "Known preparation outputs could not be removed after a rate limit", input.clock.now());
                 return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
               }
@@ -499,7 +589,7 @@ export const createPreparationService = (input: {
             }
             input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
             return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
-          } else if (await cleanupKnownOutputs(knownOutputIds)) {
+          } else if (await cleanupKnownOutputs(claim, knownOutputIds)) {
             const status = normalized.kind === "invalid_content_or_entities" ? "needs_edit" : "needs_review";
             input.preparation.markFailed(claim.operationId, status, normalized.kind, normalized.description, input.clock.now());
             return { kind: "blocked", itemId: item.id, status, reason: normalized.kind, operationId: claim.operationId };
@@ -511,10 +601,12 @@ export const createPreparationService = (input: {
       }
 
       if (separateText !== undefined) {
-        input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
-        mutationMayHaveStarted = true;
         try {
-          const creditId = await input.gateway.sendText({ chatId: input.queueChannelId, text: separateText });
+          const creditId = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "sendMessage", targetChatId: Number(input.queueChannelId), stepKey: "credit", beforeDispatch: () => {
+            assertDispatchable(claim, guard.expectedContentVersion);
+            input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+            mutationMayHaveStarted = true;
+          }, work: () => input.gateway.sendText({ chatId: input.queueChannelId, text: separateText }) });
           knownOutputIds.push(creditId);
           const mediaFingerprint = createHash("sha256").update("{}").digest("hex");
           const creditSnapshot = { schemaVersion: 2 as const, chatId: input.queueChannelId, messageId: creditId, ordinal: outputMembers.length, contentType: "text" as const, text: separateText, origin: item.origin, nativeOrigin: { kind: "absent" as const }, telegramDate: input.clock.now(), hasReplyMarkup: false, mediaFingerprint, contentFingerprint: "" };
@@ -523,8 +615,9 @@ export const createPreparationService = (input: {
           outputMembers.push({ memberKey: `credit:${claim.operationId}`, messageId: creditId, role: "credit", deliveryMode: "copy", snapshot: creditSnapshot });
         } catch (error) {
           const normalized = classifyTelegramError(error, "sendMessage");
+          if (normalized.kind === "local_deferral") throw error;
           if (normalized.kind === "rate_limited") {
-            if (!await cleanupKnownOutputs(knownOutputIds)) {
+            if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
               input.preparation.markUncertain(claim.operationId, "cleanup_after_rate_limit_failed", "Known preparation outputs could not be removed after a rate limit", input.clock.now());
               return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
             }
@@ -536,7 +629,7 @@ export const createPreparationService = (input: {
             input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
             return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
           }
-          if (await cleanupKnownOutputs(knownOutputIds)) {
+          if (await cleanupKnownOutputs(claim, knownOutputIds)) {
             input.preparation.markFailed(claim.operationId, "blocked", normalized.kind, normalized.description, input.clock.now());
             return { kind: "blocked", itemId: item.id, status: "blocked", reason: normalized.kind, operationId: claim.operationId };
           }
@@ -549,7 +642,7 @@ export const createPreparationService = (input: {
       input.preparation.recordCompleteResult(claim.operationId, result, input.clock.now());
       const installed = input.preparation.installPreparedGeneration(claim.operationId, input.clock.now());
       let cleanupError: string | undefined;
-      try { await input.gateway.deleteMessages(input.queueChannelId, installed.oldSourceIds); }
+      try { await runRequest({ operationId: claim.operationId, itemId: item.id, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "old-sources", work: () => input.gateway.deleteMessages(input.queueChannelId, installed.oldSourceIds) }); }
       catch (error) {
         const normalized = classifyTelegramError(error, "deleteMessages");
         if (normalized.kind !== "source_missing") cleanupError = normalized.description;
@@ -558,6 +651,21 @@ export const createPreparationService = (input: {
       return { kind: "prepared", itemId: item.id, preparationState: installed.preparationState, operationId: claim.operationId };
     } catch (error) {
       const normalized = classifyTelegramError(error);
+      if (normalized.kind === "local_deferral") {
+        if (knownOutputIds.length > 0) {
+          if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
+            input.preparation.markUncertain(claim.operationId, "local_deferral_after_output", "Preparation outputs could not be removed after local Telegram deferral", input.clock.now());
+            return { kind: "uncertain", itemId: claim.itemId, operationId: claim.operationId };
+          }
+        } else if (mutationMayHaveStarted) {
+          input.preparation.markUncertain(claim.operationId, "local_deferral_after_request", normalized.description, input.clock.now());
+          return { kind: "uncertain", itemId: claim.itemId, operationId: claim.operationId };
+        }
+        const retry = retryAt(normalized, input.clock.now());
+        input.preparation.scheduleRetry(claim.operationId, retry, "local_deferral", normalized.description, input.clock.now());
+        if (normalized.localDeferralReason === "protection_changed") input.preparation.markPreparationNeeded(claim.itemId, claim.kind === "refresh" ? "refresh" : "initial", input.clock.now());
+        return { kind: "retry_scheduled", itemId: claim.itemId, retryAt: retry, operationId: claim.operationId };
+      }
       input.logger.error("preparation_failed", { itemId: claim.itemId, operationId: claim.operationId, kind: normalized.kind, error: normalized.description });
       if (!mutationMayHaveStarted) {
         try { input.preparation.markFailed(claim.operationId, "needs_review", normalized.kind, normalized.description, input.clock.now()); }
@@ -572,9 +680,9 @@ export const createPreparationService = (input: {
     }
   };
 
-  const cleanupKnownOutputs = async (ids: readonly MessageId[]): Promise<boolean> => {
+  const cleanupKnownOutputs = async (claim: NonNullable<ReturnType<PreparationRepository["claimNextPreparation"]>>, ids: readonly MessageId[]): Promise<boolean> => {
     if (ids.length === 0) return true;
-    try { await input.gateway.deleteMessages(input.queueChannelId, ids); return true; }
+    try { await runRequest({ operationId: claim.operationId, itemId: claim.itemId, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "known-outputs-cleanup", work: () => input.gateway.deleteMessages(input.queueChannelId, ids) }); return true; }
     catch (error) { return classifyTelegramError(error, "deleteMessages").kind === "source_missing"; }
   };
 
@@ -589,7 +697,7 @@ export const createPreparationService = (input: {
     for (const operation of input.preparation.listCleanupPending().slice(0, limit)) {
       attempts += 1;
       try {
-        await input.gateway.deleteMessages(input.queueChannelId, operation.sourceIds);
+        await runRequest({ operationId: operation.operationId, itemId: operation.itemId, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "source-cleanup", work: () => input.gateway.deleteMessages(input.queueChannelId, operation.sourceIds) });
         input.preparation.finishCleanup(operation.operationId, input.clock.now());
       } catch (error) {
         const normalized = classifyTelegramError(error, "deleteMessages");

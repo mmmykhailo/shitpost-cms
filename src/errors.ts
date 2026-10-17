@@ -1,5 +1,14 @@
 import type { NormalizedTelegramError, NormalizedTelegramErrorKind } from "./types";
 
+export class TelegramLocalDeferralError extends Error {
+  readonly kind = "local_deferral" as const;
+  readonly requestStarted = false;
+  constructor(readonly reason: NonNullable<NormalizedTelegramError["localDeferralReason"]>, readonly retryAt: number, message = `Telegram request deferred locally: ${reason}`) {
+    super(message);
+    this.name = "TelegramLocalDeferralError";
+  }
+}
+
 export class OperationConflictError extends Error {
   constructor(message: string) {
     super(message);
@@ -40,6 +49,9 @@ const descriptionOf = (error: unknown): string => {
 const numeric = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
 
 export const classifyTelegramError = (error: unknown, method?: string): NormalizedTelegramError => {
+  if (error instanceof TelegramLocalDeferralError) {
+    return { kind: "local_deferral", description: error.message, localDeferralReason: error.reason, retryAt: error.retryAt, requestMayHaveSucceeded: false, ...(method === undefined ? {} : { method }) };
+  }
   if (error instanceof InvalidTelegramOutputError) {
     const normalized: NormalizedTelegramError = { kind: "ambiguous_send_result", method: method ?? "recordOutput", description: error.message, requestMayHaveSucceeded: error.requestMayHaveSucceeded, cause: error };
     if (error.knownOutputs.length > 0) normalized.knownOutputs = error.knownOutputs as NormalizedTelegramError["knownOutputs"] & {};

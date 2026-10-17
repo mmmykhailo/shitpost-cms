@@ -7,6 +7,6 @@ export const createFakeClock = (initialTime: number): FakeClock => {
   return {
     now: () => current,
     advance: (milliseconds) => { current += milliseconds; },
-    sleep: async (milliseconds) => { current += milliseconds; },
+    sleep: async (milliseconds, signal) => { if (!signal?.aborted) current += milliseconds; },
   };
 };

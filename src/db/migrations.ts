@@ -617,6 +617,28 @@ const migrations: readonly Migration[] = [
       `ALTER TABLE queue_generated_events ADD COLUMN provisional_update_id INTEGER`,
     ],
   },
+  {
+    version: 11,
+    statements: [
+      `ALTER TABLE queue_preparation_operations ADD COLUMN request_evidence_version INTEGER NOT NULL DEFAULT 0 CHECK (request_evidence_version >= 0)`,
+      `CREATE TABLE preparation_request_attempts (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        request_ordinal INTEGER NOT NULL CHECK (request_ordinal > 0),
+        method TEXT NOT NULL,
+        target_chat_id INTEGER NOT NULL,
+        step_key TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        state TEXT NOT NULL CHECK (state IN ('in_flight','accepted','rejected','unknown')),
+        error_kind TEXT,
+        known_output_ids_json TEXT,
+        UNIQUE (operation_id, request_ordinal),
+        FOREIGN KEY (operation_id) REFERENCES queue_preparation_operations(id) ON DELETE CASCADE
+      )`,
+      `CREATE INDEX preparation_request_attempts_operation_idx ON preparation_request_attempts(operation_id, request_ordinal)`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {
