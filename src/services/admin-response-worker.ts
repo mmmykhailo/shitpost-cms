@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AdminResponseKind, AdminResponseRecord, AdminResponseRepository } from "../db/admin-response-repository";
 import type { AdminRepository } from "../db/admin-repository";
 import { classifyTelegramError, TelegramLocalDeferralError } from "../errors";
-import type { Logger } from "../logger";
+import { safeErrorDescription, type Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
 import type { Clock } from "../types";
 import { withTelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
@@ -173,7 +173,7 @@ export const createAdminResponseWorker = (input: {
         const worked = await runOnce();
         if (!worked) await abortableSleep(input.clock, 250, signal);
       } catch (error) {
-        input.logger.error("admin_response_worker_failed", { error: error instanceof Error ? error.message : "unknown" });
+        input.logger.error("admin_response_worker_failed", { error: safeErrorDescription(error) });
         await abortableSleep(input.clock, 1_000, signal);
       }
     }

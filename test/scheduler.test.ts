@@ -108,4 +108,34 @@ describe("scheduler service", () => {
     expect(schedule.run(Date.parse("2026-10-04T01:00:00Z"))).toBeUndefined();
     expect(scheduler.nextAt()).toBeUndefined();
   });
+
+  test("scheduler loop exits cleanly when its worker signal is aborted", async () => {
+    const { schedule, clock } = open();
+    const controller = new AbortController();
+    const scheduler = createSchedulerService({
+      schedule,
+      publisher: { publishNext: async () => ({ kind: "empty" }) },
+      clock: { now: clock.now, sleep: async () => { controller.abort(); } },
+      logger: createLogger("error"),
+    });
+    await scheduler.run(controller.signal);
+    scheduler.stop();
+    expect(scheduler.nextAt()).toBeUndefined();
+  });
+
+  test("does not treat a no-output result that crosses the retry deadline as empty", async () => {
+    const occurrence = Date.parse("2026-10-04T01:00:00Z");
+    const { schedule, clock } = open({ initialTime: occurrence + 299_999 });
+    schedule.addSlot(60, 1, occurrence - 86_400_000);
+    schedule.setEnabled(true, 1, clock.now());
+    schedule.setLastScan(occurrence - 1);
+    const scheduler = createSchedulerService({
+      schedule,
+      publisher: { publishNext: async () => { clock.advance(1); return { kind: "empty" }; } },
+      clock,
+      logger: createLogger("error"),
+    });
+    expect((await scheduler.scanOnce()).outcome?.kind).toBe("empty");
+    expect(schedule.run(occurrence)).toMatchObject({ status: "failed", errorCode: "retry_window_expired" });
+  });
 });

@@ -56,6 +56,9 @@ describe("publication service through the grammY adapter", () => {
       deleteMessages: async (_chatId: unknown, messageIds: number[]) => { deleted.push([...messageIds]); return true; },
     } as unknown as Api;
     const gateway = createTelegramGateway(api, asChatId(999));
+    // This adapter test calls the fake grammY API directly; the production
+    // application installs Telegram admission on bot.api before dispatch.
+    delete gateway.dispatchManaged;
     const queue = createQueueRepository(database);
     const policy = createPolicyRepository(database);
     if (variant.origin.kind === "channel") policy.upsertChannel(variant.origin.chatId, "source", variant.origin.title, 1, 1);

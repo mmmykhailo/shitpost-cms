@@ -3,12 +3,15 @@ import { asMessageId, asUserId } from "../src/types";
 import { createAdminRepository } from "../src/db/admin-repository";
 import { createAdminResponseRepository } from "../src/db/admin-response-repository";
 import { createAdminUpdateRepository } from "../src/db/admin-update-repository";
+import type { AdminResponseState } from "../src/db/admin-response-repository";
 import { createTelegramIncidentRepository } from "../src/db/telegram-incident-repository";
 import { createTelegramIncidentService } from "../src/services/telegram-incidents";
 import { createAdminResponseWorker } from "../src/services/admin-response-worker";
 import { createFakeClock } from "../src/clock";
-import type { Logger } from "../src/logger";
+import { safeErrorDescription, type Logger } from "../src/logger";
 import type { TelegramGateway } from "../src/telegram";
+import { TelegramLocalDeferralError } from "../src/errors";
+import { telegramMutationScope, type TelegramRequestResult } from "../src/telegram-request-context";
 import { createTestDatabase } from "./support";
 
 const resources: Array<{ close(): void }> = [];
@@ -109,6 +112,169 @@ describe("admin response outbox", () => {
     expect(responses.recover(NOW + 7, "boot-b")).toEqual({ requeued: 0, uncertain: 1 });
     expect(responses.find(claim.id)?.state).toBe("uncertain");
     expect(responses.counts().uncertain).toBe(1);
+  });
+
+  test("renders callback buttons at managed dispatch and acknowledges prompts, incidents, and alerts", async () => {
+    const state = open();
+    const clock = createFakeClock(NOW);
+    const response = state.responses.enqueue({
+      dedupeKey: "managed-success",
+      adminChatId: 42,
+      kind: "prompt",
+      descriptor: {
+        version: 1,
+        text: "Choose an action",
+        entities: [{ type: "bold", offset: 0, length: 6 }],
+        disableLinkPreview: true,
+        replyMarkup: { kind: "inline_keyboard", rows: [[{ text: "Open", action: "queue", payload: {}, itemVersion: 4 }]] },
+        prompt: { adminId: 42, generationId: "prompt-generation", kind: "recover" },
+        incident: { id: "incident-1", kind: "warning" },
+        alert: { dedupeKey: "item_issue:4", fingerprint: "fingerprint", mode: "on_change" },
+      },
+      now: NOW,
+    }).record;
+    state.admin.setPendingPrompt(42, "recover", { step: "reference" }, "prompt-generation", response.id, NOW);
+    const acknowledgements: string[] = [];
+    let sentPayload: Record<string, unknown> | undefined;
+    const gateway = {
+      dispatchManaged: true as const,
+      sendAdminMessage: async (message: Record<string, unknown>) => {
+        const scope = telegramMutationScope()!;
+        const payload = { ...message };
+        scope.beforeDispatch?.("sendMessage", payload);
+        sentPayload = payload;
+        scope.onResult?.({ state: "accepted", knownOutputIds: [951] });
+        return asMessageId(951);
+      },
+    } as unknown as TelegramGateway;
+    const worker = createAdminResponseWorker({
+      responses: state.responses,
+      admin: state.admin,
+      gateway,
+      adminChatId: 42,
+      adminUserId: ADMIN_ID,
+      bootId: "boot-a",
+      clock,
+      logger: silentLogger,
+      incidents: {
+        canDeliver: () => true,
+        acknowledgeDelivered: (_id, kind) => { acknowledgements.push(`incident:${kind}`); return true; },
+      },
+      alerts: {
+        canDeliver: () => true,
+        acknowledgeDelivered: (_key, _fingerprint, mode) => { acknowledgements.push(`alert:${mode}`); },
+      },
+    });
+
+    expect(await worker.runOnce()).toBe(true);
+    expect(state.responses.find(response.id)).toMatchObject({ state: "sent", telegramMessageId: 951 });
+    expect(state.admin.getPrompt(42, NOW)).toMatchObject({ deliveryState: "active", expectedReplyToMessageId: 951 });
+    expect(acknowledgements).toEqual(["incident:warning", "alert:on_change"]);
+    expect(sentPayload?.text).toBe("Choose an action");
+    expect(sentPayload?.entities).toEqual([{ type: "bold", offset: 0, length: 6 }]);
+    expect(sentPayload?.linkPreviewIsDisabled).toBe(true);
+    const markup = sentPayload?.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+    expect(markup.inline_keyboard[0]?.[0]?.callback_data).toMatch(/^v1:/);
+  });
+
+  test("maps managed response receipts and missing receipts to safe durable states", async () => {
+    const cases: Array<{ name: string; result?: TelegramRequestResult; expected: AdminResponseState }> = [
+      { name: "missing-message-id", result: { state: "accepted" }, expected: "uncertain" },
+      { name: "unknown", result: { state: "unknown", errorKind: "transient_network" }, expected: "uncertain" },
+      { name: "rate-limited", result: { state: "rejected", errorKind: "rate_limited" }, expected: "pending" },
+      { name: "rejected", result: { state: "rejected", errorKind: "source_missing" }, expected: "failed" },
+      { name: "missing-receipt", expected: "uncertain" },
+    ];
+    for (const [index, entry] of cases.entries()) {
+      const state = open();
+      const clock = createFakeClock(NOW);
+      const record = state.responses.enqueue({ dedupeKey: entry.name, adminChatId: 42, kind: "confirmation", descriptor: { version: 1, text: entry.name }, now: NOW }).record;
+      const gateway = {
+        dispatchManaged: true as const,
+        sendAdminMessage: async () => {
+          const scope = telegramMutationScope()!;
+          scope.beforeDispatch?.("sendMessage", {});
+          if (entry.result !== undefined) scope.onResult?.(entry.result);
+          return asMessageId(960 + index);
+        },
+      } as unknown as TelegramGateway;
+      const worker = createAdminResponseWorker({ responses: state.responses, admin: state.admin, gateway, adminChatId: 42, adminUserId: ADMIN_ID, bootId: "boot-a", clock, logger: silentLogger, cooldown: { notBefore: () => NOW + 20_000, isActive: () => false } as never });
+      expect(await worker.runOnce()).toBe(true);
+      expect(state.responses.find(record.id)?.state).toBe(entry.expected);
+      if (entry.expected === "pending") expect(state.responses.find(record.id)?.nextAttemptAt).toBeGreaterThan(NOW);
+    }
+  });
+
+  test("retries deferrals, preserves ambiguous delivery, rejects definite failures, and cancels stale notices", async () => {
+    const failures: Array<{ error: unknown; expected: AdminResponseState }> = [
+      { error: new TelegramLocalDeferralError("shared_cooldown", NOW + 5_000, "wait"), expected: "pending" },
+      { error: { kind: "rate_limited", retryAfterSeconds: 30, description: "retry later" }, expected: "pending" },
+      { error: { kind: "transient_network", description: "connection lost" }, expected: "uncertain" },
+      { error: { kind: "source_missing", description: "rejected" }, expected: "failed" },
+    ];
+    for (const [index, entry] of failures.entries()) {
+      const state = open();
+      const clock = createFakeClock(NOW);
+      const response = state.responses.enqueue({ dedupeKey: `failure-${index}`, adminChatId: 42, kind: "confirmation", descriptor: { version: 1, text: "response" }, now: NOW }).record;
+      const gateway = { dispatchManaged: false as const, sendAdminMessage: async () => { throw entry.error; } } as unknown as TelegramGateway;
+      const worker = createAdminResponseWorker({ responses: state.responses, admin: state.admin, gateway, adminChatId: 42, adminUserId: ADMIN_ID, bootId: "boot-a", clock, logger: silentLogger });
+      expect(await worker.runOnce()).toBe(true);
+      expect(state.responses.find(response.id)?.state).toBe(entry.expected);
+    }
+
+    for (const type of ["incident", "alert"] as const) {
+      const state = open();
+      const clock = createFakeClock(NOW);
+      const response = state.responses.enqueue({
+        dedupeKey: `stale-${type}`,
+        adminChatId: 42,
+        kind: "warning",
+        descriptor: { version: 1, text: "stale", ...(type === "incident" ? { incident: { id: "incident-stale", kind: "warning" } } : { alert: { dedupeKey: "item_issue:8", fingerprint: "old", mode: "on_change" } }) },
+        now: NOW,
+      }).record;
+      const gateway = {
+        dispatchManaged: true as const,
+        sendAdminMessage: async () => {
+          telegramMutationScope()!.beforeDispatch?.("sendMessage", {});
+          return asMessageId(990);
+        },
+      } as unknown as TelegramGateway;
+      const worker = createAdminResponseWorker({
+        responses: state.responses,
+        admin: state.admin,
+        gateway,
+        adminChatId: 42,
+        adminUserId: ADMIN_ID,
+        bootId: "boot-a",
+        clock,
+        logger: silentLogger,
+        incidents: { canDeliver: () => false, acknowledgeDelivered: () => true },
+        alerts: { canDeliver: () => false, acknowledgeDelivered: () => {} },
+      });
+      expect(await worker.runOnce()).toBe(true);
+      expect(state.responses.find(response.id)?.state).toBe("cancelled");
+    }
+  });
+
+  test("marks invalid stored descriptors failed and backs off after a worker claim error", async () => {
+    const state = open();
+    const response = state.responses.enqueue({ dedupeKey: "bad-descriptor", adminChatId: 42, kind: "confirmation", descriptor: { version: 1, text: "valid" }, now: NOW }).record;
+    const claim = state.responses.claimDue(NOW, "boot-a")!;
+    const badResponses = Object.assign({}, state.responses, { claimDue: () => ({ ...claim, descriptor: { version: 2, text: "bad" } }) }) as typeof state.responses;
+    const neverSend = { dispatchManaged: false as const, sendAdminMessage: async () => asMessageId(999) } as unknown as TelegramGateway;
+    const worker = createAdminResponseWorker({ responses: badResponses, admin: state.admin, gateway: neverSend, adminChatId: 42, adminUserId: ADMIN_ID, bootId: "boot-a", clock: createFakeClock(NOW), logger: silentLogger });
+    expect(await worker.runOnce()).toBe(true);
+    expect(state.responses.find(response.id)).toMatchObject({ state: "failed", lastErrorKind: "invalid_descriptor" });
+    expect(await createAdminResponseWorker({ responses: state.responses, admin: state.admin, gateway: neverSend, adminChatId: 42, adminUserId: ADMIN_ID, bootId: "boot-a", clock: createFakeClock(NOW), logger: silentLogger }).runOnce()).toBe(false);
+
+    const loggerEvents: string[] = [];
+    const logger: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: (event) => loggerEvents.push(event) };
+    const brokenResponses = Object.assign({}, state.responses, { claimDue: () => { throw new Error("database unavailable"); } }) as typeof state.responses;
+    const controller = new AbortController();
+    const clock = { now: () => NOW, sleep: async () => { controller.abort(); } };
+    await createAdminResponseWorker({ responses: brokenResponses, admin: state.admin, gateway: neverSend, adminChatId: 42, adminUserId: ADMIN_ID, bootId: "boot-a", clock, logger }).run(controller.signal);
+    expect(loggerEvents).toContain("admin_response_worker_failed");
+    expect(safeErrorDescription(new Error("secret 123456:abcdefghijklmnopqrstuvwxyzABCDEFGH"))).toBe("secret [redacted]");
   });
 });
 

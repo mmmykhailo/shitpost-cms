@@ -55,6 +55,39 @@ describe("ingestion service", () => {
     expect(current.service.finalizeAlbums()).toEqual([1]);
     current.service.observe({ ...first, messageId: asMessageId(99) }, 11_000);
     expect(current.service.observe(first, 11_000).ignoredReason).toBe("duplicate");
+    expect(current.service.observe(snapshotFixture({ messageId: asMessageId(32), ordinal: 2, mediaGroupId: "g" }), 11_001)).toMatchObject({ accepted: true, itemId: 1 });
+  });
+
+  test("handles generated posts and synchronous queue edits when no pending-update store is configured", () => {
+    current = open();
+    const direct = createIngestionService({ queueChannelId: asChatId(-100), queue: current.queue, policy: current.policy, generated: current.generated, events: current.events, logger: createLogger("error"), now: current.clock.now });
+    const generated = snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(799) });
+    current.events.expect({ family: "preparation", operationId: "generated-799", chatId: -100, messageId: 799, kind: "post", now: current.clock.now() });
+    expect(direct.observe(generated, current.clock.now())).toEqual({ accepted: false, ignoredReason: "generated_message" });
+
+    expect(direct.handleChannelPost({ message_id: 800, date: 10, chat: { id: -999, type: "channel" }, text: "wrong chat" } as never)).toMatchObject({ accepted: false, ignoredReason: "wrong_chat" });
+    expect(direct.handleChannelPost({ message_id: 800, date: 10, chat: { id: -100, type: "channel" }, text: "direct post" } as never)).toMatchObject({ accepted: true, itemId: 1 });
+    expect(direct.handleEditedChannelPost({ message_id: 999, date: 10, chat: { id: -100, type: "channel" }, text: "unknown edit" } as never)).toMatchObject({ accepted: false, ignoredReason: "duplicate" });
+    expect(direct.handleEditedChannelPost({ message_id: 800, date: 10, edit_date: 11, chat: { id: -100, type: "channel" }, text: "admin edit" } as never)).toMatchObject({ accepted: true, itemId: 1 });
+    expect(current.queue.findItemById(1)).toMatchObject({ editorialFreezeReason: "admin_edit" });
+    expect(direct.handleEditedChannelPost({ message_id: 800, date: 10, edit_date: 11, chat: { id: -100, type: "channel" }, text: "stale admin edit" } as never, 0)).toMatchObject({ accepted: false, ignoredReason: "duplicate" });
+    expect(direct.finalizePendingUpdates()).toEqual([]);
+  });
+
+  test("suppresses provisional and accepted generated edits after matching their request receipts", () => {
+    current = open();
+    const inFlight = snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(801), text: "generated edit", editDate: 11, telegramUpdateId: 3 });
+    const inFlightEvent = current.events.expect({ family: "preparation", operationId: "preparation-801", chatId: -100, messageId: 801, kind: "edit", ...(inFlight.contentFingerprint === undefined ? {} : { fingerprint: inFlight.contentFingerprint }), snapshot: inFlight, now: 10_000 });
+    current.events.markEditRequestStarted(inFlightEvent, 10_000);
+    expect(current.service.handleEditedChannelPost({ message_id: 801, date: 10, edit_date: 11, chat: { id: -100, type: "channel" }, text: "generated edit" } as never, 3)).toMatchObject({ accepted: false, ignoredReason: "pending_update" });
+
+    const acceptedMessage = { message_id: 802, date: 10, edit_date: 12, chat: { id: -100, type: "channel" }, text: "accepted generated edit" } as never;
+    const accepted = snapshotFromMessage(acceptedMessage, 0, 4);
+    const acceptedEvent = current.events.expect({ family: "preparation", operationId: "preparation-802", chatId: -100, messageId: 802, kind: "edit", ...(accepted.contentFingerprint === undefined ? {} : { fingerprint: accepted.contentFingerprint }), snapshot: accepted, now: 10_000 });
+    current.events.markEditRequestStarted(acceptedEvent, 10_000);
+    expect(current.events.markEditRequestAccepted(acceptedEvent, 10_001, accepted.editDate)).toEqual({ kind: "none" });
+    const direct = createIngestionService({ queueChannelId: asChatId(-100), queue: current.queue, policy: current.policy, generated: current.generated, events: current.events, logger: createLogger("error"), now: current.clock.now });
+    expect(direct.handleEditedChannelPost(acceptedMessage, 4)).toMatchObject({ accepted: false, ignoredReason: "generated_message" });
   });
 
   test("uses the persistent suppression record for renewal updates", () => {
@@ -63,6 +96,15 @@ describe("ingestion service", () => {
     generated.register(-100, [500], "renew-1", "renewal", 10_000);
     const result = current.service.observe(snapshotFixture({ messageId: asMessageId(500) }), 10_001);
     expect(result).toEqual({ accepted: false, ignoredReason: "generated_message" });
+  });
+
+  test("accepts an edit to a known current source immediately while retaining its pending receipt", () => {
+    current = open();
+    current.queue.observeQueueSnapshot(snapshotFixture({ chatId: asChatId(-100), messageId: asMessageId(510), text: "before" }), 10_000);
+
+    expect(current.service.handleEditedChannelPost({ message_id: 510, date: 10, edit_date: 11, chat: { id: -100, type: "channel" }, text: "edited now" } as never, 12)).toMatchObject({ accepted: true, itemId: 1 });
+    expect(current.queue.findItemById(1)).toMatchObject({ editorialFreezeReason: "admin_edit", editorialFreezeUpdateId: 12 });
+    expect(current.pending.find(-100, 510)).toMatchObject({ updateKind: "edit", state: "ingested", telegramUpdateId: 12 });
   });
 
   test("finalizes channel updates from durable pending rows after the ordering window", () => {

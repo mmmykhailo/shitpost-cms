@@ -24,6 +24,16 @@ const loggerSpy = (): { logger: Logger; events: string[] } => {
   return { logger, events };
 };
 
+const adminResponseRows = (databasePath: string): Array<{ state: string; text: string }> => {
+  const database = createDatabase(databasePath);
+  try {
+    const rows = database.raw.query("SELECT state, descriptor_json FROM admin_response_outbox ORDER BY created_at, id").all() as Array<{ state: string; descriptor_json: string }>;
+    return rows.map((row) => ({ state: row.state, text: (JSON.parse(row.descriptor_json) as { text: string }).text }));
+  } finally {
+    database.close();
+  }
+};
+
 const makeApplicationHarness = () => {
   const directory = mkdtempSync(join(tmpdir(), "queuebot-application-"));
   const config = {
@@ -183,11 +193,14 @@ describe("application composition", () => {
     try {
       await applicationMain(harness.options);
 
-      const orphanAlerts = harness.adminAlerts.filter((message) => message.includes("Orphaned sources for queue item"));
+      const responseRows = adminResponseRows(harness.config.databasePath);
+      const responses = responseRows.map((row) => row.text);
+      const orphanAlerts = responses.filter((message) => message.includes("Orphaned sources for queue item"));
       expect(orphanAlerts).toHaveLength(2);
       expect(orphanAlerts).toContain("[immediate] Orphaned sources for queue item #1, generation 0, are past Telegram's deletion age limit and require manual cleanup. Old source IDs: 5001, 5002. Current generation 0 source IDs: 40.");
       expect(orphanAlerts).toContain("[immediate] Orphaned sources for queue item #1, generation 1, are past Telegram's deletion age limit and require manual cleanup. Old source IDs: 5003. Current generation 0 source IDs: 40.");
-      expect(harness.adminAlerts).toContain("[critical] Renewal capacity is unsafe: due uncertain renewals require admin resolution for item(s) #1.");
+      expect(responses).toContain("[critical] Renewal capacity is unsafe: due uncertain renewals require admin resolution for item(s) #1.");
+      expect(responseRows.filter((row) => row.text.includes("Orphaned sources for queue item")).every((row) => row.state === "pending")).toBe(true);
     } finally {
       harness.cleanup();
     }
@@ -206,7 +219,9 @@ describe("application composition", () => {
         entry.apply(harness.gateway);
         await applicationMain(harness.options);
         expect(harness.statusEvents).toEqual(["starting", "stopping", "remove"]);
-        expect(harness.adminAlerts).toHaveLength(1);
+        const startupResponses = adminResponseRows(harness.config.databasePath).filter((row) => row.text.includes("Queue bot cannot start:"));
+        expect(startupResponses).toHaveLength(1);
+        expect(startupResponses[0]?.state).toBe("pending");
       } finally {
         harness.cleanup();
       }
