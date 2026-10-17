@@ -204,6 +204,8 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
         lastSchedulerScanAt: null,
         activeOperations: 0,
         uncertainOperations: 0,
+        adminUpdates: { active: 0, uncertain: 0 },
+        adminResponses: { pending: 0, sending: 0, uncertain: 0, failed: 0 },
         pendingUpdates: {},
         orphanCounts: { unresolved: 0, terminal: 0 },
         renewalCapacity: { safe: true },
@@ -714,6 +716,7 @@ describe("admin command, queue, and publication handlers", () => {
       harness.setPhysicalAge(queueAge);
       await harness.run(commandUpdate(297, 297, "health"));
       expect(harness.lastSent().message.text).toContain("oldest physical source age: 2.87 days");
+      expect(harness.lastSent().message.text).toContain("Admin actions: 0 active · 0 uncertain");
     } finally {
       harness.close();
     }
