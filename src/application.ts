@@ -20,6 +20,7 @@ import { createRuntimeLease } from "./db/runtime";
 import { createTelegramGateway, type BotMembership, type TelegramGateway } from "./telegram";
 import { createIngestionService } from "./services/ingestion";
 import { createPublicationService } from "./services/publisher";
+import { createPublicationCoordinator } from "./services/publication-coordinator";
 import { createRenewalService } from "./services/renewal";
 import { createRenewalWorker } from "./services/renewal-worker";
 import { createPreparationService } from "./services/preparation";
@@ -257,8 +258,11 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, events: generatedEvents, pending, logger, now: clock.now });
   const preparation = createPreparationService({ queue, preparation: preparationRepository, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
+  const publicationCoordinator = createPublicationCoordinator();
   const publisher = createPublicationService({
     queue, gateway, queueChannelId: config.queueChannelId, targetChannelId: config.targetChannelId, clock, logger, operationTracker, cooldown: telegramCooldown,
+    coordinator: publicationCoordinator,
+    schedule,
     onSharedFailure: async (error, context) => {
       const key = error.kind === "rate_limited" ? "shared_issue:flood_wait" : `shared_issue:${error.kind}`;
       const fingerprint = createHash("sha256").update(JSON.stringify({ kind: error.kind })).digest("hex");
@@ -278,7 +282,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   });
   const renewal = createRenewalService({ queue, policy, generated, events: generatedEvents, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown });
   const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
-  const scheduler = createSchedulerService({ schedule, publisher, clock, logger });
+  const scheduler = createSchedulerService({ schedule, publisher, clock, logger, bootId });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
   if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);

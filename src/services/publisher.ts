@@ -8,6 +8,7 @@ import type { TelegramCooldown } from "../telegram-cooldown";
 import type { ChatId } from "../types";
 import type { OperationTracker } from "./task-supervisor";
 import { transferPreparedStep } from "./prepared-transfer";
+import type { PublicationCoordinator } from "./publication-coordinator";
 
 export type PublicationOutcome =
   | { kind: "empty" }
@@ -20,6 +21,7 @@ export type PublicationOutcome =
   | { kind: "failed"; itemId: number; status: string; error: string; operationId?: string };
 
 type Claimed = NonNullable<ReturnType<QueueRepository["claimReadyPublication"]>>;
+export type ScheduledPublicationContext = { occurrenceAt: number; deadlineAt: number; claimToken: string };
 const deliverySteps = (members: readonly PreparedMember[]): TransferStep[] => {
   const steps: TransferStep[] = [];
   for (let index = 0; index < members.length;) {
@@ -62,6 +64,8 @@ export const createPublicationService = (input: {
   cooldown?: TelegramCooldown;
   operationId?: () => string;
   operationTracker?: OperationTracker;
+  coordinator?: PublicationCoordinator;
+  schedule?: { cancelUnsentRuns(reason: string, now: number): number };
   onSharedFailure?: (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }) => Promise<void> | void;
   onSharedRecovery?: () => Promise<void> | void;
 }) => {
@@ -244,7 +248,7 @@ export const createPublicationService = (input: {
     });
   };
 
-  const publishNext = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }): Promise<PublicationOutcome> => {
+  const publishNextUnlocked = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome> => {
     const now = input.clock.now();
     const first = input.queue.peekNextReady(now);
     if (!first) return expected ? { kind: "blocked", itemId: expected.itemId, status: "stale_candidate", reason: "No prepared item is currently ready; reopen the queue." } : { kind: "empty" };
@@ -263,7 +267,7 @@ export const createPublicationService = (input: {
     const attempted: number[] = [];
     for (const candidate of candidates) {
       const operationId = newOperationId();
-      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted);
+      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted, scheduled);
       attempted.push(candidate.itemId);
       if (!claimed) continue;
       const outcome = await tracked(operationId, () => publishPreparedClaimed(claimed));
@@ -272,6 +276,17 @@ export const createPublicationService = (input: {
       lastDefinite = outcome;
     }
     return lastDefinite ?? { kind: "empty" };
+  };
+
+  const publishNext = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome> => {
+    const execute = async (): Promise<PublicationOutcome> => {
+      const outcome = await publishNextUnlocked(type, expected, scheduled);
+      if (type === "manual_publish" && (outcome.kind === "published" || outcome.kind === "cleanup_pending")) {
+        input.schedule?.cancelUnsentRuns("manual_publication", input.clock.now());
+      }
+      return outcome;
+    };
+    return input.coordinator ? input.coordinator.runExclusive(execute) : execute();
   };
 
   return { publishNext, cleanupPending };

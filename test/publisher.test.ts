@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
 import { createTelegramCooldownRepository } from "../src/db/telegram-cooldown-repository";
-import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
+import { createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { createPublicationService } from "../src/services/publisher";
+import { createPublicationCoordinator } from "../src/services/publication-coordinator";
 import { createTelegramCooldown } from "../src/telegram-cooldown";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
@@ -49,11 +50,12 @@ const open = (gateway: TelegramGateway) => {
   const database = createDatabase(join(directory, "bot.sqlite"));
   const queue = createQueueRepository(database);
   const policy = createPolicyRepository(database);
+  const schedule = createScheduleRepository(database);
   const clock = createFakeClock(10_000);
   const cooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
-  const service = createPublicationService({ queue, gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
+  const service = createPublicationService({ queue, schedule, coordinator: createPublicationCoordinator(), gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock, logger: createLogger("error"), cooldown, operationId: (() => { let i = 0; return () => `op-${++i}`; })() });
   resources.push({ directory, close: database.close });
-  return { database, queue, policy, service, clock, cooldown };
+  return { database, queue, policy, schedule, service, clock, cooldown };
 };
 
 const ready = (run: ReturnType<typeof open>, itemId = 1, mode: "copy" | "forward" = "copy"): void => markQueueItemPrepared(run.database, itemId, mode, run.clock.now());
@@ -82,6 +84,40 @@ describe("publication service", () => {
     ready(maintenanceRun);
     maintenanceRun.queue.claimRenewal("renewing", 10_000, 20_000);
     expect(await maintenanceRun.service.publishNext()).toEqual({ kind: "empty" });
+  });
+
+  test("atomically associates a scheduled run with its publication operation", async () => {
+    const occurrence = Date.parse("2026-10-05T00:00:00Z");
+    const fake = fakeGateway();
+    const run = open(fake.gateway);
+    run.clock.advance(occurrence + 30_000 - run.clock.now());
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(119) }), occurrence - 2_000);
+    ready(run, 1);
+    run.schedule.addSlot(0, 1, occurrence - 1);
+    run.schedule.setEnabled(true, 1, run.clock.now());
+    run.schedule.materialize(occurrence);
+    const claim = run.schedule.claimRun(occurrence, "test-boot", run.clock.now())!;
+
+    expect((await run.service.publishNext("publish", undefined, claim)).kind).toBe("published");
+    expect(run.schedule.run(occurrence)).toMatchObject({ status: "running", attemptCount: 1, itemId: 1, operationId: "op-1" });
+    expect(run.schedule.associatedAttempts(occurrence)).toMatchObject([{ attemptNo: 1, operationId: "op-1", itemId: 1, operationState: "done", outputIds: [1000] }]);
+  });
+
+  test("manual confirmed output cancels scheduled work that has not started sending", async () => {
+    const occurrence = Date.parse("2026-10-05T00:00:00Z");
+    const fake = fakeGateway();
+    const run = open(fake.gateway);
+    run.clock.advance(occurrence + 30_000 - run.clock.now());
+    run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(120) }), occurrence - 2_000);
+    ready(run, 1);
+    run.schedule.addSlot(0, 1, occurrence - 1);
+    run.schedule.setEnabled(true, 1, run.clock.now());
+    run.schedule.materialize(occurrence);
+    const claim = run.schedule.claimRun(occurrence, "test-boot", run.clock.now())!;
+    run.schedule.deferRun(claim.claimToken, occurrence + 60_000, run.clock.now(), "telegram_rate_limited");
+
+    expect((await run.service.publishNext("manual_publish")).kind).toBe("published");
+    expect(run.schedule.run(occurrence)).toMatchObject({ status: "failed", cancelReason: "manual_publication" });
   });
 
   test("classifies transfer rate limits and missing sources without deleting prematurely", async () => {
