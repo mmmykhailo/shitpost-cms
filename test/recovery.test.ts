@@ -44,7 +44,7 @@ const open = () => {
     answerCallbackQuery: async () => {},
   };
   const recoveryRepository = createRecoveryRepository(database);
-  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), recovery: recoveryRepository, gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), operationId: () => "recover-1" });
+  const recovery = createRecoveryService({ queue: createQueueRepository(database), policy: createPolicyRepository(database), recovery: recoveryRepository, gateway, queueChannelId: asChatId(-1001234567890), adminChatId: asChatId(99), clock: createFakeClock(10_000), logger: createLogger("error"), bootId: "current-boot", operationId: () => "recover-1" });
   resources.push({ directory, close: database.close });
   return { recovery, recoveryRepository, deleted, queue: createQueueRepository(database), database };
 };
@@ -79,7 +79,7 @@ describe("recovery", () => {
 
   test("reconciles recorded previews after a restart", async () => {
     const { recovery, recoveryRepository, deleted, database } = open();
-    recoveryRepository.createSession("stale-recovery", [asMessageId(88)], "old-boot", 0, 1);
+    recoveryRepository.createSession("stale-recovery", [asMessageId(88)], "old-boot", 9_999, 300_000);
     recoveryRepository.addPreviewPending("stale-recovery", 88, 0, 0);
     recoveryRepository.recordPreview("stale-recovery", 88, 99, 701, snapshotFromMessage(preview(701, undefined)), 0);
     recoveryRepository.markPreviewCleanupPending("stale-recovery", 0, "process restarted before cleanup");

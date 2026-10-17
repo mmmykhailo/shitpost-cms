@@ -71,8 +71,10 @@ export const createRecoveryRepository = (database: AppDatabase) => {
     });
   };
 
-  const listRecoverable = (now: number): RecoverySessionRecord[] => {
-    const rows = database.raw.query("SELECT id FROM recovery_sessions WHERE phase NOT IN ('completed','failed') AND lease_expires_at <= ? ORDER BY updated_at").all(now) as Array<{ id: string }>;
+  const listRecoverable = (now: number, bootId?: string): RecoverySessionRecord[] => {
+    const rows = bootId === undefined
+      ? database.raw.query("SELECT id FROM recovery_sessions WHERE phase NOT IN ('completed','failed') AND lease_expires_at <= ? ORDER BY updated_at").all(now) as Array<{ id: string }>
+      : database.raw.query("SELECT id FROM recovery_sessions WHERE phase NOT IN ('completed','failed') AND (boot_id <> ? OR lease_expires_at <= ?) ORDER BY updated_at").all(bootId, now) as Array<{ id: string }>;
     return rows.map((row) => session(row.id)).filter((value): value is RecoverySessionRecord => value !== undefined);
   };
 

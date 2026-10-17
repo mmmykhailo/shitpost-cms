@@ -1,5 +1,4 @@
 import type { Bot, Context } from "grammy";
-import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { classifyTelegramError } from "../errors";
 import { safeDisplayName, validateAlias } from "../domain/byline";
 import { formatAge } from "../domain/age";
@@ -8,6 +7,10 @@ import { buildQueueMessageLink } from "../domain/telegram-message-link";
 import { validateOrderedMessageIds } from "../domain/validation";
 import type { PolicyRepository, QueueRepository, ScheduleRepository } from "../db/repositories";
 import type { AdminRepository } from "../db/admin-repository";
+import type { AdminResponseRepository, AdminResponseKind } from "../db/admin-response-repository";
+import { createHash, randomUUID } from "node:crypto";
+import type { AdminActionButton, AdminReplyMarkupIntent, AdminResponseDescriptor } from "../services/admin-response-worker";
+import type { AdminUpdateRepository } from "../db/admin-update-repository";
 import type { OrphanRepository } from "../db/orphan-repository";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { PreparationRepository } from "../db/preparation-repository";
@@ -27,6 +30,9 @@ type AdminDeps = {
   policy: PolicyRepository;
   schedule: ScheduleRepository;
   admin: AdminRepository;
+  responses: AdminResponseRepository;
+  updates: AdminUpdateRepository;
+  bootId: string;
   pending: PendingUpdateRepository;
   preparation: PreparationRepository;
   orphan: OrphanRepository;
@@ -58,12 +64,9 @@ const parseMessageIds = (text: string, expectedCount?: number): MessageId[] => {
 
 const isAuthorized = (ctx: Context, adminUserId: UserId): boolean => ctx.from?.id === adminUserId && ctx.chat?.type === "private";
 
-const button = async (deps: AdminDeps, text: string, action: string, payload: unknown = {}, itemVersion?: number) => ({
-  text,
-  callback_data: `v1:${deps.admin.createCallbackToken(deps.config.adminUserId, action, payload, deps.now(), itemVersion)}`,
-});
+const button = (_deps: AdminDeps, text: string, action: string, payload: unknown = {}, itemVersion?: number): AdminActionButton => ({ text, action, payload, ...(itemVersion === undefined ? {} : { itemVersion }) });
 
-const keyboard = (rows: Array<Awaited<ReturnType<typeof button>>[]>): InlineKeyboardMarkup => ({ inline_keyboard: rows });
+const keyboard = (rows: AdminActionButton[][]): AdminReplyMarkupIntent => ({ kind: "inline_keyboard", rows });
 
 const dashboardText = (deps: AdminDeps): string => {
   const now = deps.now();
@@ -89,62 +92,84 @@ const dashboardText = (deps: AdminDeps): string => {
 };
 
 export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
+  bot.use(async (ctx, next) => {
+    if (!isAuthorized(ctx, deps.config.adminUserId)) return next();
+    const updateId = ctx.update.update_id;
+    const callbackData = ctx.callbackQuery?.data;
+    const text = ctx.message?.text;
+    const prompt = text === undefined ? undefined : deps.admin.getPrompt(deps.config.adminUserId, deps.now());
+    const actionKind = callbackData !== undefined
+      ? "callback"
+      : text?.startsWith("/") ? `command:${text.slice(1).split(/[\s@]/u, 1)[0]?.toLowerCase() ?? "unknown"}`
+        : prompt === undefined ? "message" : `prompt:${prompt.kind}`;
+    const actionPayload = callbackData !== undefined
+      ? { callbackDigest: createHash("sha256").update(callbackData).digest("hex") }
+      : prompt === undefined ? {} : { promptKind: prompt.kind };
+    if (!deps.updates.begin({ updateId, adminId: deps.config.adminUserId, actionKind, actionPayload, bootId: deps.bootId, now: deps.now() })) {
+      if (ctx.callbackQuery) { try { await ctx.answerCallbackQuery({ text: "This action was already processed." }); } catch { /* Callback acknowledgement is best effort. */ } }
+      return;
+    }
+    try {
+      await next();
+      deps.updates.finish(updateId, "applied", { handled: true }, deps.now());
+    } catch (error) {
+      try { deps.updates.finish(updateId, "uncertain", { reason: classifyTelegramError(error).kind }, deps.now()); }
+      catch { /* Preserve the first durable state if another path already resolved it. */ }
+      throw error;
+    }
+  });
+  const enqueueReply = (ctx: Context, text: string, options: Record<string, unknown> = {}, responseKind: AdminResponseKind = "confirmation", coalesceKey?: string): void => {
+    const updateId = ctx.update.update_id;
+    const markup = options.reply_markup as AdminReplyMarkupIntent | undefined;
+    const descriptor: AdminResponseDescriptor = { version: 1, text };
+    if (Array.isArray(options.entities)) {
+      const entities = options.entities as NonNullable<AdminResponseDescriptor["entities"]>;
+      descriptor.entities = entities;
+    }
+    const linkOptions = options.link_preview_options as { is_disabled?: unknown } | undefined;
+    if (linkOptions?.is_disabled === true) descriptor.disableLinkPreview = true;
+    if (markup !== undefined) descriptor.replyMarkup = markup;
+    const row = deps.responses.enqueue({ adminChatId: deps.config.adminUserId, updateId, kind: responseKind, descriptor, ...(coalesceKey === undefined ? {} : { coalesceKey }), now: deps.now() });
+    void row;
+  };
+
+  const deferAction = (ctx: Context, actionKind: string, payload: unknown): void => {
+    if (!deps.updates.defer(ctx.update.update_id, actionKind, payload, deps.now())) throw new Error("Admin update receipt could not be moved to durable action work");
+  };
+
+  const deferPromptAction = (ctx: Context, actionKind: string, payload: unknown): void => deps.updates.transaction(() => {
+    clearPrompt();
+    deferAction(ctx, actionKind, payload);
+  });
+
+  const clearPrompt = (): void => {
+    const existing = deps.admin.getPrompt(deps.config.adminUserId, deps.now());
+    if (existing?.deliveryOutboxId !== undefined) deps.responses.cancel(existing.deliveryOutboxId, deps.now());
+    deps.admin.clearPrompt(deps.config.adminUserId);
+  };
+
   const reject = async (ctx: Context): Promise<void> => {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Not authorized", show_alert: true });
     else if (ctx.chat?.type === "private") await ctx.reply("Not authorized.");
   };
 
   const beginPrompt = async (ctx: Context, spec: PromptSpec): Promise<void> => {
-    const question = await ctx.reply(spec.text, {
-      reply_markup: {
-        force_reply: true,
-        ...(spec.placeholder === undefined ? {} : { input_field_placeholder: spec.placeholder }),
-      },
+    const generationId = randomUUID();
+    const descriptor: AdminResponseDescriptor = { version: 1, text: spec.text, replyMarkup: { kind: "force_reply", ...(spec.placeholder === undefined ? {} : { placeholder: spec.placeholder }) }, prompt: { adminId: deps.config.adminUserId, generationId, kind: spec.kind } };
+    deps.updates.transaction(() => {
+      clearPrompt();
+      const queued = deps.responses.enqueue({ adminChatId: deps.config.adminUserId, updateId: ctx.update.update_id, kind: "prompt", descriptor, now: deps.now() });
+      deps.admin.setPendingPrompt(deps.config.adminUserId, spec.kind, spec.state, generationId, queued.record.id, deps.now());
+      deps.updates.finish(ctx.update.update_id, "applied", { handled: true, promptQueued: true }, deps.now());
     });
-    const questionChatId = asChatId(question.chat.id);
-    const questionMessageId = asMessageId(question.message_id);
-    try {
-      deps.admin.setPrompt(
-        deps.config.adminUserId,
-        spec.kind,
-        spec.state,
-        questionMessageId,
-        deps.now(),
-      );
-    } catch (error) {
-      try {
-        await deps.gateway.deleteMessages(questionChatId, [questionMessageId]);
-      } catch (cleanupError) {
-        deps.logger.warn("admin_prompt_delete_failed", {
-          chatId: questionChatId,
-          messageId: questionMessageId,
-          errorKind: classifyTelegramError(cleanupError).kind,
-        });
-      }
-      throw error;
-    }
   };
 
   const deleteCallbackMenu = async (ctx: Context, action: string): Promise<void> => {
-    const message = ctx.callbackQuery?.message;
-    if (!message) return;
-    const chatId = asChatId(message.chat.id);
-    const messageId = asMessageId(message.message_id);
-    try {
-      await deps.gateway.deleteMessages(chatId, [messageId]);
-    } catch (error) {
-      const normalized = classifyTelegramError(error);
-      if (normalized.kind === "source_missing") return;
-      deps.logger.warn("admin_menu_delete_failed", {
-        chatId,
-        messageId,
-        action,
-        errorKind: normalized.kind,
-      });
-    }
+    void ctx;
+    void action;
   };
 
-  const dashboardKeyboard = async (): Promise<InlineKeyboardMarkup> => keyboard([
+  const dashboardKeyboard = async (): Promise<AdminReplyMarkupIntent> => keyboard([
     [await button(deps, "Queue", "queue"), await button(deps, "Publish next now", "publish")],
     [await button(deps, "Schedule", "schedule"), await button(deps, "Whitelist", "whitelist")],
     [await button(deps, "Author names", "authors"), await button(deps, "Health", "health")],
@@ -152,10 +177,10 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   ]);
 
   const sendDashboard = async (ctx: Context): Promise<void> => {
-    await ctx.reply(dashboardText(deps), { reply_markup: await dashboardKeyboard() });
+    await enqueueReply(ctx, dashboardText(deps), { reply_markup: await dashboardKeyboard() }, "view", `admin:${deps.config.adminUserId}:view:dashboard`);
   };
 
-  const uncertainPublicationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: InlineKeyboardMarkup } | undefined> => {
+  const uncertainPublicationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: AdminReplyMarkupIntent } | undefined> => {
     const item = deps.queue.findItemById(itemId);
     const evidence = deps.queue.operationEvidence(itemId);
     if (!item || item.status !== "uncertain_publish" || !evidence) return undefined;
@@ -171,7 +196,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     };
   };
 
-  const uncertainPreparationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: InlineKeyboardMarkup } | undefined> => {
+  const uncertainPreparationResponse = async (itemId: number): Promise<{ text: string; replyMarkup: AdminReplyMarkupIntent } | undefined> => {
     const item = deps.queue.findItemById(itemId);
     const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.state === "uncertain");
     if (!item || item.status !== "needs_review" || item.preparationState !== "uncertain" || !evidence) return undefined;
@@ -227,7 +252,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (page.length > pageSize) navigation.push(await button(deps, "Next", "queue", { offset: offset + pageSize }));
     if (navigation.length > 0) rows.push(navigation);
     rows.push([await button(deps, "Back", "dashboard")]);
-    await ctx.reply(text, { entities, link_preview_options: { is_disabled: true }, reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, text, { entities, link_preview_options: { is_disabled: true }, reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:queue`);
   };
 
   const sendPublicationOutcome = async (ctx: Context, outcome: PublicationOutcome): Promise<void> => {
@@ -235,34 +260,34 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const dashboard = await button(deps, "Dashboard", "dashboard");
     switch (outcome.kind) {
       case "published":
-        await ctx.reply(`Queue item #${outcome.itemId} was published and source cleanup completed.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue item #${outcome.itemId} was published and source cleanup completed.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "cleanup_pending":
-        await ctx.reply(`Queue item #${outcome.itemId} was published, but source cleanup is pending. Do not republish it; cleanup will be retried safely.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue item #${outcome.itemId} was published, but source cleanup is pending. Do not republish it; cleanup will be retried safely.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "uncertain": {
         const response = await uncertainPublicationResponse(outcome.itemId);
         if (response) {
-          await ctx.reply(response.text, { reply_markup: response.replyMarkup });
+          await enqueueReply(ctx, response.text, { reply_markup: response.replyMarkup });
           return;
         }
-        await ctx.reply(`Publication for queue item #${outcome.itemId} may already exist. Automatic retry is unsafe; other ready posts remain eligible for later slots. Reopen Queue to resolve it.`, { reply_markup: keyboard([[await button(deps, `Resolve #${outcome.itemId}`, "queue_uncertain", { itemId: outcome.itemId })], [queue]]) });
+        await enqueueReply(ctx, `Publication for queue item #${outcome.itemId} may already exist. Automatic retry is unsafe; other ready posts remain eligible for later slots. Reopen Queue to resolve it.`, { reply_markup: keyboard([[await button(deps, `Resolve #${outcome.itemId}`, "queue_uncertain", { itemId: outcome.itemId })], [queue]]) });
         return;
       }
       case "retry_scheduled":
-        await ctx.reply(`Queue item #${outcome.itemId} was not published; retry is scheduled for ${new Date(outcome.retryAt).toISOString()}.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue item #${outcome.itemId} was not published; retry is scheduled for ${new Date(outcome.retryAt).toISOString()}.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "blocked":
-        await ctx.reply(`Queue item #${outcome.itemId} remains blocked in status ${outcome.status}: ${outcome.reason}. Review the item before retrying.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue item #${outcome.itemId} remains blocked in status ${outcome.status}: ${outcome.reason}. Review the item before retrying.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "failed":
-        await ctx.reply(`Queue item #${outcome.itemId} failed in status ${outcome.status}: ${outcome.error}. Review the item and choose a safe next action.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue item #${outcome.itemId} failed in status ${outcome.status}: ${outcome.error}. Review the item and choose a safe next action.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "deleted_external":
-        await ctx.reply(`Queue source for item #${outcome.itemId} was already missing; the item was removed without publishing.`, { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, `Queue source for item #${outcome.itemId} was already missing; the item was removed without publishing.`, { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
       case "empty":
-        await ctx.reply("No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[queue], [dashboard]]) });
+        await enqueueReply(ctx, "No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[queue], [dashboard]]) });
         return;
     }
   };
@@ -285,7 +310,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
     if (navigation.length > 0) rows.push(navigation);
     rows.push([await button(deps, "Back", "dashboard")]);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:safety`);
   };
 
   const sendSchedule = async (ctx: Context, notice?: string): Promise<void> => {
@@ -295,7 +320,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     rows.push([await button(deps, "Back", "dashboard")]);
     const lines = [`Schedule is ${deps.schedule.enabled() ? "running" : "paused"}. Slots: ${slots.map(formatUtcSlot).join(", ") || "none"}`];
     if (notice !== undefined) lines.unshift(notice);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:schedule`);
   };
 
   const sendWhitelist = async (ctx: Context): Promise<void> => {
@@ -304,7 +329,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     for (const channel of channels) rows.push([await button(deps, `Remove ${cleanDisplay(channel.title || channel.username || String(channel.chatId))}`, "whitelist_remove", { chatId: channel.chatId })]);
     rows.push([await button(deps, "Back", "dashboard")]);
     const text = ["Whitelisted source channels", ...channels.map((channel) => `${channel.chatId} · ${cleanDisplay(channel.title)} ${channel.username ? `@${cleanDisplay(channel.username)}` : ""}`)].join("\n");
-    await ctx.reply(text, { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, text, { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:whitelist`);
   };
 
   const sendAuthors = async (ctx: Context, notice?: string, offset = 0): Promise<void> => {
@@ -319,7 +344,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     rows.push([await button(deps, "Back", "dashboard")]);
     const lines = [`Observed user authors (${authors.length === 0 ? 0 : offset + 1}–${Math.min(offset + 20, authors.length)} of ${authors.length})`, ...page.map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
     if (notice !== undefined) lines.unshift(notice);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:authors`);
   };
 
   const sendHiddenAuthors = async (ctx: Context, offset = 0, notice?: string): Promise<void> => {
@@ -334,7 +359,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     rows.push([await button(deps, "Back to users", "authors"), await button(deps, "Dashboard", "dashboard")]);
     const lines = [`Hidden sender names (${count === 0 ? 0 : offset + 1}–${Math.min(offset + authors.length, count)} of ${count})`, ...authors.map((author) => `${safeDisplayName(author.senderName)}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
     if (notice !== undefined) lines.unshift(notice);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:hidden-authors`);
   };
 
   const sendHiddenAuthor = async (ctx: Context, hiddenAuthorId: number, notice?: string): Promise<void> => {
@@ -345,7 +370,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     rows.push([await button(deps, "Back", "hidden_authors", { offset: 0 })]);
     const lines = [safeDisplayName(author.senderName), "A nickname is shared by queue posts with this exact hidden sender name.", `Current nickname: ${author.alias ? cleanDisplay(author.alias) : "none"}`];
     if (notice !== undefined) lines.unshift(notice);
-    await ctx.reply(lines.join("\n"), { reply_markup: keyboard(rows) });
+    await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:hidden-author`);
   };
 
   const sendHealth = async (ctx: Context): Promise<void> => {
@@ -353,21 +378,33 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const oldest = health.oldestPhysicalAgeMs === undefined ? "none" : formatAge(health.oldestPhysicalAgeMs);
     const pending = Object.entries(health.pendingUpdates).map(([state, count]) => `${state}=${count}`).join(", ") || "none";
     const rights = health.rights ? `queue post/delete=${health.rights.queue.canPostMessages}/${health.rights.queue.canDeleteMessages} · target post/edit/delete=${health.rights.target.canPostMessages}/${health.rights.target.canEditMessages}/${health.rights.target.canDeleteMessages}` : "unknown";
-    await ctx.reply(["Health", `Database: ${health.databaseOk ? "available" : "failed"}`, `Boot: ${health.bootId ?? "unknown"} · lease ${health.leaseOwned ? "owned" : "lost"}`, `Queue head: ${health.queueHead ?? "empty"} · oldest physical source age: ${oldest}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`, `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`, `Pending updates: ${pending}`, `Orphans: ${health.orphanCounts.unresolved} unresolved · ${health.orphanCounts.terminal} manual`, `Renewal capacity: ${health.renewalCapacity.safe ? "safe" : "unsafe"}`, `Telegram rights: ${rights}`, `Last update: ${health.lastSuccessfulUpdateAt ? new Date(health.lastSuccessfulUpdateAt).toISOString() : "unknown"}`, `Last rights check: ${health.lastRightsCheckAt ? new Date(health.lastRightsCheckAt).toISOString() : "unknown"}`, `Last backup: ${health.lastBackupAt ? new Date(health.lastBackupAt).toISOString() : "unknown"}`, `Active alerts: ${health.alerts.active}`].join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) });
+    const responseCounts = health.adminResponses;
+    const responseLine = responseCounts ? `Admin replies: ${responseCounts.pending} pending · ${responseCounts.sending} sending · ${responseCounts.uncertain} uncertain · ${responseCounts.failed} failed` : undefined;
+    const incident = health.floodIncident;
+    const incidentLine = incident ? `Flood wait: ${incident.state} · latest wait until ${new Date(incident.cooldownUntil).toISOString()} · stable check ${new Date(incident.quietUntil).toISOString()} · opening warning ${incident.warningDeliveredAt === undefined ? "not delivered" : "delivered"} · recovery ${incident.recoveryDeliveredAt === undefined ? "not delivered" : "delivered"}` : "Flood wait: no open incident";
+    const retry = health.scheduledRetry;
+    const retryLine = retry ? `Scheduled retry: ${new Date(retry.occurrenceAt).toISOString()} · ${retry.attemptCount} attempts · next ${retry.retryNotBefore === undefined ? "ready" : new Date(retry.retryNotBefore).toISOString()} · deadline ${retry.deadlineAt === undefined ? "unknown" : new Date(retry.deadlineAt).toISOString()}` : "Scheduled retry: none pending";
+    const protection = health.editorialProtection;
+    const protectionLine = protection ? `Frozen posts: ${protection.adminEdit} admin-edited · ${protection.legacyEditEvidence + protection.legacyUnverified} legacy-protected · ${protection.editCollisions} collisions needing review` : undefined;
+    await enqueueReply(ctx, ["Health", `Database: ${health.databaseOk ? "available" : "failed"}`, `Boot: ${health.bootId ?? "unknown"} · lease ${health.leaseOwned ? "owned" : "lost"}`, `Queue head: ${health.queueHead ?? "empty"} · oldest physical source age: ${oldest}`, `Scheduling: ${deps.schedule.enabled() ? "enabled" : "paused"}`, `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`, `Pending updates: ${pending}`, `Orphans: ${health.orphanCounts.unresolved} unresolved · ${health.orphanCounts.terminal} manual`, `Renewal capacity: ${health.renewalCapacity.safe ? "safe" : "unsafe"}`, `Shared Telegram pause: ${health.sharedCooldown?.remainingMs ? `until ${new Date(health.sharedCooldown.notBefore).toISOString()}` : "inactive"}`, incidentLine, retryLine, responseLine, protectionLine, `Telegram rights: ${rights}`, `Last update: ${health.lastSuccessfulUpdateAt ? new Date(health.lastSuccessfulUpdateAt).toISOString() : "unknown"}`, `Last rights check: ${health.lastRightsCheckAt ? new Date(health.lastRightsCheckAt).toISOString() : "unknown"}`, `Last backup: ${health.lastBackupAt ? new Date(health.lastBackupAt).toISOString() : "unknown"}`, `Active alerts: ${health.alerts.active}`].filter((line): line is string => line !== undefined).join("\n"), { reply_markup: keyboard([[await button(deps, "Back", "dashboard")]]) }, "view", `admin:${deps.config.adminUserId}:view:health`);
   };
 
   const handlePrompt = async (ctx: Context, text: string): Promise<boolean> => {
     const prompt = deps.admin.getPrompt(deps.config.adminUserId, deps.now());
     if (!prompt) return false;
-    if (prompt.expectedReplyToMessageId !== undefined && ctx.message?.reply_to_message?.message_id !== prompt.expectedReplyToMessageId) {
-      await ctx.reply("Reply to the active admin prompt to continue, or use /cancel.");
+    if (prompt.deliveryState === "pending") {
+      await enqueueReply(ctx, "The prompt is still waiting for Telegram delivery. Reply after it appears, or use /cancel.");
+      return true;
+    }
+    if (prompt.expectedReplyToMessageId === undefined || ctx.message?.reply_to_message?.message_id !== prompt.expectedReplyToMessageId) {
+      await enqueueReply(ctx, "Reply to the active admin prompt to continue, or use /cancel.");
       return true;
     }
     if (prompt.kind === "slot_add") {
       try {
         const slot = parseUtcSlot(text);
         deps.schedule.addSlot(slot, deps.config.adminUserId, deps.now());
-        deps.admin.clearPrompt(deps.config.adminUserId);
+        clearPrompt();
         await sendSchedule(ctx, `Added ${formatUtcSlot(slot)}.`);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Invalid UTC slot. Use HH:MM.";
@@ -382,68 +419,43 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     }
     if (prompt.kind === "whitelist_add") {
       if (!/^(?:@[A-Za-z0-9_]{5,32}|-?\d+)$/.test(text.trim())) {
-        await ctx.reply("Enter an exact public @handle or numeric channel ID.");
+        await enqueueReply(ctx, "Enter an exact public @handle or numeric channel ID.");
         return true;
       }
-      try {
-        const chat = await deps.gateway.getChat(text.trim().startsWith("@") ? text.trim() : Number(text.trim()) as ChatId);
-        if (chat.type !== "channel") throw new Error("The resolved chat is not a channel");
-        if (chat.id === deps.config.queueChannelId || chat.id === deps.config.targetChannelId) throw new Error("Queue and destination channels cannot be whitelisted");
-        const token = deps.admin.createCallbackToken(deps.config.adminUserId, "whitelist_confirm", { chatId: chat.id, username: chat.username, title: chat.title }, deps.now());
-        deps.admin.clearPrompt(deps.config.adminUserId);
-        await ctx.reply(`Confirm whitelist: ${cleanDisplay(chat.title)} (${chat.id})${chat.username ? ` @${cleanDisplay(chat.username)}` : ""}`, { reply_markup: keyboard([[{ text: "Confirm", callback_data: `v1:${token}` }]]) });
-      } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Could not resolve that channel.");
-      }
+      deferPromptAction(ctx, "whitelist_lookup", { reference: text.trim() });
       return true;
     }
     if (prompt.kind === "alias_add") {
       const match = /^(-?\d+|@[A-Za-z0-9_]{5,32})\s+(.+)$/.exec(text.trim());
       if (!match) {
-        await ctx.reply("Use `<user id or @observed_username> <alias>`.");
+        await enqueueReply(ctx, "Use `<user id or @observed_username> <alias>`.");
         return true;
       }
       try {
         const key = /^-?\d+$/.test(match[1]!) ? Number(match[1]) : match[1]!;
         deps.policy.setAlias(key, validateAlias(match[2]!), deps.config.adminUserId, deps.now());
-        deps.admin.clearPrompt(deps.config.adminUserId);
+        clearPrompt();
         await sendAuthors(ctx, "Author alias saved.");
       } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Could not save alias. Observe the user in a queue post first.");
+        await enqueueReply(ctx, error instanceof Error ? error.message : "Could not save alias. Observe the user in a queue post first.");
       }
       return true;
     }
     if (prompt.kind === "hidden_alias") {
       const state = prompt.state && typeof prompt.state === "object" ? prompt.state as Record<string, unknown> : {};
       const hiddenAuthorId = typeof state.hiddenAuthorId === "number" ? state.hiddenAuthorId : undefined;
-      if (hiddenAuthorId === undefined) { deps.admin.clearPrompt(deps.config.adminUserId); await ctx.reply("The selected hidden sender has expired."); return true; }
+      if (hiddenAuthorId === undefined) { clearPrompt(); await enqueueReply(ctx, "The selected hidden sender has expired."); return true; }
       try {
         deps.policy.setHiddenAlias(hiddenAuthorId, validateAlias(text), deps.config.adminUserId, deps.now());
-        deps.admin.clearPrompt(deps.config.adminUserId);
+        clearPrompt();
         await sendHiddenAuthor(ctx, hiddenAuthorId, "Hidden sender nickname saved.");
       } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Could not save nickname.");
+        await enqueueReply(ctx, error instanceof Error ? error.message : "Could not save nickname.");
       }
       return true;
     }
     if (prompt.kind === "recover") {
-      try {
-        const recovered = await deps.recovery.recover(text);
-        deps.admin.clearPrompt(deps.config.adminUserId);
-        deps.admin.audit(recovered.reused ? "recovery_existing_item_reused" : "recovery_completed", String(deps.config.adminUserId), deps.now(), recovered.itemId, undefined, { sourceIds: recovered.sourceIds, creditLast: recovered.creditLast ?? false });
-        if (recovered.reused) {
-          await ctx.reply(`Those messages already belong to queue item #${recovered.itemId}; I reused that item and did not create a duplicate.`);
-          await sendQueue(ctx);
-          return true;
-        }
-        const markup = recovered.canApplyPreparationRules
-          ? keyboard([[await button(deps, "Apply preparation rules", "recovery_apply_preparation", { itemId: recovered.itemId }, deps.queue.findItemById(recovered.itemId)?.contentVersion)], [await button(deps, "Queue", "queue")]])
-          : keyboard([[await button(deps, "Queue", "queue")]]);
-        const suffix = recovered.creditLast ? " The final message was recorded as an admin selected separate credit." : " It is ready to publish as shown; no author was inferred from its text.";
-        await ctx.reply(`Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}.${suffix}`, { reply_markup: markup });
-      } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Recovery failed; no queue item was confirmed.");
-      }
+      deferPromptAction(ctx, "recover", { reference: text });
       return true;
     }
     if (prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup" || prompt.kind === "uncertain_publish_adopt") {
@@ -458,8 +470,8 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       const renewalPrompt = prompt.kind === "renewal_adopt" || prompt.kind === "renewal_manual_cleanup";
       const validItem = renewalPrompt ? item?.maintenanceStatus === "uncertain_renewal" : item?.status === "uncertain_publish";
       if (itemId === undefined || !item || !evidence || operationId === undefined || sourceGeneration === undefined || phase === undefined || !validItem || evidence.operationId !== operationId || evidence.phase !== phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== sourceGeneration) {
-        deps.admin.clearPrompt(deps.config.adminUserId);
-        await ctx.reply("This renewal resolution is stale; reopen the queue.");
+        clearPrompt();
+        await enqueueReply(ctx, "This renewal resolution is stale; reopen the queue.");
         return true;
       }
       try {
@@ -468,28 +480,15 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           const ids = parseMessageIds(text.trim(), expectedCount);
           if (prompt.kind === "renewal_adopt") deps.queue.adoptUncertainRenewalGeneration({ operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: sourceGeneration }, ids, deps.now());
           else deps.queue.adoptConfirmedPublicationOutputs(itemId, operationId, item.contentVersion, sourceGeneration, deps.config.targetChannelId, ids, deps.now());
-          deps.admin.clearPrompt(deps.config.adminUserId);
-          await ctx.reply(prompt.kind === "renewal_adopt" ? `Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.` : `Adopted the exact destination IDs for queue item #${itemId}; source cleanup remains durable and retryable.`);
+          clearPrompt();
+          await enqueueReply(ctx, prompt.kind === "renewal_adopt" ? `Adopted replacement generation ${sourceGeneration + 1} for queue item #${itemId}; old-source cleanup remains durable and retryable.` : `Adopted the exact destination IDs for queue item #${itemId}; source cleanup remains durable and retryable.`);
           await sendQueue(ctx);
-        } else {
+      } else {
           const ids = parseMessageIds(text.trim());
-          try {
-            await deps.gateway.deleteMessages(deps.config.queueChannelId, ids);
-            deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), [], "manual_cleanup");
-          } catch (error) {
-            const normalized = classifyTelegramError(error);
-            if (normalized.kind !== "source_missing") {
-              deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), ids, "manual_cleanup");
-            } else {
-              deps.queue.resolveUncertainRenewal(itemId, operationId, item.contentVersion, sourceGeneration, deps.now(), [], "manual_cleanup");
-            }
-          }
-          deps.admin.clearPrompt(deps.config.adminUserId);
-          await ctx.reply(`Recorded explicit cleanup handling for queue item #${itemId}.`);
-          await sendQueue(ctx);
+          deferPromptAction(ctx, "renewal_manual_cleanup", { itemId, operationId, sourceGeneration, phase, chatId: Number(deps.config.queueChannelId), messageIds: ids.map(Number) });
         }
       } catch (error) {
-        await ctx.reply(error instanceof Error ? error.message : "Could not apply that renewal resolution.");
+        await enqueueReply(ctx, error instanceof Error ? error.message : "Could not apply that renewal resolution.");
       }
       return true;
     }
@@ -500,14 +499,14 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (!isAuthorized(ctx, deps.config.adminUserId)) return reject(ctx);
     await ctx.answerCallbackQuery();
     const data = ctx.callbackQuery?.data;
-    if (!data?.startsWith("v1:")) return ctx.reply("Stale action.");
+    if (!data?.startsWith("v1:")) return enqueueReply(ctx, "Stale action.");
     const token = data.slice(3);
     const resolved = deps.admin.consumeCallbackToken(deps.config.adminUserId, token, deps.now());
-    if (!resolved) return ctx.reply("This action expired. Open the dashboard again.");
+    if (!resolved) return enqueueReply(ctx, "This action expired. Open the dashboard again.");
     await deleteCallbackMenu(ctx, resolved.action);
     const payload = (resolved.payload && typeof resolved.payload === "object" ? resolved.payload : {}) as Record<string, unknown>;
     const itemId = typeof payload.itemId === "number" ? payload.itemId : undefined;
-    if (itemId !== undefined && resolved.itemVersion !== undefined && deps.queue.findItemById(itemId)?.contentVersion !== resolved.itemVersion) return ctx.reply("This queue item changed. Open the queue again.");
+    if (itemId !== undefined && resolved.itemVersion !== undefined && deps.queue.findItemById(itemId)?.contentVersion !== resolved.itemVersion) return enqueueReply(ctx, "This queue item changed. Open the queue again.");
     switch (resolved.action) {
       case "dashboard": return sendDashboard(ctx);
       case "queue": return sendQueue(ctx, typeof payload.offset === "number" ? payload.offset : 0);
@@ -522,91 +521,88 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "authors": return sendAuthors(ctx);
       case "authors_page": return sendAuthors(ctx, undefined, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
       case "hidden_authors": return sendHiddenAuthors(ctx, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
-      case "hidden_author_select": return typeof payload.hiddenAuthorId === "number" ? sendHiddenAuthor(ctx, payload.hiddenAuthorId) : ctx.reply("Invalid hidden sender selection.");
+      case "hidden_author_select": return typeof payload.hiddenAuthorId === "number" ? sendHiddenAuthor(ctx, payload.hiddenAuthorId) : enqueueReply(ctx, "Invalid hidden sender selection.");
       case "hidden_alias_set": {
-        if (typeof payload.hiddenAuthorId !== "number" || !deps.policy.getHiddenAuthor(payload.hiddenAuthorId)) return ctx.reply("This hidden sender is no longer available.");
+        if (typeof payload.hiddenAuthorId !== "number" || !deps.policy.getHiddenAuthor(payload.hiddenAuthorId)) return enqueueReply(ctx, "This hidden sender is no longer available.");
         return beginPrompt(ctx, { kind: "hidden_alias", state: { hiddenAuthorId: payload.hiddenAuthorId }, text: "Reply with the nickname for this exact hidden sender name.", placeholder: "Nickname" });
       }
       case "hidden_alias_remove": {
-        if (typeof payload.hiddenAuthorId !== "number") return ctx.reply("Invalid hidden sender.");
+        if (typeof payload.hiddenAuthorId !== "number") return enqueueReply(ctx, "Invalid hidden sender.");
         deps.policy.removeHiddenAlias(payload.hiddenAuthorId, deps.config.adminUserId, deps.now());
         return sendHiddenAuthor(ctx, payload.hiddenAuthorId, "Hidden sender nickname removed.");
       }
       case "health": return sendHealth(ctx);
       case "recovery_apply_preparation": {
-        if (itemId === undefined) return ctx.reply("Invalid recovered item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid recovered item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item) return ctx.reply("This recovered item no longer exists.");
+        if (!item) return enqueueReply(ctx, "This recovered item no longer exists.");
         const deliveryMode = item.origin.kind === "channel" && deps.policy.isChannelWhitelisted(item.origin.chatId) ? "forward" : "copy";
         try {
           deps.queue.reprocessRecoveredItem(itemId, deliveryMode, deps.now(), deps.now());
           deps.admin.audit("recovery_preparation_requested", String(deps.config.adminUserId), deps.now(), itemId, undefined, { deliveryMode });
-          await ctx.reply(`Preparation rules were requested for queue item #${itemId}. It will remain unscheduled until preparation finishes.`);
+          await enqueueReply(ctx, `Preparation rules were requested for queue item #${itemId}. It will remain unscheduled until preparation finishes.`);
           return sendQueue(ctx);
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Could not schedule preparation for this recovered item.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Could not schedule preparation for this recovered item.");
         }
       }
       case "safety": return sendSafety(ctx, typeof payload.offset === "number" ? payload.offset : 0);
       case "preparation_uncertain": {
-        if (itemId === undefined) return ctx.reply("Invalid preparation resolution.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid preparation resolution.");
         const response = await uncertainPreparationResponse(itemId);
-        if (!response) return ctx.reply("This preparation is no longer awaiting resolution.");
-        return ctx.reply(response.text, { reply_markup: response.replyMarkup });
+        if (!response) return enqueueReply(ctx, "This preparation is no longer awaiting resolution.");
+        return enqueueReply(ctx, response.text, { reply_markup: response.replyMarkup });
       }
       case "preparation_uncertain_retry":
       case "preparation_uncertain_discard": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return ctx.reply("Invalid preparation resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid preparation resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.operationId === payload.operationId);
-        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length > 0) return ctx.reply("This preparation resolution is stale or output evidence is incomplete.");
+        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length > 0) return enqueueReply(ctx, "This preparation resolution is stale or output evidence is incomplete.");
         try {
           deps.preparation.releaseForResolution(evidence.operationId, resolved.action === "preparation_uncertain_retry" ? "retry" : "discard", deps.now());
           deps.admin.audit(resolved.action, String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { phase: evidence.phase, trackedOutputs: evidence.outputs.length });
-          await ctx.reply(resolved.action === "preparation_uncertain_retry" ? `Preparation for queue item #${itemId} was requeued. It remains unscheduled until preparation finishes.` : `Preparation for queue item #${itemId} was discarded and left in review; the original source remains available.`);
+          await enqueueReply(ctx, resolved.action === "preparation_uncertain_retry" ? `Preparation for queue item #${itemId} was requeued. It remains unscheduled until preparation finishes.` : `Preparation for queue item #${itemId} was discarded and left in review; the original source remains available.`);
           return sendQueue(ctx);
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Could not apply the preparation resolution.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Could not apply the preparation resolution.");
         }
       }
       case "preparation_uncertain_cleanup_retry":
       case "preparation_uncertain_cleanup_discard": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return ctx.reply("Invalid preparation resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid preparation resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.preparation.operationEvidence(itemId).find((entry) => entry.operationId === payload.operationId);
-        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length === 0) return ctx.reply("This preparation resolution is stale or output evidence is incomplete.");
+        if (!item || item.preparationState !== "uncertain" || item.status !== "needs_review" || !evidence || evidence.state !== "uncertain" || evidence.phase !== payload.phase || evidence.outputs.length === 0) return enqueueReply(ctx, "This preparation resolution is stale or output evidence is incomplete.");
         try {
           const outputs = evidence.outputs as Array<{ chat_id: number; telegram_message_id: number }>;
-          for (const output of outputs) {
-            if (!Number.isSafeInteger(output.chat_id) || !Number.isSafeInteger(output.telegram_message_id) || output.telegram_message_id <= 0) throw new Error("Tracked output evidence is malformed; no outputs were cleaned automatically.");
-            try { await deps.gateway.deleteMessages(asChatId(output.chat_id), [asMessageId(output.telegram_message_id)]); }
-            catch (error) {
-              if (classifyTelegramError(error, "deleteMessages").kind !== "source_missing") throw error;
-            }
-          }
+          if (outputs.some((output) => !Number.isSafeInteger(output.chat_id) || !Number.isSafeInteger(output.telegram_message_id) || output.telegram_message_id <= 0)) throw new Error("Tracked output evidence is malformed; no outputs were cleaned automatically.");
           const action = resolved.action === "preparation_uncertain_cleanup_retry" ? "retry_after_cleanup" : "discard_after_cleanup";
-          deps.preparation.releaseForResolution(evidence.operationId, action, deps.now());
-          deps.admin.audit(resolved.action, String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { phase: evidence.phase, trackedOutputs: outputs.length });
-          await ctx.reply(resolved.action === "preparation_uncertain_cleanup_retry" ? `Tracked outputs were deleted and preparation for queue item #${itemId} was requeued.` : `Tracked outputs were deleted and preparation for queue item #${itemId} was discarded; the original source remains in review.`);
-          return sendQueue(ctx);
+          clearPrompt();
+          deferAction(ctx, "preparation_cleanup", {
+            action,
+            itemId,
+            operationId: evidence.operationId,
+            outputs: outputs.map((output) => ({ chatId: output.chat_id, messageId: output.telegram_message_id })),
+          });
+          return;
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Tracked output cleanup failed; the item remains uncertain.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Tracked output cleanup failed; the item remains uncertain.");
         }
       }
       case "publish": {
         const candidate = deps.queue.peekNextReady(deps.now());
-        if (!candidate) return ctx.reply("No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[await button(deps, "Queue", "queue")], [await button(deps, "Cancel", "dashboard")]]) });
+        if (!candidate) return enqueueReply(ctx, "No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[await button(deps, "Queue", "queue")], [await button(deps, "Cancel", "dashboard")]]) });
         const confirm = await button(deps, "Confirm publish next", "publish_execute", { itemId: candidate.id, contentVersion: candidate.contentVersion, sourceGeneration: candidate.sourceGeneration }, candidate.contentVersion);
-        return ctx.reply(`Publish next available item #${candidate.id} now? If an item fails definitively before producing output, this run may skip it and try a later ready item.`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "dashboard")]]) });
+        return enqueueReply(ctx, `Publish next available item #${candidate.id} now? If an item fails definitively before producing output, this run may skip it and try a later ready item.`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "dashboard")]]) });
       }
       case "publish_execute": {
         const item = itemId === undefined ? undefined : deps.queue.findItemById(itemId);
-        if (!item || typeof payload.contentVersion !== "number" || item.contentVersion !== payload.contentVersion || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return ctx.reply("The ready candidate changed; reopen the dashboard.");
+        if (!item || typeof payload.contentVersion !== "number" || item.contentVersion !== payload.contentVersion || typeof payload.sourceGeneration !== "number" || item.sourceGeneration !== payload.sourceGeneration) return enqueueReply(ctx, "The ready candidate changed; reopen the dashboard.");
         const candidate = deps.queue.peekNextReady(deps.now());
-        if (!candidate || candidate.id !== item.id || candidate.contentVersion !== item.contentVersion || candidate.sourceGeneration !== item.sourceGeneration) return ctx.reply("The ready queue changed; reopen the dashboard.");
-        const outcome = await deps.scheduler.manualPublish({ itemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
-        deps.admin.audit("manual_publish", String(deps.config.adminUserId), deps.now(), "itemId" in outcome ? outcome.itemId : item.id, "operationId" in outcome ? outcome.operationId : undefined, { outcome: outcome.kind, requestedItemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
-        return sendPublicationOutcome(ctx, outcome);
+        if (!candidate || candidate.id !== item.id || candidate.contentVersion !== item.contentVersion || candidate.sourceGeneration !== item.sourceGeneration) return enqueueReply(ctx, "The ready queue changed; reopen the dashboard.");
+        deferAction(ctx, "manual_publish", { itemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration });
+        return;
       }
       case "slot_add": return beginPrompt(ctx, { kind: "slot_add", state: {}, text: "Reply with the daily UTC slot as HH:MM.", placeholder: "HH:MM UTC" });
       case "slot_remove": if (typeof payload.minuteOfDay === "number") deps.schedule.removeSlot(payload.minuteOfDay, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
@@ -614,76 +610,76 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "schedule_resume": if (deps.schedule.slots().length === 0) return sendSchedule(ctx, "Add at least one UTC slot before resuming."); deps.schedule.setEnabled(true, deps.config.adminUserId, deps.now()); return sendSchedule(ctx);
       case "whitelist_add": return beginPrompt(ctx, { kind: "whitelist_add", state: {}, text: "Reply with an exact public @handle or numeric channel ID.", placeholder: "@channel or numeric ID" });
       case "whitelist_confirm": {
-        if (typeof payload.chatId !== "number") return ctx.reply("Invalid confirmation payload.");
+        if (typeof payload.chatId !== "number") return enqueueReply(ctx, "Invalid confirmation payload.");
         deps.policy.upsertChannel(payload.chatId, typeof payload.username === "string" ? payload.username : undefined, typeof payload.title === "string" ? payload.title : undefined, deps.config.adminUserId, deps.now());
         return sendWhitelist(ctx);
       }
       case "whitelist_remove": {
-        if (typeof payload.chatId !== "number") return ctx.reply("Invalid channel.");
-        return ctx.reply("Remove this numeric channel from the whitelist?", { reply_markup: keyboard([[await button(deps, "Confirm removal", "whitelist_remove_execute", { chatId: payload.chatId })], [await button(deps, "Cancel", "whitelist")]]) });
+        if (typeof payload.chatId !== "number") return enqueueReply(ctx, "Invalid channel.");
+        return enqueueReply(ctx, "Remove this numeric channel from the whitelist?", { reply_markup: keyboard([[await button(deps, "Confirm removal", "whitelist_remove_execute", { chatId: payload.chatId })], [await button(deps, "Cancel", "whitelist")]]) });
       }
       case "whitelist_remove_execute": if (typeof payload.chatId === "number") deps.policy.removeChannel(payload.chatId, deps.config.adminUserId, deps.now()); return sendWhitelist(ctx);
       case "alias_add": return beginPrompt(ctx, { kind: "alias_add", state: {}, text: "Reply with a user ID or @observed_username followed by the alias.", placeholder: "user and alias" });
       case "alias_remove": if (typeof payload.userId === "number") deps.policy.removeAlias(payload.userId, deps.config.adminUserId, deps.now()); return sendAuthors(ctx);
       case "queue_retry": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return ctx.reply("Uncertain and active-maintenance items require their state-specific resolution flow.");
-        return ctx.reply(`Retry queue item #${itemId} from ${item.status}?`, { reply_markup: keyboard([[await button(deps, "Confirm retry", "queue_retry_execute", { itemId }, item.contentVersion)], [await button(deps, "Cancel", "queue")]]) });
+        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return enqueueReply(ctx, "Uncertain and active-maintenance items require their state-specific resolution flow.");
+        return enqueueReply(ctx, `Retry queue item #${itemId} from ${item.status}?`, { reply_markup: keyboard([[await button(deps, "Confirm retry", "queue_retry_execute", { itemId }, item.contentVersion)], [await button(deps, "Cancel", "queue")]]) });
       }
       case "queue_retry_execute": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return ctx.reply("This queue item changed; reopen the queue.");
+        if (!item || !["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status) || item.maintenanceStatus !== "idle") return enqueueReply(ctx, "This queue item changed; reopen the queue.");
         deps.queue.retryItem(itemId, deps.now());
         deps.admin.audit("queue_retry", String(deps.config.adminUserId), deps.now(), itemId, undefined, { previousStatus: item.status });
         return sendQueue(ctx);
       }
       case "queue_move_end": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item) return ctx.reply("Queue item no longer exists.");
+        if (!item) return enqueueReply(ctx, "Queue item no longer exists.");
         const confirm = await button(deps, "Confirm move to end", "queue_move_execute", { itemId }, item.contentVersion);
-        return ctx.reply(`Move queue item #${itemId} to the FIFO end?`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "queue")]]) });
+        return enqueueReply(ctx, `Move queue item #${itemId} to the FIFO end?`, { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "queue")]]) });
       }
       case "queue_move_execute": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item || item.status === "done" || item.status === "deleted" || item.status === "deleted_external") return ctx.reply("Queue item changed; reopen the queue.");
+        if (!item || item.status === "done" || item.status === "deleted" || item.status === "deleted_external") return enqueueReply(ctx, "Queue item changed; reopen the queue.");
         deps.queue.moveToEnd(itemId, deps.now());
         deps.admin.audit("queue_moved_to_end", String(deps.config.adminUserId), deps.now(), itemId, undefined, { contentVersion: item.contentVersion });
         return sendQueue(ctx);
       }
       case "queue_uncertain": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const response = await uncertainPublicationResponse(itemId);
-        if (!response) return ctx.reply("This publication is no longer awaiting uncertainty resolution.");
-        return ctx.reply(response.text, { reply_markup: response.replyMarkup });
+        if (!response) return enqueueReply(ctx, "This publication is no longer awaiting uncertainty resolution.");
+        return enqueueReply(ctx, response.text, { reply_markup: response.replyMarkup });
       }
       case "uncertain_publish_retry": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return enqueueReply(ctx, "This uncertainty resolution is stale.");
         deps.queue.requeueUncertainPublication(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), "admin_confirmed_nothing_published");
         deps.admin.audit("uncertain_publication_retry", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { duplicateRiskConfirmed: true });
         return sendQueue(ctx);
       }
       case "uncertain_publish_adopt_known": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This uncertainty resolution is stale.");
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return enqueueReply(ctx, "This uncertainty resolution is stale.");
         try {
           deps.queue.adoptConfirmedPublicationOutputs(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.config.targetChannelId, evidence.knownDestinationIds, deps.now());
           deps.admin.audit("uncertain_publication_destination_adopted", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { destinationIds: evidence.knownDestinationIds });
           return sendQueue(ctx);
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Could not adopt those destination IDs.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Could not adopt those destination IDs.");
         }
       }
       case "uncertain_publish_adopt_prompt":
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid uncertainty resolution.");
         return beginPrompt(ctx, {
           kind: "uncertain_publish_adopt",
           state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase },
@@ -691,25 +687,22 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           placeholder: "message IDs",
         });
       case "uncertain_publish_delete_retry": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid uncertainty resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid uncertainty resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedOutputCount === undefined || evidence.expectedOutputCount !== evidence.knownDestinationIds.length || evidence.expectedOutputCount !== evidence.sourceIds.length) return ctx.reply("This cleanup resolution is stale or output evidence is incomplete.");
+        if (!item || !evidence || item.status !== "uncertain_publish" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedOutputCount === undefined || evidence.expectedOutputCount !== evidence.knownDestinationIds.length || evidence.expectedOutputCount !== evidence.sourceIds.length) return enqueueReply(ctx, "This cleanup resolution is stale or output evidence is incomplete.");
         try {
-          try { await deps.gateway.deleteMessages(deps.config.targetChannelId, evidence.knownDestinationIds); }
-          catch (error) { if (classifyTelegramError(error).kind !== "source_missing") throw error; }
-          deps.queue.requeueUncertainPublication(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), "admin_deleted_known_outputs");
-          deps.admin.audit("uncertain_publication_outputs_deleted_retry", String(deps.config.adminUserId), deps.now(), itemId, evidence.operationId, { destinationIds: evidence.knownDestinationIds });
-          return sendQueue(ctx);
+          deferAction(ctx, "uncertain_publish_delete_retry", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase, chatId: Number(deps.config.targetChannelId), messageIds: evidence.knownDestinationIds.map(Number) });
+          return;
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Known output cleanup failed; the item remains uncertain.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Known output cleanup failed; the item remains uncertain.");
         }
       }
       case "renewal_uncertain": {
-        if (itemId === undefined) return ctx.reply("Invalid renewal item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid renewal item.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || item.maintenanceStatus !== "uncertain_renewal" || !evidence) return ctx.reply("This renewal is no longer awaiting resolution.");
+        if (!item || item.maintenanceStatus !== "uncertain_renewal" || !evidence) return enqueueReply(ctx, "This renewal is no longer awaiting resolution.");
         const rows: Array<Awaited<ReturnType<typeof button>>[]> = [];
         if (evidence.expectedSourceCount !== undefined && evidence.knownReplacementIds.length === evidence.expectedSourceCount) rows.push([await button(deps, "Adopt known replacements", "renewal_adopt_known", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase }, item.contentVersion)]);
         if (evidence.expectedSourceCount !== undefined) rows.push([await button(deps, "Enter exact replacements", "renewal_adopt_prompt", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, expectedCount: evidence.expectedSourceCount, phase: evidence.phase }, item.contentVersion)]);
@@ -721,22 +714,22 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const details = [`Uncertain renewal #${itemId}`, `Operation: ${evidence.operationId}`, `Captured source IDs: ${evidence.sourceIds.join(", ") || "unknown"}`, `Known replacement IDs (${evidence.knownReplacementIds.length}): ${evidence.knownReplacementIds.join(", ") || "none"}`, `Known replacement count: ${replacementCount}`, `Expected replacement count: ${evidence.expectedSourceCount ?? "unknown"}`];
         if (evidence.errorCode === "partial_replacement") details.push("Resolution reason: partial_replacement. The incomplete set cannot be adopted as-is; originals remain current until a complete replacement is verified.");
         details.push("The logical publication status remains unchanged until a physical resolution is confirmed.");
-        return ctx.reply(details.join("\n"), { reply_markup: keyboard(rows) });
+        return enqueueReply(ctx, details.join("\n"), { reply_markup: keyboard(rows) });
       }
       case "renewal_adopt_known": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedSourceCount !== evidence.knownReplacementIds.length) return ctx.reply("This renewal evidence is incomplete or stale; enter the exact replacement IDs instead.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.expectedSourceCount !== evidence.knownReplacementIds.length) return enqueueReply(ctx, "This renewal evidence is incomplete or stale; enter the exact replacement IDs instead.");
         try {
           deps.queue.adoptUncertainRenewalGeneration({ operationId: evidence.operationId, itemId, capturedContentVersion: item.contentVersion, capturedSourceGeneration: item.sourceGeneration }, evidence.knownReplacementIds, deps.now());
           return sendQueue(ctx);
         } catch (error) {
-          return ctx.reply(error instanceof Error ? error.message : "Could not adopt those replacement IDs.");
+          return enqueueReply(ctx, error instanceof Error ? error.message : "Could not adopt those replacement IDs.");
         }
       }
       case "renewal_adopt_prompt":
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.expectedCount !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid renewal resolution.");
         return beginPrompt(ctx, {
           kind: "renewal_adopt",
           state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, expectedCount: payload.expectedCount, phase: payload.phase },
@@ -744,7 +737,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           placeholder: "message IDs",
         });
       case "renewal_cleanup_prompt":
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid renewal resolution.");
         return beginPrompt(ctx, {
           kind: "renewal_manual_cleanup",
           state: { itemId, operationId: payload.operationId, sourceGeneration: payload.sourceGeneration, phase: payload.phase },
@@ -752,58 +745,40 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           placeholder: "message IDs",
         });
       case "renewal_no_replacement": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.knownReplacementIds.length > 0) return ctx.reply("This renewal resolution is stale or replacements are known.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration || evidence.knownReplacementIds.length > 0) return enqueueReply(ctx, "This renewal resolution is stale or replacements are known.");
         deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "no_replacement");
         return sendQueue(ctx);
       }
       case "renewal_delete_replacements": {
-        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return ctx.reply("Invalid renewal resolution.");
+        if (itemId === undefined || typeof payload.operationId !== "string" || typeof payload.sourceGeneration !== "number" || typeof payload.phase !== "string") return enqueueReply(ctx, "Invalid renewal resolution.");
         const item = deps.queue.findItemById(itemId);
         const evidence = deps.queue.operationEvidence(itemId);
-        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return ctx.reply("This renewal resolution is stale.");
+        if (!item || !evidence || item.maintenanceStatus !== "uncertain_renewal" || evidence.operationId !== payload.operationId || evidence.phase !== payload.phase || evidence.phase !== "uncertain" || evidence.capturedSourceGeneration !== payload.sourceGeneration) return enqueueReply(ctx, "This renewal resolution is stale.");
         try {
-          try {
-            await deps.gateway.deleteMessages(deps.config.queueChannelId, evidence.knownReplacementIds);
-          } catch (error) {
-            const normalized = classifyTelegramError(error);
-            if (normalized.kind !== "source_missing") throw error;
-          }
-          deps.queue.resolveUncertainRenewal(itemId, evidence.operationId, item.contentVersion, item.sourceGeneration, deps.now(), [], "manual_cleanup");
-          return sendQueue(ctx);
+          deferAction(ctx, "renewal_delete_replacements", { itemId, operationId: evidence.operationId, sourceGeneration: evidence.capturedSourceGeneration, phase: evidence.phase, chatId: Number(deps.config.queueChannelId), messageIds: evidence.knownReplacementIds.map(Number) });
+          return;
         } catch (error) {
-          return ctx.reply(`Replacement cleanup failed (${classifyTelegramError(error).kind}); the item remains uncertain.`);
+          return enqueueReply(ctx, `Replacement cleanup failed (${classifyTelegramError(error).kind}); the item remains uncertain.`);
         }
       }
       case "queue_delete": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const confirm = await button(deps, `Confirm delete #${itemId}`, "queue_delete_confirm", { itemId }, resolved.itemVersion);
-        return ctx.reply("Delete this queue item from Telegram and SQLite?", { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "queue")]]) });
+        return enqueueReply(ctx, "Delete this queue item from Telegram and SQLite?", { reply_markup: keyboard([[confirm], [await button(deps, "Cancel", "queue")]]) });
       }
       case "queue_delete_confirm": {
-        if (itemId === undefined) return ctx.reply("Invalid queue item.");
+        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item) return ctx.reply("Queue item no longer exists.");
-        const finish = deps.operationTracker?.begin(`delete:${itemId}:${deps.now()}`);
-        try {
-          await deps.gateway.deleteMessages(deps.config.queueChannelId, deps.queue.currentSourceIds(itemId));
-          deps.queue.markAdminDeleted(itemId, deps.now());
-          deps.admin.audit("queue_deleted", String(deps.config.adminUserId), deps.now(), itemId, undefined, { sourceCount: deps.queue.currentSourceIds(itemId).length });
-          return sendQueue(ctx);
-        } catch (error) {
-          const normalized = classifyTelegramError(error);
-          if (normalized.kind === "source_missing") {
-            deps.queue.markMissing(itemId, undefined, deps.now());
-            return sendQueue(ctx);
-          }
-          return ctx.reply(`Deletion failed (${normalized.kind}); the SQLite item was kept.`);
-        } finally {
-          finish?.();
-        }
+        if (!item) return enqueueReply(ctx, "Queue item no longer exists.");
+        const sourceIds = deps.queue.currentSourceIds(itemId).map(Number);
+        if (sourceIds.length === 0) return enqueueReply(ctx, "Queue item has no current source messages to delete.");
+        deferAction(ctx, "queue_delete", { itemId, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration, chatId: Number(item.queueChatId), sourceIds });
+        return;
       }
-      default: return ctx.reply("Unknown or stale action.");
+      default: return enqueueReply(ctx, "Unknown or stale action.");
     }
   };
 
@@ -815,18 +790,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   command("start", async (ctx) => {
-    await ctx.api.setMyCommands([
-      { command: "start", description: "Open queue manager" },
-      { command: "manage", description: "Open queue manager" },
-      { command: "queue", description: "Browse FIFO queue" },
-      { command: "schedule", description: "Manage UTC slots" },
-      { command: "whitelist", description: "Manage channel whitelist" },
-      { command: "authors", description: "Manage author aliases" },
-      { command: "health", description: "Show health" },
-      { command: "recover", description: "Recover an explicit queue message" },
-      { command: "cancel", description: "Cancel the current prompt" },
-    ], { scope: { type: "chat", chat_id: deps.config.adminUserId } });
-    await sendDashboard(ctx);
+    const replyMarkup = await dashboardKeyboard();
+    deps.updates.transaction(() => {
+      deferAction(ctx, "set_commands", {});
+      enqueueReply(ctx, dashboardText(deps), { reply_markup: replyMarkup }, "view", `admin:${deps.config.adminUserId}:view:dashboard`);
+    });
   });
   command("manage", sendDashboard);
   command("queue", sendQueue);
@@ -842,7 +810,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       placeholder: "message IDs [--credit-last]",
     });
   });
-  command("cancel", async (ctx) => { deps.admin.clearPrompt(deps.config.adminUserId); await ctx.reply("Pending admin prompt cancelled."); });
+  command("cancel", async (ctx) => { clearPrompt(); await enqueueReply(ctx, "Pending admin prompt cancelled."); });
 
   bot.callbackQuery(/.*/, handleCallback);
   bot.on("message:text", async (ctx) => {

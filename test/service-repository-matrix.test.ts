@@ -105,7 +105,7 @@ describe("scheduler outcome and loop matrix", () => {
     [{ kind: "blocked", itemId: 1, status: "blocked", reason: "manual", operationId: "op" }, "blocked"],
     [{ kind: "cleanup_pending", itemId: 1, operationId: "op" }, "published"],
     [{ kind: "deleted_external", itemId: 1, operationId: "op" }, "failed"],
-    [{ kind: "retry_scheduled", itemId: 1, retryAt: 2, operationId: "op" }, "failed"],
+    [{ kind: "retry_scheduled", itemId: 1, retryAt: Date.parse("2026-10-04T02:00:00Z"), operationId: "op" }, "failed"],
     [{ kind: "uncertain", itemId: 1, operationId: "op" }, "failed"],
     [{ kind: "failed", itemId: 1, status: "queued", error: "error", operationId: "op" }, "failed"],
   ];
@@ -114,7 +114,7 @@ describe("scheduler outcome and loop matrix", () => {
     const { database } = openDatabase("scheduler-matrix");
     const schedule = createScheduleRepository(database);
     const queue = createQueueRepository(database);
-    const clock = createFakeClock(Date.parse("2026-10-04T02:00:00Z"));
+    const clock = createFakeClock(Date.parse("2026-10-04T01:02:00Z"));
     queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(1) }), clock.now());
     queue.claimPublication("op", "publish", clock.now());
     const scheduler = createSchedulerService({ schedule, publisher: { publishNext: async () => outcome }, clock, logger: loggerSpy().logger });
@@ -129,7 +129,7 @@ describe("scheduler outcome and loop matrix", () => {
   test("handles disabled/no-op scans, manual publication, and concurrent scans", async () => {
     const { database } = openDatabase("scheduler-loop");
     const schedule = createScheduleRepository(database);
-    const clock = createFakeClock(Date.parse("2026-10-04T02:00:00Z"));
+    const clock = createFakeClock(Date.parse("2026-10-04T01:02:00Z"));
     let release!: () => void;
     const pending = new Promise<void>((resolve) => { release = resolve; });
     const scheduler = createSchedulerService({ schedule, publisher: { publishNext: async () => { await pending; return { kind: "empty" }; } }, clock, logger: loggerSpy().logger });

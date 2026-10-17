@@ -245,11 +245,11 @@ describe("operations safety net", () => {
 
     expect(admin.getPrompt(7, 100)).toBeUndefined();
     admin.setPrompt(7, "author", { step: "name" }, 44, 100, 10);
-    expect(admin.getPrompt(7, 109)).toEqual({ kind: "author", state: { step: "name" }, expectedReplyToMessageId: 44 });
+    expect(admin.getPrompt(7, 109)).toEqual({ kind: "author", state: { step: "name" }, deliveryState: "active", expectedReplyToMessageId: 44 });
     expect(admin.getPrompt(7, 110)).toBeUndefined();
 
     admin.setPrompt(7, "author", { step: "alias" }, undefined, 200, 100);
-    expect(admin.getPrompt(7, 201)).toEqual({ kind: "author", state: { step: "alias" } });
+    expect(admin.getPrompt(7, 201)).toEqual({ kind: "author", state: { step: "alias" }, deliveryState: "active" });
     database.raw.query("UPDATE admin_prompts SET state_json = ? WHERE admin_id = ?").run("[]", 7);
     expect(admin.getPrompt(7, 202)).toBeUndefined();
     admin.setPrompt(7, "author", { step: "clear" }, undefined, 300);

@@ -1,7 +1,7 @@
 import type { Api, Transformer } from "grammy";
 import { classifyTelegramError, TelegramLocalDeferralError } from "../errors";
 import type { TelegramAdmissionRepository } from "../db/telegram-admission-repository";
-import type { Logger } from "../logger";
+import { safeErrorDescription, type Logger } from "../logger";
 import type { TelegramCooldown } from "../telegram-cooldown";
 import type { Clock } from "../types";
 import { asNumericChatId, telegramMutationScope, type TelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
@@ -82,7 +82,7 @@ export const createTelegramAdmission = (input: {
   };
 
   const report = async (event: "telegram_real_flood_wait_observer_failed" | "telegram_relevant_success_observer_failed", error: unknown): Promise<void> => {
-    input.logger.error(event, { error: error instanceof Error ? error.message : "unknown" });
+    input.logger.error(event, { error: safeErrorDescription(error) });
   };
 
   const observeReal429 = async (method: string, scope: TelegramMutationScope | undefined, error: unknown, at: number): Promise<void> => {
@@ -95,7 +95,7 @@ export const createTelegramAdmission = (input: {
 
   const recordResult = (scope: TelegramMutationScope | undefined, result: TelegramRequestResult): void => {
     try { scope?.onResult?.(result); }
-    catch (error) { input.logger.error("telegram_request_evidence_write_failed", { operationId: scope?.operationId, error: error instanceof Error ? error.message : "unknown" }); }
+    catch (error) { input.logger.error("telegram_request_evidence_write_failed", { operationId: scope?.operationId, error: safeErrorDescription(error) }); }
   };
 
   const removeEntry = (entry: QueueEntry): void => {
@@ -147,7 +147,7 @@ export const createTelegramAdmission = (input: {
     }
     if (entry.signal?.aborted || scope?.signal?.aborted) throw new TelegramLocalDeferralError("cancelled", input.clock.now(), "Telegram mutation was cancelled before dispatch");
 
-    scope?.beforeDispatch?.();
+    scope?.beforeDispatch?.(method, entry.payload);
     input.repository.reserve(chatId, cost, input.clock.now());
     currentMethod = method;
     activeRawEntry = entry;

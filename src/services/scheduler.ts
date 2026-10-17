@@ -7,7 +7,7 @@ import { abortableSleep } from "./task-supervisor";
 
 type ReadyCandidate = { itemId: number; contentVersion: number; sourceGeneration: number };
 type Publisher = {
-  publishNext(type?: "publish" | "manual_publish", expected?: ReadyCandidate, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome>;
+  publishNext(type?: "publish" | "manual_publish", expected?: ReadyCandidate, scheduled?: ScheduledPublicationContext, adminAction?: { updateId: number; claimToken: string }): Promise<PublicationOutcome>;
 };
 
 export type SchedulerService = ReturnType<typeof createSchedulerService>;
@@ -152,6 +152,6 @@ export const createSchedulerService = (input: {
   };
 
   const stop = (): void => { loopRunning = false; };
-  const manualPublish = (expected?: ReadyCandidate): Promise<PublicationOutcome> => input.publisher.publishNext("manual_publish", expected);
+  const manualPublish = (expected?: ReadyCandidate, adminAction?: { updateId: number; claimToken: string }): Promise<PublicationOutcome> => input.publisher.publishNext("manual_publish", expected, undefined, adminAction);
   return { scanOnce, nextAt, run, stop, manualPublish };
 };

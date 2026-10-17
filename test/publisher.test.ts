@@ -269,31 +269,14 @@ describe("publication service", () => {
     expect(missingRun.queue.currentSourceIds(1)).toEqual([asMessageId(136), asMessageId(137)]);
   });
 
-  test("reports shared failures and recovery callbacks without losing publication progress", async () => {
+  test("extends the central shared cooldown after a Telegram flood response", async () => {
     const limited = fakeGateway({ transferFailure: { kind: "rate_limited", description: "slow down" } });
     const run = open(limited.gateway);
     run.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(138) }), 1_000);
     ready(run);
-    const failures: string[] = [];
-    const service = createPublicationService({
-      queue: run.queue, gateway: limited.gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock: run.clock,
-      logger: createLogger("error"), cooldown: run.cooldown,
-      onSharedFailure: (error, context) => { failures.push(`${error.kind}:${context?.itemId}`); },
-    });
-    expect((await service.publishNext()).kind).toBe("retry_scheduled");
-    expect(failures).toEqual(["rate_limited:1"]);
-
-    const success = fakeGateway();
-    const recovered = open(success.gateway);
-    recovered.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(139) }), 1_000);
-    ready(recovered);
-    let recoveries = 0;
-    const withRecovery = createPublicationService({
-      queue: recovered.queue, gateway: success.gateway, queueChannelId: asChatId(-100), targetChannelId: asChatId(-200), clock: recovered.clock,
-      logger: createLogger("error"), onSharedRecovery: () => { recoveries += 1; },
-    });
-    expect((await withRecovery.publishNext()).kind).toBe("published");
-    expect(recoveries).toBe(1);
+    const outcome = await run.service.publishNext();
+    expect(outcome.kind).toBe("retry_scheduled");
+    expect(run.cooldown.notBefore()).toBeGreaterThan(run.clock.now());
   });
 
   test("returns actionable outcomes for malformed prepared state and stale manual confirmations", async () => {

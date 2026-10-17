@@ -59,7 +59,7 @@ export type SendTextInput = {
 };
 
 export type ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | ForceReply;
-export type AdminMessageInput = SendTextInput & { replyMarkup?: ReplyMarkup };
+export type AdminMessageInput = SendTextInput & { replyMarkup?: ReplyMarkup; linkPreviewIsDisabled?: boolean };
 
 export type EditAdminMessageInput = {
   chatId: ChatId;
@@ -226,9 +226,10 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
 
   const sendAdminMessage = async (input: AdminMessageInput): Promise<MessageId> => {
     const entities = toTelegramEntities(input.entities);
-    const options: { entities?: GrammyMessageEntity[]; reply_markup?: ReplyMarkup } = {};
+    const options: { entities?: GrammyMessageEntity[]; reply_markup?: ReplyMarkup; link_preview_options?: { is_disabled: boolean } } = {};
     if (entities !== undefined) options.entities = entities;
     if (input.replyMarkup !== undefined) options.reply_markup = input.replyMarkup;
+    if (input.linkPreviewIsDisabled !== undefined) options.link_preview_options = { is_disabled: input.linkPreviewIsDisabled };
     return call("sendMessage", async () => {
       const message = await api.sendMessage(adminChatId, input.text, options);
       return returnedMessageId(message.message_id, "sendMessage", "response");

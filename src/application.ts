@@ -8,6 +8,8 @@ import { fingerprintSnapshotContent } from "./domain/message";
 import { createLogger, safeErrorDescription, type Logger } from "./logger";
 import { createDatabase, type AppDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
+import { createAdminResponseRepository } from "./db/admin-response-repository";
+import { createAdminUpdateRepository } from "./db/admin-update-repository";
 import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
 import { createPendingUpdateRepository } from "./db/pending-update-repository";
@@ -17,6 +19,7 @@ import { createRecoveryRepository } from "./db/recovery-repository";
 import { createOrphanRepository } from "./db/orphan-repository";
 import { createTelegramCooldownRepository } from "./db/telegram-cooldown-repository";
 import { createTelegramAdmissionRepository } from "./db/telegram-admission-repository";
+import { createTelegramIncidentRepository } from "./db/telegram-incident-repository";
 import { createOperationRequestRepository } from "./db/operation-request-repository";
 import { createPreparationRequestRepository } from "./db/preparation-request-repository";
 import { createRuntimeLease } from "./db/runtime";
@@ -41,6 +44,9 @@ import { adminChatIdFromUserId, createRecoveryService } from "./services/recover
 import { createRuntimeStatusWriter } from "./runtime-status";
 import { createTelegramCooldown } from "./telegram-cooldown";
 import { createTelegramAdmission } from "./services/telegram-admission";
+import { createAdminResponseWorker } from "./services/admin-response-worker";
+import { createAdminActionWorker } from "./services/admin-actions";
+import { createTelegramIncidentService } from "./services/telegram-incidents";
 import { systemClock, type Clock, type UserId } from "./types";
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
@@ -113,6 +119,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
   const admin = createAdminRepository(database);
+  const adminResponses = createAdminResponseRepository(database);
+  const adminUpdates = createAdminUpdateRepository(database);
   const generated = createGeneratedMessageRepository(database);
   const generatedEvents = createGeneratedEventRepository(database);
   const preparationRepository = createPreparationRepository(database);
@@ -120,6 +128,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const recoveryRepository = createRecoveryRepository(database);
   const orphanRepository = createOrphanRepository(database);
   const alertRepository = createAlertRepository(database);
+  const incidentRepository = createTelegramIncidentRepository(database);
   const runtime = createRuntimeLease(database, `${processLike.pid}-${bootId}`, clock);
   const supervisor = createTaskSupervisor({ logger });
   const operationTracker = createOperationTracker();
@@ -150,9 +159,15 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   if (recoveredPreparations.requeued + recoveredPreparations.uncertain + recoveredPreparations.cleanupPending > 0) logger.warn("prior_boot_preparations_recovered", recoveredPreparations);
   const interruptedRuns = schedule.recoverInterruptedRuns(clock.now());
   if (interruptedRuns > 0) logger.warn("interrupted_schedule_runs_recovered", { count: interruptedRuns });
+  const recoveredResponses = adminResponses.recover(clock.now(), bootId);
+  if (recoveredResponses.requeued + recoveredResponses.uncertain > 0) logger.warn("admin_responses_recovered", recoveredResponses);
+  const interruptedAdminUpdates = adminUpdates.markInterruptedUncertain(clock.now());
+  if (interruptedAdminUpdates > 0) logger.warn("admin_updates_recovered_uncertain", { count: interruptedAdminUpdates });
 
   const bot = options.bot ?? new Bot(config.botToken);
   const telegramCooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
+  const adminChatId = adminChatIdFromUserId(config.adminUserId);
+  const telegramIncidents = createTelegramIncidentService({ incidents: incidentRepository, responses: adminResponses, adminChatId: Number(adminChatId), adminUserId: config.adminUserId, cooldown: telegramCooldown, now: clock.now, logger });
   const telegramAdmission = createTelegramAdmission({
     repository: createTelegramAdmissionRepository(database),
     cooldown: telegramCooldown,
@@ -160,19 +175,22 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     logger,
     queueChatId: Number(config.queueChannelId),
     targetChatId: Number(config.targetChannelId),
+    onRealFloodWait: (event) => telegramIncidents.observeRealFloodWait(event),
+    onRelevantSuccess: (event) => telegramIncidents.observeRelevantSuccess(event),
   });
   telegramAdmission.install(bot.api);
   const operationRequest = createOperationRequestRepository(database);
   const preparationRequest = createPreparationRequestRepository(database);
-  const adminChatId = adminChatIdFromUserId(config.adminUserId);
   const gateway = options.gateway ?? createTelegramGateway(bot.api, adminChatId);
   const alerts = createAlertService({
     alert: alertRepository,
     gateway,
     adminChatId,
     logger,
+    responses: adminResponses,
     createCallbackToken: (action, payload, now, itemVersion) => admin.createCallbackToken(config.adminUserId, action, payload, now, itemVersion),
   });
+  const adminResponseWorker = createAdminResponseWorker({ responses: adminResponses, admin, gateway, adminChatId: Number(adminChatId), adminUserId: config.adminUserId, bootId, clock, logger, cooldown: telegramCooldown, incidents: telegramIncidents, alerts });
   let validatedBotId: UserId | undefined;
   let lastRightsCheckAt = 0;
   let lastSuccessfulRightsCheckAt: number | undefined;
@@ -264,8 +282,9 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   } catch (error) {
     const normalized = classifyTelegramError(error);
     logger.error("startup_rights_check_failed", { kind: normalized.kind, method: normalized.method, error: safeErrorDescription(error) });
-    try { await gateway.sendAdminMessage({ chatId: adminChatId, text: `Queue bot cannot start: ${safeErrorDescription(error)}` }); }
-    catch (alertError) { logger.error("startup_admin_alert_failed", { error: safeErrorDescription(alertError) }); }
+    try {
+      adminResponses.enqueue({ dedupeKey: `startup:${bootId}:failure`, adminChatId: Number(adminChatId), kind: "warning", descriptor: { version: 1, text: `Queue bot cannot start: ${safeErrorDescription(error)}` }, now: clock.now() });
+    } catch (alertError) { logger.error("startup_admin_alert_persist_failed", { error: safeErrorDescription(alertError) }); }
     await shutdown("startup_failure");
     return;
   }
@@ -279,27 +298,41 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     coordinator: publicationCoordinator,
     schedule,
     requestEvidence: operationRequest,
-    onSharedFailure: async (error, context) => {
-      const key = error.kind === "rate_limited" ? "shared_issue:flood_wait" : `shared_issue:${error.kind}`;
-      const fingerprint = createHash("sha256").update(JSON.stringify({ kind: error.kind })).digest("hex");
-      const retry = context?.retryAt === undefined ? "" : ` Retry is scheduled for ${new Date(context.retryAt).toISOString()}.`;
-      const operation = context === undefined ? {} : { itemId: context.itemId, operationId: context.operationId, retryAt: context.retryAt };
-      await alerts.raiseOnChange(key, "immediate", fingerprint, {
-        text: `Prepared publication stopped by a shared Telegram ${error.kind} condition.${retry} ${safeErrorDescription(error.description)}`,
-        ...operation,
-        actions: [{ text: "Open queue", action: "queue", payload: {} }],
-      }, clock.now());
-    },
-    onSharedRecovery: async () => {
-      for (const existing of alertRepository.active().filter((entry) => entry.dedupeKey.startsWith("shared_issue:"))) {
-        await alerts.resolve(existing.dedupeKey, "A prepared publication succeeded; the shared Telegram issue cleared.", clock.now());
-      }
-    },
   });
   const renewal = createRenewalService({ queue, policy, generated, events: generatedEvents, gateway, queueChannelId: config.queueChannelId, clock, logger, operationTracker, cooldown: telegramCooldown, requestEvidence: operationRequest });
   const renewalWorker = createRenewalWorker({ queue, renewal, cooldown: telegramCooldown, clock, logger });
   const scheduler = createSchedulerService({ schedule, publisher, clock, logger, bootId });
   const recovery = createRecoveryService({ queue, policy, recovery: recoveryRepository, gateway, queueChannelId: config.queueChannelId, adminChatId, clock, logger, bootId, operationTracker });
+  const adminActionWorker = createAdminActionWorker({
+    updates: adminUpdates,
+    responses: adminResponses,
+    admin,
+    queue,
+    preparation: preparationRepository,
+    gateway,
+    scheduler,
+    recovery,
+    adminChatId: Number(adminChatId),
+    adminUserId: config.adminUserId,
+    queueChatId: Number(config.queueChannelId),
+    targetChatId: Number(config.targetChannelId),
+    bootId,
+    clock,
+    logger,
+    operationTracker,
+    incidents: telegramIncidents,
+    setCommands: () => bot.api.setMyCommands([
+      { command: "start", description: "Open queue manager" },
+      { command: "manage", description: "Open queue manager" },
+      { command: "queue", description: "Browse FIFO queue" },
+      { command: "schedule", description: "Manage UTC slots" },
+      { command: "whitelist", description: "Manage channel whitelist" },
+      { command: "authors", description: "Manage author aliases" },
+      { command: "health", description: "Show health" },
+      { command: "recover", description: "Recover an explicit queue message" },
+      { command: "cancel", description: "Cancel the current prompt" },
+    ], { scope: { type: "chat", chat_id: config.adminUserId } }),
+  });
   const recoveredSessions = await recovery.reconcileExpiredSessions();
   if (recoveredSessions.completed > 0 || recoveredSessions.blocked > 0) logger.info("recovery_sessions_reconciled", recoveredSessions);
   const orphanCleanup = createOrphanCleanupService({
@@ -310,8 +343,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     cooldown: telegramCooldown,
     onPermissionAlert: async (orphan) => alerts.raise(`permissions:${orphan.chatId}`, "immediate", `Telegram refused cleanup rights for queue chat ${orphan.chatId}; orphan ${orphan.messageId} still needs attention.`, clock.now()),
   });
-  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights, cooldown: telegramCooldown });
-  const retention = createRetentionService({ queue, generated, generatedEvents, pending, admin, alerts: alertRepository, clock, logger });
+  const health = createHealthService({ database, queue, schedule, pending, orphan: orphanRepository, alerts: alertRepository, responses: adminResponses, adminUpdates, incidents: incidentRepository, now: clock.now, ownsLease: runtime.owns, bootStartedAt, lastRightsCheckAt: () => lastSuccessfulRightsCheckAt, lastBackupAt: () => lastSuccessfulBackupAt, rights: () => currentRights, cooldown: telegramCooldown });
+  const retention = createRetentionService({ queue, generated, generatedEvents, pending, admin, alerts: alertRepository, responses: adminResponses, adminUpdates, incidents: incidentRepository, clock, logger });
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: clock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
   registerAdminHandlers(bot, {
@@ -320,6 +353,9 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     policy,
     schedule,
     admin,
+    responses: adminResponses,
+    updates: adminUpdates,
+    bootId,
     pending,
     preparation: preparationRepository,
     orphan: orphanRepository,
@@ -337,6 +373,15 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   });
 
   const startBackgroundWork = (): void => {
+    supervisor.start("admin_actions", (signal) => adminActionWorker.run(signal));
+    supervisor.start("admin_responses", (signal) => adminResponseWorker.run(signal));
+    supervisor.start("telegram_incidents", async (signal) => {
+      while (!signal.aborted && !stopped) {
+        try { telegramIncidents.evaluate(clock.now()); }
+        catch (error) { logger.error("telegram_incident_evaluation_failed", { error: safeErrorDescription(error) }); }
+        await abortableSleep(clock, 1_000, signal);
+      }
+    });
     supervisor.start("renewal", (signal) => renewalWorker.run(signal));
     supervisor.start("preparation", (signal) => preparationWorker.run(signal));
     supervisor.start("pending_updates", async (signal) => {
@@ -474,17 +519,6 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
             evidence: evidenceSummary,
             actions,
           }, now);
-        }
-        const sharedIssueFingerprint = createHash("sha256").update("shared_flood_wait").digest("hex");
-        if (telegramCooldown.isActive()) {
-          activeConditions.add("shared_issue:flood_wait");
-          await alerts.raiseOnChange("shared_issue:flood_wait", "immediate", sharedIssueFingerprint, {
-            text: `Telegram mutations are paused by the shared flood wait until ${new Date(telegramCooldown.notBefore()).toISOString()}.`,
-            retryAt: telegramCooldown.notBefore(),
-            actions: [{ text: "Open queue", action: "queue", payload: {} }],
-          }, now);
-        } else if (alertRepository.find("shared_issue:flood_wait")?.resolvedAt === undefined) {
-          await alerts.resolve("shared_issue:flood_wait", "The shared Telegram flood wait ended.", now);
         }
         const manualOrphanGroups = new Map<string, { itemId: number; sourceGeneration: number; messageIds: Set<number> }>();
         for (const orphan of orphanRepository.terminal()) {

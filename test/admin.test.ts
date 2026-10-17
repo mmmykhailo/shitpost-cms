@@ -8,11 +8,15 @@ import { registerAdminHandlers } from "../src/handlers/admin";
 import type { PublicationOutcome } from "../src/services/publisher";
 import { createDatabase } from "../src/db/database";
 import { createAdminRepository } from "../src/db/admin-repository";
+import { createAdminResponseRepository } from "../src/db/admin-response-repository";
+import { createAdminUpdateRepository } from "../src/db/admin-update-repository";
 import { createOrphanRepository } from "../src/db/orphan-repository";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
 import { createPreparationRepository } from "../src/db/preparation-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "../src/db/repositories";
 import { createRenewalService } from "../src/services/renewal";
+import { createAdminResponseWorker } from "../src/services/admin-response-worker";
+import { createAdminActionWorker } from "../src/services/admin-actions";
 import { createFakeClock } from "../src/clock";
 import { createLogger } from "../src/logger";
 import type { TelegramGateway } from "../src/telegram";
@@ -79,6 +83,8 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
   const admin = createAdminRepository(database);
+  const responses = createAdminResponseRepository(database);
+  const updates = createAdminUpdateRepository(database);
   const pending = createPendingUpdateRepository(database);
   const preparation = createPreparationRepository(database);
   const orphan = createOrphanRepository(database);
@@ -90,6 +96,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   let nextSourceMessageId = 5_000;
   const sourceTransfers: number[][] = [];
   let deleteFailure: unknown;
+  let deliverAdminMessage: TelegramGateway["sendAdminMessage"];
   let physicalAgeMs: number | undefined;
   let resolvedChat: { id: ReturnType<typeof asChatId>; type: "channel" | "group" } = { id: asChatId(-100555), type: "channel" };
 
@@ -115,6 +122,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
       if (deleteFailure !== undefined) throw deleteFailure;
     },
     getChat: async () => resolvedChat,
+    sendAdminMessage: async (input: Parameters<TelegramGateway["sendAdminMessage"]>[0]) => deliverAdminMessage(input),
   } as unknown as TelegramGateway;
 
   const logger = {
@@ -143,6 +151,14 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     }
     return { ok: true, result: true } as never;
   });
+  deliverAdminMessage = async (input) => {
+    const message = await bot.api.sendMessage(input.chatId, input.text, {
+      ...(input.entities === undefined ? {} : { entities: input.entities as never }),
+      ...(input.linkPreviewIsDisabled === undefined ? {} : { link_preview_options: { is_disabled: input.linkPreviewIsDisabled } }),
+      ...(input.replyMarkup === undefined ? {} : { reply_markup: input.replyMarkup }),
+    });
+    return asMessageId(message.message_id);
+  };
 
   const config = {
     botToken: "test-token",
@@ -160,6 +176,9 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     policy,
     schedule,
     admin,
+    responses,
+    updates,
+    bootId: "admin-test",
     pending,
     preparation,
     orphan,
@@ -197,6 +216,34 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     now: () => NOW,
   } as AdminDeps;
   registerAdminHandlers(bot, deps);
+  const responseWorker = createAdminResponseWorker({
+    responses,
+    admin,
+    gateway,
+    adminChatId: ADMIN_CHAT_ID,
+    adminUserId: ADMIN_ID,
+    bootId: "admin-test",
+    clock: createFakeClock(NOW),
+    logger,
+  });
+  const actionWorker = createAdminActionWorker({
+    updates,
+    responses,
+    admin,
+    queue,
+    preparation,
+    gateway,
+    scheduler: deps.scheduler,
+    recovery: deps.recovery,
+    adminChatId: ADMIN_CHAT_ID,
+    adminUserId: ADMIN_ID,
+    queueChatId: Number(QUEUE_CHAT_ID),
+    targetChatId: Number(TARGET_CHAT_ID),
+    bootId: "admin-test",
+    clock: createFakeClock(NOW),
+    logger,
+    setCommands: async () => bot.api.setMyCommands([{ command: "start", description: "Open queue manager" }], { scope: { type: "chat", chat_id: ADMIN_ID } }),
+  });
 
   return {
     bot,
@@ -209,6 +256,8 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     gateway,
     config,
     admin,
+    responses,
+    updates,
     schedule,
     calls,
     sent,
@@ -229,7 +278,11 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
       if (!button || !("callback_data" in button)) throw new Error(`No callback button named ${text}`);
       return button.callback_data;
     },
-    run: (update: Update): Promise<void> => bot.handleUpdate(update),
+    run: async (update: Update): Promise<void> => {
+      await bot.handleUpdate(update);
+      for (let index = 0; index < 100 && await actionWorker.runOnce(); index += 1) { /* Drain durable test actions. */ }
+      for (let index = 0; index < 100 && await responseWorker.runOnce(); index += 1) { /* Drain due test responses. */ }
+    },
     close: (): void => {
       database.close();
       rmSync(directory, { recursive: true, force: true });
@@ -281,11 +334,11 @@ describe("admin schedule handlers", () => {
       await harness.run(callbackUpdate(2, "callback-add", addToken, menu.message));
 
       expect(harness.calls.some((call) => call.method === "answerCallbackQuery" && call.payload.callback_query_id === "callback-add")).toBe(true);
-      expect(harness.deleted).toEqual([{ chatId: ADMIN_CHAT_ID, messageIds: [menu.message.message_id] }]);
+      expect(harness.deleted).toEqual([]);
       const question = harness.lastSent();
       expect(question.message.text).toBe("Reply with the daily UTC slot as HH:MM.");
       expect(question.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: "HH:MM UTC" });
-      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: "slot_add", state: {}, expectedReplyToMessageId: question.message.message_id });
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toMatchObject({ kind: "slot_add", state: {}, deliveryState: "active", expectedReplyToMessageId: question.message.message_id });
       expect(question.message.message_id).not.toBe(menu.message.message_id);
 
       await harness.run(replyUpdate(3, 3, "05:00", question.message));
@@ -377,7 +430,7 @@ describe("admin schedule handlers", () => {
     }
   });
 
-  test("keeps a valid action running when callback-menu deletion fails", async () => {
+  test("keeps a valid action running without waiting for callback-menu cleanup", async () => {
     const harness = createHarness();
     try {
       await harness.run(commandUpdate(40, 40, "schedule"));
@@ -388,16 +441,8 @@ describe("admin schedule handlers", () => {
 
       expect(harness.schedule.enabled()).toBe(false);
       expect(harness.lastSent().message.text).toContain("Add at least one UTC slot before resuming.");
-      expect(harness.deleted).toEqual([{ chatId: ADMIN_CHAT_ID, messageIds: [menu.message.message_id] }]);
-      expect(harness.warnings).toEqual([{
-        event: "admin_menu_delete_failed",
-        fields: {
-          chatId: ADMIN_CHAT_ID,
-          messageId: menu.message.message_id,
-          action: "schedule_resume",
-          errorKind: "permission_denied",
-        },
-      }]);
+      expect(harness.deleted).toEqual([]);
+      expect(harness.warnings).toEqual([]);
     } finally {
       harness.close();
     }
@@ -450,6 +495,50 @@ describe("admin schedule handlers", () => {
       await harness.run(callbackUpdate(908, "stale-publish", harness.callbackData(confirmation, "Confirm publish next"), confirmation.message));
       expect(harness.lastSent().message.text).toContain("ready queue changed; reopen the dashboard");
       expect(publishCalls).toBe(0);
+    } finally {
+      harness.close();
+    }
+  });
+
+  test("reconciles a manual publication bound to its operation after the action response is interrupted", async () => {
+    let queueRef: ReturnType<typeof createQueueRepository> | undefined;
+    const publishedThenInterrupted: AdminDeps["scheduler"]["manualPublish"] = async (expected, adminAction) => {
+      if (!adminAction) throw new Error("manual publication did not carry its receipt claim");
+      const queue = queueRef!;
+      const claim = queue.claimReadyPublication("admin-publish-crash", "manual_publish", NOW, expected, "admin-test", [], undefined, 0, adminAction);
+      if (!claim) throw new Error("expected ready item was not claimed");
+      const sourceIds = queue.currentSourceIds(claim.item.id);
+      const contract: PublicationContract = {
+        capturedLogicalStatus: "queued",
+        capturedContentVersion: claim.capturedContentVersion,
+        capturedSourceGeneration: claim.capturedSourceGeneration,
+        sourceIds,
+        policy: { kind: "copy", reason: "direct_queue_post" },
+        expectedTransferredMessageCount: sourceIds.length,
+        expectedOutputMessageCount: sourceIds.length,
+        requiresInlineEdit: false,
+        requiresSeparateByline: false,
+      };
+      const guard = { operationId: claim.operationId, itemId: claim.item.id, capturedContentVersion: claim.capturedContentVersion, capturedSourceGeneration: claim.capturedSourceGeneration };
+      queue.persistPublicationContract(claim.operationId, contract, NOW);
+      queue.beginPublicationTransfer(guard, NOW + 1);
+      queue.recordCompleteBaseOutputs(guard, sourceIds.map((_id, ordinal) => ({ chatId: Number(TARGET_CHAT_ID), messageId: 950 + ordinal, ordinal })), NOW + 2);
+      const destinationIds = sourceIds.map((_id, ordinal) => 950 + ordinal);
+      queue.markPublicationOutputComplete(guard, destinationIds, NOW + 3);
+      queue.markSourceCleanupPending(guard, NOW + 4);
+      queue.markCompleted(claim.item.id, claim.operationId, NOW + 5);
+      throw new TypeError("network timeout after publication completed");
+    };
+    const harness = createHarness(publishedThenInterrupted);
+    queueRef = harness.queue;
+    try {
+      const item = harness.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(1620) }), NOW).item;
+      harness.database.raw.query("UPDATE queue_items SET preparation_state = 'ready', representation_kind = 'prepared' WHERE id = ?").run(item.id);
+      const token = harness.admin.createCallbackToken(ADMIN_ID, "publish_execute", { itemId: item.id, contentVersion: item.contentVersion, sourceGeneration: item.sourceGeneration }, NOW, item.contentVersion);
+      await harness.run(callbackUpdate(9050, "manual-publish-crash", `v1:${token}`, makeMessage(9050, "menu", BOT_INFO)));
+      expect(harness.queue.findItemById(item.id)?.status).toBe("done");
+      expect(harness.updates.find(9050)).toMatchObject({ state: "applied", result: { reconciliationAttempted: true } });
+      expect(harness.lastSent().message.text).toContain("published and source cleanup completed before restart");
     } finally {
       harness.close();
     }
@@ -556,14 +645,14 @@ describe("admin schedule handlers", () => {
         await harness.run(callbackUpdate(100 + index, `callback-prompt-${index}`, `v1:${token}`, source));
         const question = harness.lastSent();
         expect(question.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: entry.placeholder });
-        expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: entry.kind, state: entry.state, expectedReplyToMessageId: question.message.message_id });
+        expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toMatchObject({ kind: entry.kind, state: entry.state, deliveryState: "active", expectedReplyToMessageId: question.message.message_id });
         expect(harness.admin.getPrompt(ADMIN_ID, NOW)?.expectedReplyToMessageId).not.toBe(source.message_id);
       }
 
       await harness.run(commandUpdate(200, 200, "recover"));
       const recoveryQuestion = harness.lastSent();
       expect(recoveryQuestion.payload.reply_markup).toEqual({ force_reply: true, input_field_placeholder: "message IDs [--credit-last]" });
-      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toEqual({ kind: "recover", state: {}, expectedReplyToMessageId: recoveryQuestion.message.message_id });
+      expect(harness.admin.getPrompt(ADMIN_ID, NOW)).toMatchObject({ kind: "recover", state: {}, deliveryState: "active", expectedReplyToMessageId: recoveryQuestion.message.message_id });
     } finally {
       harness.close();
     }
@@ -589,10 +678,7 @@ describe("admin schedule handlers", () => {
       expect(harness.schedule.enabled()).toBe(true);
       expect(resumedMenu.message.text).toContain("Schedule is running. Slots: 05:00 UTC");
       expect(harness.callbackData(resumedMenu, "Pause")).toMatch(/^v1:/);
-      expect(harness.deleted).toEqual([
-        { chatId: ADMIN_CHAT_ID, messageIds: [runningMenu.message.message_id] },
-        { chatId: ADMIN_CHAT_ID, messageIds: [pausedMenu.message.message_id] },
-      ]);
+      expect(harness.deleted).toEqual([]);
     } finally {
       harness.close();
     }

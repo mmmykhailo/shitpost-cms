@@ -663,7 +663,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return row ? rowToItem(row) : undefined;
   };
 
-  const claimReadyPublication = (operationId: string, type: "publish" | "manual_publish", now: number, expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, bootId?: string, excludedIds: readonly number[] = [], scheduled?: { occurrenceAt: number; deadlineAt: number; claimToken: string }, requestEvidenceVersion = 0): ClaimedItem | undefined => database.transaction(() => {
+  const claimReadyPublication = (operationId: string, type: "publish" | "manual_publish", now: number, expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, bootId?: string, excludedIds: readonly number[] = [], scheduled?: { occurrenceAt: number; deadlineAt: number; claimToken: string }, requestEvidenceVersion = 0, adminAction?: { updateId: number; claimToken: string }): ClaimedItem | undefined => database.transaction(() => {
     if (scheduled) {
       const run = database.raw.query(`SELECT sr.retry_deadline_at, sr.claim_token, sr.cancelled_at
         FROM schedule_runs sr JOIN settings s ON s.key = 'schedule_enabled'
@@ -693,6 +693,10 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         AND NOT EXISTS (SELECT 1 FROM queue_preparation_operations po WHERE po.item_id = queue_items.id AND po.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`).run(operationId, now, ready.id, ready.contentVersion, ready.sourceGeneration, now);
     if (Number(changed.changes) !== 1) return undefined;
     database.raw.query("INSERT INTO operations (id, type, item_id, state, phase, boot_id, return_item_status, captured_content_version, captured_source_generation, lease_owner, lease_expires_at, created_at, updated_at, request_evidence_version) VALUES (?, ?, ?, 'running', 'claimed', ?, 'queued', ?, ?, ?, ?, ?, ?, ?)").run(operationId, type, ready.id, currentBootId ?? bootId ?? operationId, ready.contentVersion, ready.sourceGeneration, operationId, now + 300_000, now, now, requestEvidenceVersion);
+    if (adminAction) {
+      const bound = database.raw.query("UPDATE admin_update_receipts SET operation_id = ?, updated_at = ? WHERE update_id = ? AND state = 'running' AND claim_token = ?").run(operationId, now, adminAction.updateId, adminAction.claimToken);
+      if (Number(bound.changes) !== 1) throw new Error("Admin publication receipt lost ownership before operation binding");
+    }
     if (scheduled) {
       const run = database.raw.query("SELECT attempt_count FROM schedule_runs WHERE occurrence_at = ? AND status = 'running' AND claim_token = ? AND cancelled_at IS NULL").get(scheduled.occurrenceAt, scheduled.claimToken) as { attempt_count: number } | null;
       if (!run) throw new Error("Scheduled publication claim was lost before operation association");

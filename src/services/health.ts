@@ -7,6 +7,9 @@ import { nextOccurrence } from "../domain/schedule";
 import { calculateRenewalCapacity, type RenewalCapacity } from "./capacity";
 import type { BotMembership } from "../telegram";
 import type { TelegramCooldown } from "../telegram-cooldown";
+import type { AdminResponseRepository } from "../db/admin-response-repository";
+import type { AdminUpdateRepository } from "../db/admin-update-repository";
+import type { TelegramIncidentRepository } from "../db/telegram-incident-repository";
 
 export type HealthService = ReturnType<typeof createHealthService>;
 
@@ -24,6 +27,9 @@ export const createHealthService = (input: {
   lastBackupAt?: () => number | undefined;
   rights?: () => { queue: BotMembership; target: BotMembership } | undefined;
   cooldown?: Pick<TelegramCooldown, "notBefore">;
+  responses?: AdminResponseRepository;
+  adminUpdates?: AdminUpdateRepository;
+  incidents?: TelegramIncidentRepository;
 }) => {
   const snapshot = () => {
     const now = input.now();
@@ -53,6 +59,10 @@ export const createHealthService = (input: {
     const operations = input.database.raw.query("SELECT COUNT(*) AS active, SUM(CASE WHEN phase = 'uncertain' THEN 1 ELSE 0 END) AS uncertain FROM operations WHERE state NOT IN ('done','failed')").get() as { active: number | null; uncertain: number | null };
     const preparations = input.database.raw.query("SELECT COUNT(*) AS active, SUM(CASE WHEN state = 'uncertain' THEN 1 ELSE 0 END) AS uncertain FROM queue_preparation_operations WHERE state NOT IN ('done','failed')").get() as { active: number | null; uncertain: number | null };
     const lastOperation = input.database.raw.query("SELECT type, phase, updated_at FROM operations WHERE state IN ('done','failed') ORDER BY updated_at DESC LIMIT 1").get() as { type: string; phase: string; updated_at: number } | null;
+    const frozen = input.database.raw.query("SELECT editorial_freeze_reason AS reason, COUNT(*) AS count FROM queue_items WHERE editorial_frozen_at IS NOT NULL AND status NOT IN ('deleted','published') GROUP BY editorial_freeze_reason").all() as Array<{ reason: string | null; count: number }>;
+    const retry = input.database.raw.query("SELECT occurrence_at, retry_not_before, retry_deadline_at, attempt_count FROM schedule_runs WHERE status = 'pending' AND cancelled_at IS NULL AND retry_deadline_at > ? ORDER BY COALESCE(retry_not_before, occurrence_at), occurrence_at LIMIT 1").get(now) as { occurrence_at: number; retry_not_before: number | null; retry_deadline_at: number | null; attempt_count: number } | null;
+    const editCollisions = input.database.raw.query("SELECT COUNT(*) AS count FROM queue_items WHERE last_error_code = 'admin_edit_collision' AND status = 'needs_review'").get() as { count: number };
+    const currentIncident = input.incidents?.snapshot();
     return {
       bootId: app.current_boot_id,
       uptimeMs: Math.max(0, now - (input.bootStartedAt ?? app.created_at)),
@@ -76,6 +86,18 @@ export const createHealthService = (input: {
       renewalCapacity: capacity,
       lastOperation: lastOperation ? { type: lastOperation.type, phase: lastOperation.phase, updatedAt: lastOperation.updated_at } : undefined,
       alerts: input.alerts.counts(),
+      sharedCooldown: { notBefore: cooldownUntil ?? 0, remainingMs: Math.max(0, (cooldownUntil ?? 0) - now) },
+      floodIncident: currentIncident,
+      scheduledRetry: retry === null ? undefined : { occurrenceAt: retry.occurrence_at, retryNotBefore: retry.retry_not_before ?? undefined, deadlineAt: retry.retry_deadline_at ?? undefined, attemptCount: retry.attempt_count },
+      adminResponses: input.responses?.counts() ?? { pending: 0, sending: 0, uncertain: 0, failed: 0 },
+      adminUpdates: input.adminUpdates?.counts() ?? { active: 0, uncertain: 0 },
+      editorialProtection: {
+        adminEdit: frozen.find((entry) => entry.reason === "admin_edit")?.count ?? 0,
+        adminDelete: frozen.find((entry) => entry.reason === "admin_delete")?.count ?? 0,
+        legacyEditEvidence: frozen.find((entry) => entry.reason === "legacy_edit_evidence")?.count ?? 0,
+        legacyUnverified: frozen.find((entry) => entry.reason === "legacy_unverified")?.count ?? 0,
+        editCollisions: editCollisions.count,
+      },
     };
   };
 

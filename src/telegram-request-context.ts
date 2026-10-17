@@ -16,7 +16,7 @@ export type TelegramMutationScope = {
   deadlineAt?: number;
   signal?: AbortSignal;
   stepKey?: string;
-  beforeDispatch?: () => void;
+  beforeDispatch?: (method?: string, payload?: unknown) => void;
   onResult?: (result: TelegramRequestResult) => void;
 };
 

@@ -10,10 +10,22 @@ export const createAdminRepository = (database: AppDatabase) => {
     database.raw.query("INSERT INTO admin_prompts (admin_id, kind, state_json, expected_reply_to_message_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(admin_id) DO UPDATE SET kind = excluded.kind, state_json = excluded.state_json, expected_reply_to_message_id = excluded.expected_reply_to_message_id, created_at = excluded.created_at, expires_at = excluded.expires_at").run(adminId, kind, JSON.stringify(payload), replyToMessageId ?? null, now, now + ttlMs);
   };
 
-  const getPrompt = (adminId: number, now: number): { kind: string; state: unknown; expectedReplyToMessageId?: number } | undefined => {
-    const row = database.raw.query("SELECT kind, state_json, expected_reply_to_message_id, expires_at FROM admin_prompts WHERE admin_id = ?").get(adminId) as { kind: string; state_json: string; expected_reply_to_message_id: number | null; expires_at: number } | null;
+  const setPendingPrompt = (adminId: number, kind: string, state: unknown, generationId: string, outboxId: string, now: number): void => {
+    const payload = validateJsonPayload(state, "admin prompt");
+    database.raw.query(`INSERT INTO admin_prompts (admin_id, kind, state_json, expected_reply_to_message_id, created_at, expires_at, generation_id, delivery_state, delivery_outbox_id)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, 'pending', ?) ON CONFLICT(admin_id) DO UPDATE SET kind = excluded.kind, state_json = excluded.state_json, expected_reply_to_message_id = NULL, created_at = excluded.created_at, expires_at = excluded.expires_at, generation_id = excluded.generation_id, delivery_state = 'pending', delivery_outbox_id = excluded.delivery_outbox_id`).run(adminId, kind, JSON.stringify(payload), now, now, generationId, outboxId);
+  };
+
+  const activatePendingPrompt = (adminId: number, generationId: string, outboxId: string, messageId: number, now: number, ttlMs = 15 * 60_000): boolean => {
+    if (!Number.isSafeInteger(messageId) || messageId <= 0 || !Number.isSafeInteger(now) || now < 0) throw new RangeError("Invalid delivered prompt identity or time");
+    return Number(database.raw.query(`UPDATE admin_prompts SET expected_reply_to_message_id = ?, delivery_state = 'active', expires_at = ?
+      WHERE admin_id = ? AND generation_id = ? AND delivery_outbox_id = ? AND delivery_state = 'pending'`).run(messageId, now + ttlMs, adminId, generationId, outboxId).changes) === 1;
+  };
+
+  const getPrompt = (adminId: number, now: number): { kind: string; state: unknown; deliveryState?: "pending" | "active"; generationId?: string; deliveryOutboxId?: string; expectedReplyToMessageId?: number } | undefined => {
+    const row = database.raw.query("SELECT kind, state_json, expected_reply_to_message_id, expires_at, delivery_state, generation_id, delivery_outbox_id FROM admin_prompts WHERE admin_id = ?").get(adminId) as { kind: string; state_json: string; expected_reply_to_message_id: number | null; expires_at: number; delivery_state: "pending" | "active"; generation_id: string | null; delivery_outbox_id: string | null } | null;
     if (!row) return undefined;
-    if (row.expires_at <= now) {
+    if (row.delivery_state === "active" && row.expires_at <= now) {
       database.raw.query("DELETE FROM admin_prompts WHERE admin_id = ?").run(adminId);
       return undefined;
     }
@@ -25,7 +37,9 @@ export const createAdminRepository = (database: AppDatabase) => {
       database.raw.query("DELETE FROM admin_prompts WHERE admin_id = ?").run(adminId);
       return undefined;
     }
-    const result: { kind: string; state: unknown; expectedReplyToMessageId?: number } = { kind: row.kind, state };
+    const result: { kind: string; state: unknown; deliveryState?: "pending" | "active"; generationId?: string; deliveryOutboxId?: string; expectedReplyToMessageId?: number } = { kind: row.kind, state, deliveryState: row.delivery_state };
+    if (row.generation_id !== null) result.generationId = row.generation_id;
+    if (row.delivery_outbox_id !== null) result.deliveryOutboxId = row.delivery_outbox_id;
     if (row.expected_reply_to_message_id !== null) result.expectedReplyToMessageId = row.expected_reply_to_message_id;
     return result;
   };
@@ -61,11 +75,11 @@ export const createAdminRepository = (database: AppDatabase) => {
 
   const purgeExpiredTokensAndPrompts = (now: number): { tokens: number; prompts: number } => database.transaction(() => {
     const tokens = Number(database.raw.query("DELETE FROM callback_tokens WHERE (consumed_at IS NOT NULL AND consumed_at < ?) OR expires_at < ?").run(now - 7 * 86_400_000, now).changes);
-    const prompts = Number(database.raw.query("DELETE FROM admin_prompts WHERE expires_at < ?").run(now).changes);
+    const prompts = Number(database.raw.query("DELETE FROM admin_prompts WHERE delivery_state = 'active' AND expires_at < ?").run(now).changes);
     return { tokens, prompts };
   });
 
   const purgeAuditEvents = (before: number): number => Number(database.raw.query("DELETE FROM audit_events WHERE created_at < ?").run(before).changes);
 
-  return { setPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit, purgeExpiredTokensAndPrompts, purgeAuditEvents };
+  return { setPrompt, setPendingPrompt, activatePendingPrompt, getPrompt, clearPrompt, createCallbackToken, consumeCallbackToken, audit, purgeExpiredTokensAndPrompts, purgeAuditEvents };
 };

@@ -4,11 +4,12 @@ import { classifyTelegramError } from "../errors";
 import { snapshotFromMessage } from "../domain/message";
 import type { RecoveryRepository } from "../db/recovery-repository";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
-import type { Logger } from "../logger";
+import { safeErrorDescription, type Logger } from "../logger";
 import type { ChatId, Clock, MessageId, SemanticOrigin, UserId } from "../types";
 import { asChatId, asMessageId } from "../types";
 import type { TelegramGateway } from "../telegram";
 import type { OperationTracker } from "./task-supervisor";
+import { withTelegramMutationScope } from "../telegram-request-context";
 
 export const queueInternalId = (queueChannelId: ChatId): string => {
   const value = String(Math.abs(queueChannelId));
@@ -86,7 +87,7 @@ export const createRecoveryService = (input: {
       return true;
     }
     try {
-      await input.gateway.deleteMessages(input.adminChatId, previewIds);
+      await withTelegramMutationScope({ family: "recovery", priority: "admin", operationId }, () => input.gateway.deleteMessages(input.adminChatId, previewIds));
       input.recovery?.complete(operationId, input.clock.now());
       return true;
     } catch (error) {
@@ -94,7 +95,7 @@ export const createRecoveryService = (input: {
         input.recovery?.complete(operationId, input.clock.now());
         return true;
       }
-      const description = error instanceof Error ? error.message : "preview cleanup failed";
+      const description = safeErrorDescription(error);
       input.recovery?.markPreviewCleanupPending(operationId, input.clock.now(), description);
       input.logger.error("recovery_preview_cleanup_failed", { operationId, itemId, error: description });
       return false;
@@ -126,7 +127,7 @@ export const createRecoveryService = (input: {
       for (const [ordinal, sourceId] of sourceIds.entries()) {
         input.recovery?.addPreviewPending(operationId, sourceId, ordinal, input.clock.now());
         input.recovery?.setPhase(operationId, "preview_pending", input.clock.now());
-        const preview = await input.gateway.forwardMessage({ targetChatId: input.adminChatId, sourceChatId: input.queueChannelId, messageId: sourceId });
+        const preview = await withTelegramMutationScope({ family: "recovery", priority: "admin", operationId, stepKey: `preview:${ordinal + 1}` }, () => input.gateway.forwardMessage({ targetChatId: input.adminChatId, sourceChatId: input.queueChannelId, messageId: sourceId }));
         const previewId = asMessageId(preview.message_id);
         previews.push(previewId);
         const captured = snapshotFromMessage(preview);
@@ -145,13 +146,12 @@ export const createRecoveryService = (input: {
       return { itemId: item.id, sourceIds, ...(creditLast ? { creditLast: true } : {}), canApplyPreparationRules: !creditLast && oneRecordedAlbum };
     } catch (error) {
       if (previews.length > 0) await cleanupPreviews(operationId, previews, insertedItemId);
-      else input.recovery?.setPhase(operationId, "failed", input.clock.now(), error instanceof Error ? error.message : "recovery failed");
+      else input.recovery?.setPhase(operationId, "failed", input.clock.now(), safeErrorDescription(error));
       throw error;
     }
   };
 
-  const recover = async (reference: string | readonly number[]): Promise<{ itemId: number; sourceIds: MessageId[]; reused?: boolean; creditLast?: boolean; canApplyPreparationRules?: boolean }> => {
-    const operationId = newOperationId();
+  const recover = async (reference: string | readonly number[], operationId = newOperationId()): Promise<{ itemId: number; sourceIds: MessageId[]; reused?: boolean; creditLast?: boolean; canApplyPreparationRules?: boolean }> => {
     const finish = input.operationTracker?.begin(operationId);
     try { return await recoverUntracked(operationId, reference); }
     finally { finish?.(); }
@@ -161,7 +161,7 @@ export const createRecoveryService = (input: {
     if (!input.recovery) return { completed: 0, blocked: 0 };
     let completed = 0;
     let blocked = 0;
-    for (const session of input.recovery.listRecoverable(input.clock.now())) {
+    for (const session of input.recovery.listRecoverable(input.clock.now(), bootId)) {
       try {
         const previews = input.recovery.previews(session.id);
         if (previews.some((preview) => preview.previewMessageId === undefined || preview.previewChatId === undefined)) {
@@ -173,7 +173,7 @@ export const createRecoveryService = (input: {
         const previewIds = previews.map((preview) => preview.previewMessageId!);
         if (previewIds.length > 0) {
           try {
-            await input.gateway.deleteMessages(input.adminChatId, previewIds);
+            await withTelegramMutationScope({ family: "recovery", priority: "background", operationId: session.id }, () => input.gateway.deleteMessages(input.adminChatId, previewIds));
           } catch (error) {
             if (classifyTelegramError(error).kind !== "source_missing") throw error;
           }
@@ -181,8 +181,9 @@ export const createRecoveryService = (input: {
         input.recovery.complete(session.id, input.clock.now());
         completed += 1;
       } catch (error) {
-        input.recovery.markPreviewCleanupPending(session.id, input.clock.now(), error instanceof Error ? error.message : "recovery preview cleanup failed");
-        input.logger.error("recovery_preview_reconciliation_failed", { operationId: session.id, itemId: session.itemId, error: error instanceof Error ? error.message : "unknown" });
+        const description = safeErrorDescription(error);
+        input.recovery.markPreviewCleanupPending(session.id, input.clock.now(), description);
+        input.logger.error("recovery_preview_reconciliation_failed", { operationId: session.id, itemId: session.itemId, error: description });
         blocked += 1;
       }
     }

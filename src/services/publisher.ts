@@ -71,20 +71,8 @@ export const createPublicationService = (input: {
   coordinator?: PublicationCoordinator;
   schedule?: { cancelUnsentRuns(reason: string, now: number): number; claimCanDispatch(claim: ScheduledPublicationContext, now: number): boolean };
   requestEvidence?: OperationRequestRepository;
-  onSharedFailure?: (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }) => Promise<void> | void;
-  onSharedRecovery?: () => Promise<void> | void;
 }) => {
   const newOperationId = input.operationId ?? randomUUID;
-
-  const reportSharedFailure = async (error: NormalizedTelegramError, context?: { itemId: number; operationId: string; retryAt?: number }): Promise<void> => {
-    try { await input.onSharedFailure?.(error, context); }
-    catch (alertError) { input.logger.error("publication_shared_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
-  };
-
-  const reportSharedRecovery = async (): Promise<void> => {
-    try { await input.onSharedRecovery?.(); }
-    catch (alertError) { input.logger.error("publication_shared_recovery_alert_failed", { error: alertError instanceof Error ? alertError.message : "unknown" }); }
-  };
 
   const tracked = async <T>(operationId: string, work: () => Promise<T>): Promise<T> => {
     const finish = input.operationTracker?.begin(operationId);
@@ -169,7 +157,6 @@ export const createPublicationService = (input: {
     if (error.kind === "rate_limited" || error.kind === "local_deferral") {
       const retryAt = retryAtFor(error, now, input.cooldown);
       input.queue.setRetry(claimed.item.id, claimed.operationId, now, retryAt, error.kind, error.description);
-      if (error.kind === "rate_limited") await reportSharedFailure(error, { itemId: claimed.item.id, operationId: claimed.operationId, retryAt });
       return { kind: "retry_scheduled", itemId: claimed.item.id, retryAt, operationId: claimed.operationId };
     }
     if (error.kind === "ambiguous_send_result" || error.kind === "transient_network" || error.kind === "transient_server") {
@@ -244,7 +231,6 @@ export const createPublicationService = (input: {
       input.queue.recordCompleteBaseOutputs(guard, destinationIds.map((messageId, ordinal) => ({ chatId: input.targetChannelId, messageId, ordinal })), input.clock.now());
       input.queue.markPublicationOutputComplete(guard, destinationIds, input.clock.now());
       input.queue.markSourceCleanupPending(guard, input.clock.now());
-      await reportSharedRecovery();
     } catch (error) {
       const normalized = classifyTelegramError(error);
       if (normalized.kind === "source_missing" && members.length === 1 && destinationIds.length === 0) {
@@ -261,7 +247,6 @@ export const createPublicationService = (input: {
       if (normalized.kind === "permission_denied" || normalized.kind === "destination_unavailable") {
         const retryAt = input.clock.now() + 6 * 60 * 60_000;
         input.queue.setRetry(item.id, claimed.operationId, input.clock.now(), retryAt, normalized.kind, normalized.description);
-        await reportSharedFailure(normalized, { itemId: item.id, operationId: claimed.operationId, retryAt });
         return { kind: "failed", itemId: item.id, status: "shared_failure", error: normalized.description, operationId: claimed.operationId };
       }
       if (normalized.kind === "source_missing") {
@@ -312,7 +297,7 @@ export const createPublicationService = (input: {
     });
   };
 
-  const publishNextUnlocked = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome> => {
+  const publishNextUnlocked = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext, adminAction?: { updateId: number; claimToken: string }): Promise<PublicationOutcome> => {
     const now = input.clock.now();
     const first = input.queue.peekNextReady(now);
     if (!first) return expected ? { kind: "blocked", itemId: expected.itemId, status: "stale_candidate", reason: "No prepared item is currently ready; reopen the queue." } : { kind: "empty" };
@@ -331,7 +316,7 @@ export const createPublicationService = (input: {
     const attempted: number[] = [];
     for (const candidate of candidates) {
       const operationId = newOperationId();
-      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted, scheduled, input.requestEvidence === undefined ? 0 : 1);
+      const claimed = input.queue.claimReadyPublication(operationId, type, input.clock.now(), candidate, undefined, attempted, scheduled, input.requestEvidence === undefined ? 0 : 1, adminAction);
       attempted.push(candidate.itemId);
       if (!claimed) continue;
       const outcome = await tracked(operationId, () => publishPreparedClaimed(claimed, scheduled));
@@ -342,9 +327,9 @@ export const createPublicationService = (input: {
     return lastDefinite ?? { kind: "empty" };
   };
 
-  const publishNext = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext): Promise<PublicationOutcome> => {
+  const publishNext = async (type: "publish" | "manual_publish" = "publish", expected?: { itemId: number; contentVersion: number; sourceGeneration: number }, scheduled?: ScheduledPublicationContext, adminAction?: { updateId: number; claimToken: string }): Promise<PublicationOutcome> => {
     const execute = async (): Promise<PublicationOutcome> => {
-      const outcome = await publishNextUnlocked(type, expected, scheduled);
+      const outcome = await publishNextUnlocked(type, expected, scheduled, adminAction);
       if (type === "manual_publish" && (outcome.kind === "published" || outcome.kind === "cleanup_pending")) {
         input.schedule?.cancelUnsentRuns("manual_publication", input.clock.now());
       }
