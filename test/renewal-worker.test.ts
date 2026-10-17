@@ -53,8 +53,8 @@ const createGateway = (hooks: GatewayHooks = {}) => {
       if (hooks.forward) return { message_id: Number((await hooks.forward([messageId]))[0]!) } as never;
       return { message_id: Number(asMessageId(nextMessageId++)) } as never;
     },
-    editText: async () => {},
-    editCaption: async () => {},
+    editText: async ({ messageId }) => ({ messageId }),
+    editCaption: async ({ messageId }) => ({ messageId }),
     sendText: async () => asMessageId(nextMessageId++),
     deleteMessages: async (_chatId, messageIds) => {
       deletions.push(messageIds.map(Number));

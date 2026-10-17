@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase } from "../src/db/database";
+import { createGeneratedEventRepository } from "../src/db/generated-event-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository } from "../src/db/repositories";
+import { snapshotFromMessage } from "../src/domain/message";
 import { createPendingUpdateRepository } from "../src/db/pending-update-repository";
 import { createIngestionService } from "../src/services/ingestion";
 import { createRenewalService } from "../src/services/renewal";
@@ -20,17 +22,19 @@ const open = () => {
   const queue = createQueueRepository(database);
   const policy = createPolicyRepository(database);
   const generated = createGeneratedMessageRepository(database);
+  const events = createGeneratedEventRepository(database);
   const pending = createPendingUpdateRepository(database);
   const service = createIngestionService({
     queueChannelId: asChatId(-100),
     queue,
     policy,
     generated,
+    events,
     pending,
     logger: createLogger("error"),
     now: clock.now,
   });
-  return { directory, database, service, pending, queue, policy, generated, clock, advance: (milliseconds: number) => { currentTime += milliseconds; } };
+  return { directory, database, service, pending, queue, policy, generated, events, clock, advance: (milliseconds: number) => { currentTime += milliseconds; } };
 };
 
 let current: ReturnType<typeof open> | undefined;
@@ -137,6 +141,23 @@ describe("ingestion service", () => {
     });
   });
 
+  test("reconciles a bot edit echo that arrives before the Telegram edit response", () => {
+    current = open();
+    const id = asMessageId(554);
+    current.queue.observeQueueSnapshot(snapshotFixture({ messageId: id, text: "before" }), 10_000);
+    const editedMessage = { message_id: Number(id), date: 10, edit_date: 11, chat: { id: -100, type: "channel" }, text: "bot version" } as never;
+    const incoming = snapshotFromMessage(editedMessage, 0, 11);
+    const eventId = current.events.expect({ family: "preparation", operationId: "prep-echo", chatId: -100, messageId: Number(id), kind: "edit", fingerprint: incoming.contentFingerprint!, snapshot: incoming, now: 10_000 });
+    current.events.markEditRequestStarted(eventId, 10_000, 10);
+
+    expect(current.service.handleEditedChannelPost(editedMessage, 11)).toEqual({ accepted: false, ignoredReason: "pending_update" });
+    expect(current.queue.findItemById(1)?.editorialFrozenAt).toBeUndefined();
+    expect(current.queue.getCurrentSnapshotSet(1)[0]?.text).toBe("before");
+    expect(current.events.markEditRequestAccepted(eventId, 10_001, incoming.editDate)).toEqual({ kind: "generated" });
+    expect(current.queue.findItemById(1)?.editorialFrozenAt).toBeUndefined();
+    expect(current.database.raw.query("SELECT state, request_state FROM queue_generated_events WHERE id = ?").get(eventId)).toEqual({ state: "matched", request_state: "accepted" });
+  });
+
   test("quarantines an update while renewal output is unresolved, then suppresses it when registered", () => {
     current = open();
     current.service.observe(snapshotFixture({ messageId: asMessageId(502), telegramDate: 0 }), 1);
@@ -185,8 +206,8 @@ describe("ingestion service", () => {
         return replacementId;
       },
       forwardMessage: async () => { throw new Error("unused"); },
-      editText: async () => {},
-      editCaption: async () => {},
+      editText: async ({ messageId }) => ({ messageId }),
+      editCaption: async ({ messageId }) => ({ messageId }),
       sendText: async () => asMessageId(1),
       deleteMessages: async (_chatId, ids) => { deleted.push(...ids.map(Number)); },
       sendAdminMessage: async () => asMessageId(1),

@@ -26,8 +26,8 @@ const createApi = (overrides: Record<string, unknown> = {}): { api: Api; calls: 
     copyMessage: async () => responseMessage,
     forwardMessage: async () => responseMessage,
     sendMessage: async () => responseMessage,
-    editMessageText: async () => true,
-    editMessageCaption: async () => true,
+    editMessageText: async () => ({ message_id: 1, edit_date: 2 }),
+    editMessageCaption: async () => ({ message_id: 1, edit_date: 2 }),
     deleteMessages: async () => true,
     answerCallbackQuery: async () => true,
   };
@@ -74,8 +74,8 @@ describe("Telegram gateway adapter", () => {
     const gateway = createTelegramGateway(api, asChatId(42));
     const entities = [{ type: "text_link", offset: 0, length: 5, url: "https://example.test", language: "en", customEmojiId: "emoji", user: { id: asUserId(7), firstName: "Ada", lastName: "L" } }];
     await gateway.sendText({ chatId: asChatId(-100), text: "hello", entities });
-    await gateway.editText({ chatId: asChatId(-100), messageId: asMessageId(1), text: "edited", entities, linkPreviewIsDisabled: true });
-    await gateway.editCaption({ chatId: asChatId(-100), messageId: asMessageId(1), caption: "caption", captionEntities: entities, showCaptionAboveMedia: true });
+    expect(await gateway.editText({ chatId: asChatId(-100), messageId: asMessageId(1), text: "edited", entities, linkPreviewIsDisabled: true })).toEqual({ messageId: asMessageId(1), editDate: 2_000 });
+    expect(await gateway.editCaption({ chatId: asChatId(-100), messageId: asMessageId(1), caption: "caption", captionEntities: entities, showCaptionAboveMedia: true })).toEqual({ messageId: asMessageId(1), editDate: 2_000 });
     await gateway.sendAdminMessage({ chatId: asChatId(42), text: "admin", entities, replyMarkup: { inline_keyboard: [] } });
     await gateway.editAdminMessage({ chatId: asChatId(42), messageId: asMessageId(2), text: "menu", replyMarkup: { inline_keyboard: [] } });
     await gateway.answerCallbackQuery({ callbackQueryId: "callback", text: "done", showAlert: true });
@@ -123,6 +123,14 @@ describe("Telegram gateway adapter", () => {
     const { api: malformedApi } = createApi({ copyMessages: async () => [{ message_id: 20 }, null, { message_id: 22 }] });
     const malformedError = await rejected(() => createTelegramGateway(malformedApi, asChatId(42)).copyMessages(source));
     expect(malformedError).toMatchObject({ kind: "ambiguous_send_result", knownOutputs: [asMessageId(20), asMessageId(22)], requestMayHaveSucceeded: true });
+  });
+
+  test("requires an actual matching edited-message receipt", async () => {
+    for (const response of [true, {}, { message_id: 0 }, { message_id: 2 }, { message_id: 1, edit_date: -1 }]) {
+      const { api } = createApi({ editMessageText: async () => response });
+      const error = await rejected(() => createTelegramGateway(api, asChatId(42)).editText({ chatId: asChatId(-100), messageId: asMessageId(1), text: "edited" }));
+      expect(error).toMatchObject({ kind: "ambiguous_send_result", method: "editMessageText", requestMayHaveSucceeded: true });
+    }
   });
 
   test("normalizes and classifies API failures for every public method", async () => {

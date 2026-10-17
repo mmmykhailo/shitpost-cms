@@ -47,6 +47,11 @@ export type EditCaptionInput = {
   showCaptionAboveMedia?: boolean;
 };
 
+export type TelegramEditReceipt = {
+  messageId: MessageId;
+  editDate?: number;
+};
+
 export type SendTextInput = {
   chatId: ChatId;
   text: string;
@@ -78,8 +83,8 @@ export type TelegramGateway = {
   /** Single-member copy is used when source-specific failure association matters. */
   copyMessage?(input: { targetChatId: ChatId; sourceChatId: ChatId; messageId: MessageId; disableNotification?: boolean }): Promise<MessageId>;
   forwardMessage(input: { targetChatId: ChatId; sourceChatId: ChatId; messageId: MessageId; disableNotification?: boolean }): Promise<Message>;
-  editText(input: EditTextInput): Promise<void>;
-  editCaption(input: EditCaptionInput): Promise<void>;
+  editText(input: EditTextInput): Promise<TelegramEditReceipt>;
+  editCaption(input: EditCaptionInput): Promise<TelegramEditReceipt>;
   sendText(input: SendTextInput): Promise<MessageId>;
   deleteMessages(chatId: ChatId, messageIds: readonly MessageId[]): Promise<void>;
   sendAdminMessage(input: AdminMessageInput): Promise<MessageId>;
@@ -112,6 +117,19 @@ const ambiguousSendResult = (method: string, reason: string, knownOutputs: reado
 const returnedMessageId = (value: unknown, method: string, label: string): MessageId => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw ambiguousSendResult(method, `${label} is not a positive safe integer`);
   return asMessageId(value);
+};
+
+const returnedEditReceipt = (value: unknown, method: string, expectedMessageId: MessageId): TelegramEditReceipt => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw ambiguousSendResult(method, "response did not contain the edited message");
+  const record = value as { message_id?: unknown; edit_date?: unknown };
+  const messageId = returnedMessageId(record.message_id, method, "edited message ID");
+  if (messageId !== expectedMessageId) throw ambiguousSendResult(method, `response message ID ${messageId} did not match requested ID ${expectedMessageId}`);
+  const receipt: TelegramEditReceipt = { messageId };
+  if (record.edit_date !== undefined) {
+    if (typeof record.edit_date !== "number" || !Number.isSafeInteger(record.edit_date) || record.edit_date < 0 || !Number.isSafeInteger(record.edit_date * 1_000)) throw ambiguousSendResult(method, "response edit date is invalid");
+    receipt.editDate = record.edit_date * 1_000;
+  }
+  return receipt;
 };
 
 const normalizeBulkTransferResult = (result: unknown, method: "copyMessages" | "forwardMessages", requestedCount: number): MessageId[] => {
@@ -186,20 +204,22 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
     });
   };
 
-  const editText = async (input: EditTextInput): Promise<void> => {
+  const editText = async (input: EditTextInput): Promise<TelegramEditReceipt> => {
     const entities = toTelegramEntities(input.entities);
     const options: { entities?: GrammyMessageEntity[]; link_preview_options?: { is_disabled: boolean } } = {};
     if (entities !== undefined) options.entities = entities;
     if (input.linkPreviewIsDisabled !== undefined) options.link_preview_options = { is_disabled: input.linkPreviewIsDisabled };
-    await call("editMessageText", () => api.editMessageText(input.chatId, input.messageId, input.text, options));
+    const result = await call("editMessageText", () => api.editMessageText(input.chatId, input.messageId, input.text, options));
+    return returnedEditReceipt(result, "editMessageText", input.messageId);
   };
 
-  const editCaption = async (input: EditCaptionInput): Promise<void> => {
+  const editCaption = async (input: EditCaptionInput): Promise<TelegramEditReceipt> => {
     const captionEntities = toTelegramEntities(input.captionEntities);
     const options: { caption: string; caption_entities?: GrammyMessageEntity[]; show_caption_above_media?: boolean } = { caption: input.caption };
     if (captionEntities !== undefined) options.caption_entities = captionEntities;
     if (input.showCaptionAboveMedia !== undefined) options.show_caption_above_media = input.showCaptionAboveMedia;
-    await call("editMessageCaption", () => api.editMessageCaption(input.chatId, input.messageId, options));
+    const result = await call("editMessageCaption", () => api.editMessageCaption(input.chatId, input.messageId, options));
+    return returnedEditReceipt(result, "editMessageCaption", input.messageId);
   };
 
   const sendAdminMessage = async (input: AdminMessageInput): Promise<MessageId> => {

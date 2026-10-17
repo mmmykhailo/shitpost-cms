@@ -82,12 +82,16 @@ export const createIngestionService = (input: {
   const handleEditedChannelPost = (message: Message, telegramUpdateId?: number): IngestionResult => {
     if (message.chat.id !== input.queueChannelId) return { accepted: false, ignoredReason: "wrong_chat" };
     const snapshot = snapshotFromMessage(message, 0, telegramUpdateId);
-    const expected = input.events?.consume(snapshot.chatId, snapshot.messageId, "edit", snapshot.contentFingerprint, input.now());
+    const now = input.now();
+    const expected = input.events?.consume(snapshot.chatId, snapshot.messageId, "edit", snapshot.contentFingerprint, now, snapshot);
+    if (expected?.provisional) {
+      input.logger.debug("generated_edit_observed_before_request_result", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: expected.operationId, family: expected.family });
+      return { accepted: false, ignoredReason: "pending_update" };
+    }
     if (expected) {
       input.logger.debug("expected_generated_edit_matched", { chatId: snapshot.chatId, messageId: snapshot.messageId, operationId: expected.operationId, family: expected.family });
       return { accepted: false, ignoredReason: "generated_message" };
     }
-    const now = input.now();
     const known = input.queue.findKnownSource(snapshot.chatId, snapshot.messageId);
     if (!input.pending) {
       if (!known || !known.current || known.removed) {
@@ -116,7 +120,11 @@ export const createIngestionService = (input: {
     const ingested: number[] = [];
     for (const pending of input.pending.due(now)) {
       const unmatchedEditAt = pending.unmatchedEditAt ?? (pending.updateKind === "edit" ? pending.receivedAt : undefined);
-      const event = unmatchedEditAt === undefined ? input.events?.consume(pending.queueChatId, pending.telegramMessageId, pending.updateKind === "edit" ? "edit" : "post", pending.snapshot.contentFingerprint, now) : undefined;
+      const event = unmatchedEditAt === undefined ? input.events?.consume(pending.queueChatId, pending.telegramMessageId, pending.updateKind === "edit" ? "edit" : "post", pending.snapshot.contentFingerprint, now, pending.updateKind === "edit" ? pending.snapshot : undefined) : undefined;
+      if (event?.provisional) {
+        input.pending.defer(pending.queueChatId, pending.telegramMessageId, now + 1_000, event.operationId);
+        continue;
+      }
       if (event) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "consumed_generated", now, event.operationId);
         input.logger.debug("expected_generated_update_matched", { chatId: pending.queueChatId, messageId: pending.telegramMessageId, operationId: event.operationId, family: event.family });

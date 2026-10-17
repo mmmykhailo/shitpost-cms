@@ -28,8 +28,8 @@ const fakeGateway = (options: { failDelete?: boolean; sourceMissingOnDelete?: bo
     copyMessages: async ({ messageIds }) => { calls.push("copy"); if (options.transferFailure !== undefined) throw options.transferFailure; if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return (options.shortTransfer ? messageIds.slice(0, 1) : messageIds).map(() => asMessageId(nextMessageId++)); },
     copyMessage: async () => { calls.push("copy"); if (options.transferFailure !== undefined) throw options.transferFailure; if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return asMessageId(nextMessageId++); },
     forwardMessage: async () => { calls.push("forward"); if (options.transferFailure !== undefined) throw options.transferFailure; if (options.ambiguousTransfer) throw { kind: "ambiguous_send_result", description: "transfer response lost" }; return { message_id: nextMessageId++, chat: { id: -200, type: "channel", title: "Target" }, date: 10 }; },
-    editText: async () => { calls.push("editText"); if (options.ambiguousEdit) throw { kind: "ambiguous_send_result", description: "edit response lost" }; },
-    editCaption: async () => { calls.push("editCaption"); },
+    editText: async ({ messageId }) => { calls.push("editText"); if (options.ambiguousEdit) throw { kind: "ambiguous_send_result", description: "edit response lost" }; return { messageId }; },
+    editCaption: async ({ messageId }) => { calls.push("editCaption"); return { messageId }; },
     sendText: async () => { calls.push("sendText"); if (options.ambiguousByline) throw { kind: "ambiguous_send_result", description: "byline response lost" }; return asMessageId(nextMessageId++); },
     deleteMessages: async (_chatId, messageIds) => {
       calls.push(`delete:${messageIds.join(",")}`);

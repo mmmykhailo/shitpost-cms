@@ -609,6 +609,14 @@ const migrations: readonly Migration[] = [
       `UPDATE admin_prompts SET generation_id = 'legacy:' || admin_id WHERE generation_id IS NULL`,
     ],
   },
+  {
+    version: 10,
+    statements: [
+      `ALTER TABLE queue_generated_events ADD COLUMN provisional_snapshot_json TEXT`,
+      `ALTER TABLE queue_generated_events ADD COLUMN provisional_received_at INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN provisional_update_id INTEGER`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

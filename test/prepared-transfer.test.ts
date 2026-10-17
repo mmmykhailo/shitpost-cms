@@ -18,7 +18,7 @@ const gateway = (overrides: Partial<TelegramGateway> = {}): TelegramGateway => (
   getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
   forwardMessages: async () => [asMessageId(201), asMessageId(202)], copyMessages: async () => [asMessageId(301), asMessageId(302)],
   forwardMessage: async () => ({ message_id: 401 } as never), copyMessage: async () => asMessageId(501),
-  editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {},
+  editText: async ({ messageId }) => ({ messageId }), editCaption: async ({ messageId }) => ({ messageId }), sendText: async () => asMessageId(1), deleteMessages: async () => {},
   sendAdminMessage: async () => asMessageId(1), editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
   ...overrides,
 });

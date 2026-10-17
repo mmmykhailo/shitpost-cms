@@ -30,8 +30,8 @@ const gatewayWithDeleteFailure = (deleteFailureKind: "transient_network" | "perm
     copyMessages: async ({ messageIds }) => { calls.push("copy"); return messageIds.map(() => asMessageId(nextId++)); },
     forwardMessage: async () => { calls.push("forward"); return { message_id: nextId++ } as never; },
     copyMessage: async () => { calls.push("copy"); return asMessageId(nextId++); },
-    editText: async () => {},
-    editCaption: async () => {},
+    editText: async ({ messageId }) => ({ messageId }),
+    editCaption: async ({ messageId }) => ({ messageId }),
     sendText: async () => asMessageId(nextId++),
     deleteMessages: async () => {
       calls.push("delete");

@@ -70,7 +70,7 @@ At the first snapshot, item #86 had 22,444 refresh attempts. Do not hardcode ite
 
 These are concrete engineering choices for implementing the agreed behavior. They are not claims that the user explicitly discussed every storage column or constant.
 
-- Use additive migrations 6–9 as described below. If the branch has acquired newer migrations, append four new consecutive versions; never edit a migration already applied anywhere.
+- Use additive migrations 6–9 as described below. If a later implementation checkpoint has already committed those versions, append a new migration for any additional evidence needed by the same invariants; never edit a migration already applied anywhere.
 - Keep deferred schedule runs in existing status `pending`; use extra columns for retry and cancellation. Do not rebuild the schedule status CHECK merely to add `retry_pending`.
 - Use a dedicated private-admin response outbox. Do not store channel publications in it.
 - Introduce one shared outbound admission layer for proactive pacing, final version/protection checks, and central real-429 observation.
@@ -283,6 +283,8 @@ observed_after_update_id INTEGER
 expected_edit_date INTEGER
 valid_until INTEGER
 ```
+
+The response-order implementation also stores a provisional update snapshot, its receipt time, and update ID while an edit request is in flight. If migrations 6–9 have already been committed or applied, add these fields in a new migration rather than editing migration 6.
 
 Use `state` for whether an expected update is still matchable; use `request_state` for what is known about the outbound attempt. Do not conflate the two.
 

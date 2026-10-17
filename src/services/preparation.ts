@@ -201,23 +201,39 @@ export const createPreparationService = (input: {
         return { kind: "prepared", itemId: item.id, preparationState: completed.preparationState, operationId: claim.operationId };
       }
 
-      input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, nextSnapshot, input.clock.now());
+      const editEventId = input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, nextSnapshot, input.clock.now());
       input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+      input.preparation.markEditRequestStarted(editEventId, input.clock.now());
       mutationMayHaveStarted = true;
       try {
+        let receipt;
         if (edit === "text") {
           const request = { chatId: input.queueChannelId, messageId: target.messageId, text: nextSnapshot.text ?? "" } as Parameters<TelegramGateway["editText"]>[0];
           if (nextSnapshot.entities !== undefined) request.entities = nextSnapshot.entities;
           if (nextSnapshot.linkPreviewOptions?.isDisabled !== undefined) request.linkPreviewIsDisabled = nextSnapshot.linkPreviewOptions.isDisabled;
-          await input.gateway.editText(request);
+          receipt = await input.gateway.editText(request);
         } else {
           const request = { chatId: input.queueChannelId, messageId: target.messageId, caption: nextSnapshot.caption ?? "" } as Parameters<TelegramGateway["editCaption"]>[0];
           if (nextSnapshot.captionEntities !== undefined) request.captionEntities = nextSnapshot.captionEntities;
           if (nextSnapshot.showCaptionAboveMedia !== undefined) request.showCaptionAboveMedia = nextSnapshot.showCaptionAboveMedia;
-          await input.gateway.editCaption(request);
+          receipt = await input.gateway.editCaption(request);
+        }
+        if (receipt.messageId !== target.messageId) throw { kind: "ambiguous_send_result", description: "Telegram edit response identified a different message", requestMayHaveSucceeded: true };
+        const response = input.preparation.markEditRequestAccepted(editEventId, input.clock.now(), receipt.editDate);
+        if (response.kind === "collision" && response.snapshot) {
+          input.queue.acceptAdminQueueEdit({ chatId: input.queueChannelId, messageId: target.messageId, snapshot: response.snapshot, receivedAt: input.clock.now(), ...(response.snapshot.telegramUpdateId === undefined ? {} : { updateId: response.snapshot.telegramUpdateId }) });
+          return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
         }
       } catch (error) {
         const normalized = classifyTelegramError(error, edit === "text" ? "editMessageText" : "editMessageCaption");
+        const noOp = normalized.description.toLowerCase().includes("message is not modified");
+        const eventResult = normalized.kind === "rate_limited" || normalized.kind === "source_missing" || normalized.kind === "invalid_content_or_entities" || noOp
+          ? input.preparation.markEditRequestRejected(editEventId, input.clock.now())
+          : input.preparation.markEditRequestUnknown(editEventId, input.clock.now());
+        if (eventResult.snapshot) {
+          input.queue.acceptAdminQueueEdit({ chatId: input.queueChannelId, messageId: target.messageId, snapshot: eventResult.snapshot, receivedAt: input.clock.now(), ...(eventResult.snapshot.telegramUpdateId === undefined ? {} : { updateId: eventResult.snapshot.telegramUpdateId }) });
+          return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
+        }
         if (normalized.kind === "source_missing") {
           const missing = input.preparation.markMemberMissing(guard, target.memberKey, { method: normalized.method ?? "editMessageText", ...(normalized.code === undefined ? {} : { code: normalized.code }), description: normalized.description }, input.clock.now());
           guard = missing.nextGuard;
@@ -228,7 +244,7 @@ export const createPreparationService = (input: {
           const retry = retryAt(normalized, input.clock.now());
           input.preparation.scheduleRetry(claim.operationId, retry, normalized.kind, normalized.description, input.clock.now());
           return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
-        } else if (!normalized.description.toLowerCase().includes("message is not modified")) {
+        } else if (!noOp) {
           input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
           return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
         }
@@ -435,25 +451,43 @@ export const createPreparationService = (input: {
         if (inline.placement === "inline_text" && inline.entities === undefined && oldEntities !== undefined) delete snapshot.entities;
         if (inline.placement === "inline_caption" && inline.captionEntities === undefined && oldCaptionEntities !== undefined) delete snapshot.captionEntities;
         snapshot.contentFingerprint = fingerprintSnapshotContent(snapshot);
-        input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, snapshot, input.clock.now());
+        const editEventId = input.preparation.expectEdit(claim.operationId, input.queueChannelId, target.messageId, snapshot, input.clock.now());
         input.preparation.setPhase(claim.operationId, "attribution_pending", input.clock.now());
+        input.preparation.markEditRequestStarted(editEventId, input.clock.now());
         mutationMayHaveStarted = true;
         try {
+          let receipt;
           if (edit === "text") {
             const editInput = { chatId: input.queueChannelId, messageId: target.messageId, text: snapshot.text ?? "" } as Parameters<TelegramGateway["editText"]>[0];
             if (snapshot.entities !== undefined) editInput.entities = snapshot.entities;
             if (snapshot.linkPreviewOptions?.isDisabled !== undefined) editInput.linkPreviewIsDisabled = snapshot.linkPreviewOptions.isDisabled;
-            await input.gateway.editText(editInput);
+            receipt = await input.gateway.editText(editInput);
           } else {
             const editInput = { chatId: input.queueChannelId, messageId: target.messageId, caption: snapshot.caption ?? "" } as Parameters<TelegramGateway["editCaption"]>[0];
             if (snapshot.captionEntities !== undefined) editInput.captionEntities = snapshot.captionEntities;
             if (snapshot.showCaptionAboveMedia !== undefined) editInput.showCaptionAboveMedia = snapshot.showCaptionAboveMedia;
-            await input.gateway.editCaption(editInput);
+            receipt = await input.gateway.editCaption(editInput);
+          }
+          if (receipt.messageId !== target.messageId) throw { kind: "ambiguous_send_result", description: "Telegram edit response identified a different message", requestMayHaveSucceeded: true };
+          const response = input.preparation.markEditRequestAccepted(editEventId, input.clock.now(), receipt.editDate);
+          if (response.kind === "collision" && response.snapshot) {
+            input.queue.acceptProvisionalPreparationEdit({ chatId: input.queueChannelId, messageId: target.messageId, snapshot: response.snapshot, receivedAt: input.clock.now(), ...(response.snapshot.telegramUpdateId === undefined ? {} : { updateId: response.snapshot.telegramUpdateId }) });
+            return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
           }
           outputMembers[targetIndex] = { ...target, snapshot };
         } catch (error) {
           const normalized = classifyTelegramError(error);
-          if (["rate_limited", "transient_network", "transient_server", "ambiguous_send_result"].includes(normalized.kind)) {
+          const noOp = normalized.description.toLowerCase().includes("message is not modified");
+          const eventResult = normalized.kind === "rate_limited" || normalized.kind === "source_missing" || normalized.kind === "invalid_content_or_entities" || noOp
+            ? input.preparation.markEditRequestRejected(editEventId, input.clock.now())
+            : input.preparation.markEditRequestUnknown(editEventId, input.clock.now());
+          if (eventResult.snapshot) {
+            input.queue.acceptProvisionalPreparationEdit({ chatId: input.queueChannelId, messageId: target.messageId, snapshot: eventResult.snapshot, receivedAt: input.clock.now(), ...(eventResult.snapshot.telegramUpdateId === undefined ? {} : { updateId: eventResult.snapshot.telegramUpdateId }) });
+            return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
+          }
+          if (noOp) {
+            outputMembers[targetIndex] = { ...target, snapshot };
+          } else if (["rate_limited", "transient_network", "transient_server", "ambiguous_send_result"].includes(normalized.kind)) {
             if (normalized.kind === "rate_limited") {
               if (!await cleanupKnownOutputs(knownOutputIds)) {
                 input.preparation.markUncertain(claim.operationId, "cleanup_after_rate_limit_failed", "Known preparation outputs could not be removed after a rate limit", input.clock.now());
@@ -465,14 +499,14 @@ export const createPreparationService = (input: {
             }
             input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
             return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
-          }
-          if (await cleanupKnownOutputs(knownOutputIds)) {
+          } else if (await cleanupKnownOutputs(knownOutputIds)) {
             const status = normalized.kind === "invalid_content_or_entities" ? "needs_edit" : "needs_review";
             input.preparation.markFailed(claim.operationId, status, normalized.kind, normalized.description, input.clock.now());
             return { kind: "blocked", itemId: item.id, status, reason: normalized.kind, operationId: claim.operationId };
+          } else {
+            input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
+            return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
           }
-          input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now());
-          return { kind: "uncertain", itemId: item.id, operationId: claim.operationId };
         }
       }
 

@@ -38,7 +38,7 @@ describe("operations safety net", () => {
     const messages: string[] = [];
     const gateway = {
       getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
-      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
+      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async ({ messageId }) => ({ messageId }), editCaption: async ({ messageId }) => ({ messageId }), sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
       sendAdminMessage: async ({ text }: { text: string }) => { messages.push(text); return asMessageId(messages.length); },
     } satisfies TelegramGateway;
     const service = createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") });
@@ -55,7 +55,7 @@ describe("operations safety net", () => {
     const messages: string[] = [];
     const gateway = {
       getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
-      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
+      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async ({ messageId }) => ({ messageId }), editCaption: async ({ messageId }) => ({ messageId }), sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
       sendAdminMessage: async ({ text }: { text: string }) => { messages.push(text); return asMessageId(messages.length); },
     } satisfies TelegramGateway;
     const service = createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") });
@@ -116,7 +116,7 @@ describe("operations safety net", () => {
     const messages: string[] = [];
     const gateway = {
       getBotIdentity: async () => ({ id: asUserId(1) }), getChat: async () => ({ id: asChatId(-100), type: "channel" as const }), getBotMembership: async () => ({ status: "administrator", canPostMessages: true, canDeleteMessages: true, canEditMessages: true }),
-      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async () => {}, editCaption: async () => {}, sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
+      forwardMessages: async () => [], copyMessages: async () => [], forwardMessage: async () => { throw new Error("unused"); }, editText: async ({ messageId }) => ({ messageId }), editCaption: async ({ messageId }) => ({ messageId }), sendText: async () => asMessageId(1), deleteMessages: async () => {}, editAdminMessage: async () => {}, answerCallbackQuery: async () => {},
       sendAdminMessage: async ({ text }: { text: string }) => { messages.push(text); return asMessageId(messages.length); },
     } satisfies TelegramGateway;
     const service = createAlertService({ alert: createAlertRepository(database), gateway, adminChatId: asChatId(99), logger: createLogger("error") });

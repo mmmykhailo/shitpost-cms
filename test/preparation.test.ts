@@ -37,8 +37,8 @@ const makeGateway = () => {
     copyMessages: async ({ messageIds }: { messageIds: readonly number[] }) => messageIds.map(() => asMessageId(nextId++)),
     forwardMessages: async ({ messageIds }: { messageIds: readonly number[] }) => messageIds.map(() => asMessageId(nextId++)),
     forwardMessage: async ({ messageId }: { messageId: number }) => ({ message_id: nextId++, chat: { id: -100, type: "channel", title: "Queue" }, date: NOW / 1000, text: String(messageId) }),
-    editText: async ({ messageId, text }: { messageId: number; text: string }) => { edits.push({ messageId, text }); },
-    editCaption: async ({ messageId, caption }: { messageId: number; caption: string }) => { edits.push({ messageId, caption }); },
+    editText: async ({ messageId, text }: { messageId: number; text: string }) => { edits.push({ messageId, text }); return { messageId: asMessageId(messageId), editDate: NOW }; },
+    editCaption: async ({ messageId, caption }: { messageId: number; caption: string }) => { edits.push({ messageId, caption }); return { messageId: asMessageId(messageId), editDate: NOW }; },
     sendText: async ({ text }: { text: string }) => { sentText.push(text); return asMessageId(nextId++); },
     deleteMessages: async (_chatId: number, ids: readonly number[]) => { deleted.push([...ids]); },
   };

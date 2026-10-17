@@ -131,6 +131,13 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
     return Number(result.changes) === 1;
   };
 
+  const defer = (chatId: number, messageId: number, processAfter: number, candidateOperationId?: string): boolean => {
+    if (!Number.isSafeInteger(processAfter) || processAfter < 0) throw new Error("Pending update deferral time is invalid");
+    const result = database.raw.query(`UPDATE pending_queue_updates SET process_after = MAX(process_after, ?), candidate_operation_id = COALESCE(?, candidate_operation_id)
+      WHERE queue_chat_id = ? AND telegram_message_id = ? AND state IN ('pending','quarantined_renewal_candidate')`).run(processAfter, candidateOperationId ?? null, chatId, messageId);
+    return Number(result.changes) === 1;
+  };
+
   const countByState = (): Record<string, number> => {
     const result: Record<string, number> = {};
     const rows = database.raw.query("SELECT state, COUNT(*) AS count FROM pending_queue_updates GROUP BY state").all() as Array<{ state: string; count: number }>;
@@ -147,5 +154,5 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
     database.raw.query("DELETE FROM pending_queue_updates WHERE state IN ('consumed_generated','ingested','discarded') AND received_at < ?").run(before);
   };
 
-  return { find, upsert, due, markState, countByState, listByState, purge };
+  return { find, upsert, due, markState, defer, countByState, listByState, purge };
 };

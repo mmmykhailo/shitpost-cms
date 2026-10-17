@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AppDatabase } from "./database";
+import { createGeneratedEventRepository } from "./generated-event-repository";
 import { assertPreparedMembers } from "../domain/prepared-post";
 import {
   validateAttributionDescriptor,
@@ -34,6 +35,7 @@ export type PreparationRepository = ReturnType<typeof createPreparationRepositor
 export const createPreparationRepository = (database: AppDatabase, options: { leaseMs?: number; operationId?: () => string } = {}) => {
   const leaseMs = options.leaseMs ?? 300_000;
   const makeOperationId = options.operationId ?? randomUUID;
+  const generatedEvents = createGeneratedEventRepository(database);
 
   const operation = (id: string): PreparationRow | undefined => database.raw.query("SELECT * FROM queue_preparation_operations WHERE id = ?").get(id) as PreparationRow | null ?? undefined;
   const assertOwner = (id: string, allowCleanup = false): PreparationRow => {
@@ -110,16 +112,17 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     void row;
   });
 
-  const expectEdit = (operationId: string, chatId: number, messageId: number, snapshotValue: unknown, now: number): void => database.transaction(() => {
+  const expectEdit = (operationId: string, chatId: number, messageId: number, snapshotValue: unknown, now: number): string => {
     assertOwner(operationId);
     const snapshot = validateStoredMessageSnapshot(snapshotValue);
     if (Number(snapshot.chatId) !== chatId || Number(snapshot.messageId) !== messageId || !snapshot.contentFingerprint) throw new Error("Expected edit snapshot identity or fingerprint is invalid");
-    const duplicate = database.raw.query("SELECT 1 FROM queue_generated_events WHERE operation_family = 'preparation' AND operation_id = ? AND chat_id = ? AND message_id = ? AND event_kind = 'edit' AND expected_fingerprint = ? AND state = 'pending'").get(operationId, chatId, messageId, snapshot.contentFingerprint);
-    if (duplicate) return;
-    database.raw.query(`INSERT INTO queue_generated_events (id, operation_family, operation_id, chat_id, message_id, event_kind, expected_fingerprint, expected_snapshot_json, state, created_at)
-      VALUES (?, 'preparation', ?, ?, ?, 'edit', ?, ?, 'pending', ?)`)
-      .run(randomUUID(), operationId, chatId, messageId, snapshot.contentFingerprint, asJson(snapshot), now);
-  });
+    return generatedEvents.expect({ family: "preparation", operationId, chatId, messageId, kind: "edit", fingerprint: snapshot.contentFingerprint, snapshot, now });
+  };
+
+  const markEditRequestStarted = (eventId: string, startedAt: number, observedAfterUpdateId?: number): void => generatedEvents.markEditRequestStarted(eventId, startedAt, observedAfterUpdateId);
+  const markEditRequestAccepted = (eventId: string, finishedAt: number, editDate?: number): ReturnType<typeof generatedEvents.markEditRequestAccepted> => generatedEvents.markEditRequestAccepted(eventId, finishedAt, editDate);
+  const markEditRequestRejected = (eventId: string, finishedAt: number): ReturnType<typeof generatedEvents.markEditRequestRejected> => generatedEvents.markEditRequestRejected(eventId, finishedAt);
+  const markEditRequestUnknown = (eventId: string, finishedAt: number): ReturnType<typeof generatedEvents.markEditRequestUnknown> => generatedEvents.markEditRequestUnknown(eventId, finishedAt);
 
   const recordCompleteResult = (operationId: string, result: PreparationResult, now: number): void => database.transaction(() => {
     const row = assertOwner(operationId);
@@ -348,5 +351,5 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
       .run(row.item_id, operationId, JSON.stringify({ action, trackedOutputs: hasOutputs }), now);
   });
 
-  return { claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
+  return { claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, markEditRequestStarted, markEditRequestAccepted, markEditRequestRejected, markEditRequestUnknown, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
 };
