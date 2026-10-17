@@ -1,0 +1,3 @@
+# Publish the earliest ready item past issues
+
+A post requiring attention must not stop publication of other ready posts. Select the earliest eligible item in logical order and continue within a publishing slot after definite failures before output, allowing at most one successful publication per slot; repaired items retain their original position among remaining posts. A possibly completed send consumes its slot and requires resolution without automatic resend, while global Telegram failures stop the run rather than faulting every item; this trades strict FIFO blocking for continued publication without automatic duplication.

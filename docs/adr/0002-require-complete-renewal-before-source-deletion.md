@@ -1,0 +1,3 @@
+# Require a complete replacement before deleting originals
+
+Renewal can return only part of an album or lose the response to a request that may have succeeded. Preserve surviving original messages and require admin review when a complete replacement cannot be confirmed, rather than interpreting incomplete output as permission to remove the item. This accepts possible temporary replacement remnants and manual intervention to avoid irreversible loss of queued content. Only a confirmed complete replacement may become current before old-source deletion; subsequent deletion failures leave tracked orphaned sources while the replacement remains usable.

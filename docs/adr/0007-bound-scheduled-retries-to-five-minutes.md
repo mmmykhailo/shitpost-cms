@@ -1,0 +1,3 @@
+# Bound scheduled retries to five minutes
+
+A scheduled send definitely rejected before any output may retry only until five minutes after its original publication occurrence. Preserve that deadline across restart; pausing publishing or a successful manual publication cancels pending scheduled retries, and expired occurrences stay skipped. Keep at most one successful publication per occurrence and require review whenever output may already exist. This allows brief Telegram waits to recover without silently losing a slot, while rejecting delayed catch-up bursts and automatic resends of uncertain output.

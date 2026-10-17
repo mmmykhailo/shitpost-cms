@@ -1,0 +1,3 @@
+# Preserve queue identity while renewing Telegram sources
+
+Telegram's ordinary deletion limit requires replacing long-waiting queue sources before they become 48 hours old. Renewal replaces the Telegram messages while preserving the logical item's identity, publishing position, content, attribution, album grouping, and initial enqueue time. This deliberately allows physical order in the queue channel to differ from publishing order: resetting the queue item on each replacement would move long-waiting posts backwards and erase their actual waiting age. Queue listings therefore link to the current source while displaying total queue age.
