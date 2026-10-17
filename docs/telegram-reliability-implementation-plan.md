@@ -2,7 +2,9 @@
 
 Prepared on 2026-10-17 against commit `9866e598b9076e816b088bd26014b0c2ec16ac97`, whose latest database migration is version 5.
 
-Audience: an implementation team that needs explicit files, interfaces, sequencing, failure rules, and acceptance checks. This document is an implementation handoff, not a claim that the work has already been done. It does not authorize changes to production or a deployment.
+Implementation status: completed locally through code checkpoint `fc9d09e`; the current schema is version 11. `bun run check:all` passes with 371 tests, 1,661 assertions, 91.39% application line coverage, and 93.39% function coverage. Production data, service state, and Telegram messages were not changed.
+
+Audience: an implementation team that needs explicit files, interfaces, sequencing, failure rules, and acceptance checks. This plan records the agreed implementation and verification status. It does not authorize production deployment.
 
 ## 0. Read this before changing code
 
@@ -70,7 +72,7 @@ At the first snapshot, item #86 had 22,444 refresh attempts. Do not hardcode ite
 
 These are concrete engineering choices for implementing the agreed behavior. They are not claims that the user explicitly discussed every storage column or constant.
 
-- Use additive migrations 6–9 as described below. If a later implementation checkpoint has already committed those versions, append a new migration for any additional evidence needed by the same invariants; never edit a migration already applied anywhere.
+- Use additive migrations 6–11 as described below. Never edit a migration already applied anywhere.
 - Keep deferred schedule runs in existing status `pending`; use extra columns for retry and cancellation. Do not rebuild the schedule status CHECK merely to add `retry_pending`.
 - Use a dedicated private-admin response outbox. Do not store channel publications in it.
 - Introduce one shared outbound admission layer for proactive pacing, final version/protection checks, and central real-429 observation.
@@ -149,7 +151,7 @@ Important traps:
 9. Schedule operation IDs currently become associated with runs only after `publishNext()` returns. Fix that crash gap before adding automatic retries.
 10. `markQueueItemPrepared()` aligns applied/wanted revisions in fixtures. Do not use it for the original enqueue-after-existing-nickname regression; it hides the bug.
 11. `createFakeClock.sleep()` advances time immediately. Do not run infinite worker loops with it; use a manually advanced clock with deferred sleepers.
-12. Existing diagnostics assert observed defects, not corrected behavior. They must not become green regression tests that continue to require the bug.
+12. The original diagnostic probes asserted observed defects, not corrected behavior. They were removed after the cases moved into regression tests; do not restore them as green checks that continue to require the bug.
 
 ## 3. Work order and checkpoints
 
@@ -172,22 +174,16 @@ Do not stop after fixing only the first refresh loop. The requested scope also i
 
 Use real temporary SQLite databases from `test/support.ts`; use fake Telegram transports or explicit gateway fakes. Never use a production token, production channel, SSH session, or production database in tests.
 
-### 4.1 Promote the original regressions
+### 4.1 Regression coverage
 
-Use these probes to locate the real seams, then write assertions for the REQUIRED behavior:
+The implementation is complete. The original defect probes have been removed; the corrected behavior is covered by the named test suites below. Keep these assertions when changing the implementation:
 
-- `scripts/diagnostics/nickname-refresh-loop.ts`.
-- `scripts/diagnostics/telegram-flood-waits.ts`.
-- `scripts/diagnostics/admin-edit-protection.ts`.
-
-At minimum, observe a failing test for each of these BEFORE the corresponding fix:
-
-1. Existing alias -> new submission -> preparation -> next scan: first result ready, next scan empty, one actual transformation.
-2. Admin body edit leaving the credit unchanged -> nickname change: zero subsequent automatic edit calls.
-3. No-op refresh -> manual edit -> manual restoration to previous bot text: restoration accepted and stored.
-4. Scheduled definite 429 -> advance within deadline -> scheduler retry: one publication, no manual trigger.
-5. Command during cooldown -> another update arrives: both middleware calls finish without waiting for the cooldown; response eventually delivers.
-6. Opening warning cannot deliver -> wait clears: no standalone recovery notification.
+1. Existing alias -> new submission -> preparation -> next scan converges to ready with one actual transformation (`preparation.test.ts`, `preparation-repository.test.ts`).
+2. Admin body edit leaving the credit unchanged -> nickname change issues zero subsequent automatic edit calls (`ingestion.test.ts`, `preparation.test.ts`).
+3. No-op refresh -> manual edit -> manual restoration to previous bot text is accepted and stored (`ingestion.test.ts`).
+4. Scheduled definite 429 -> advance within deadline -> scheduler retry publishes once without a manual trigger (`scheduler.test.ts`, `publisher.test.ts`).
+5. A command during cooldown does not hold subsequent middleware calls open; its response eventually delivers (`admin-reliability.test.ts`, `telegram-admission.test.ts`).
+6. If an opening warning cannot deliver and the wait clears, no standalone recovery notification is sent (`operations.test.ts`, `admin-reliability.test.ts`).
 
 ### 4.2 Add a controlled clock
 
@@ -1300,7 +1296,7 @@ bun run check:all
 
 At plan baseline, this includes typecheck, full tests, coverage gate, and fake-root deployment tests. Do not change coverage thresholds or exclude new executable modules to make the gate pass. The coverage inventory includes executable TypeScript across `src`; new services/repositories need meaningful coverage.
 
-Review existing exact migration-version assertions: `test/migration.test.ts` currently expects 5. Update to the new actual latest version without removing old upgrade-fixture coverage.
+The baseline exact migration-version assertion was 5. It now expects the actual latest version, 11; old upgrade-fixture coverage remains in place.
 
 Search for old assumptions after implementation:
 
@@ -1329,21 +1325,21 @@ After all checks pass:
 
 Completion checklist:
 
-- [ ] Original existing-alias enqueue regression is green at the real ingestion/preparation seam.
-- [ ] Known loop rows converge; no hardcoded item-specific repair exists.
-- [ ] Admin edits freeze whole logical posts, including buffered/provisional edits.
-- [ ] Stale generated-edit expectations cannot swallow manual restoration.
-- [ ] Frozen valid posts still publish/renew unchanged and survive restart.
-- [ ] Scheduled retries obey original deadlines, cancellation, atomic attempt association, and uncertainty evidence.
-- [ ] Command middleware never waits for flood expiry to return.
-- [ ] Retained responses/prompts/confirmations survive restart without repeating effects.
-- [ ] Shared incidents have actual-delivery-aware warning/recovery transitions.
-- [ ] Local deferrals do not become real Telegram incidents.
-- [ ] No source cleanup failure can resend confirmed publication.
-- [ ] Health and retention understand every new durable state.
-- [ ] Shutdown/lease-loss/crash tests cover request initiation boundaries.
-- [ ] Full `bun run check:all` passes with unchanged required thresholds.
-- [ ] Final diff contains no credentials, production data, or unrelated user changes.
+- [x] Original existing-alias enqueue regression is green at the real ingestion/preparation seam.
+- [x] Known loop rows converge; no hardcoded item-specific repair exists.
+- [x] Admin edits freeze whole logical posts, including buffered/provisional edits.
+- [x] Stale generated-edit expectations cannot swallow manual restoration.
+- [x] Frozen valid posts still publish/renew unchanged and survive restart.
+- [x] Scheduled retries obey original deadlines, cancellation, atomic attempt association, and uncertainty evidence.
+- [x] Command middleware never waits for flood expiry to return.
+- [x] Retained responses/prompts/confirmations survive restart without repeating effects.
+- [x] Shared incidents have actual-delivery-aware warning/recovery transitions.
+- [x] Local deferrals do not become real Telegram incidents.
+- [x] No source cleanup failure can resend confirmed publication.
+- [x] Health and retention understand every new durable state.
+- [x] Shutdown/lease-loss/crash tests cover request initiation boundaries.
+- [x] Full `bun run check:all` passes with unchanged required thresholds.
+- [x] Final diff contains no credentials, production data, or unrelated user changes.
 
 The implementation task is complete only when the agreed behavior and all relevant failure/restart paths are implemented and verified. Writing a plan, adding schema, silencing the recovery text, or fixing only item #86 is not completion.
 

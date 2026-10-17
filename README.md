@@ -17,20 +17,24 @@ The database defaults to `./data/bot.sqlite`. It is WAL-backed and is intentiona
 
 - A new post is prepared in the queue channel before it can publish. The channel forward/copy choice is captured when the post is received: listed channel origins retain Telegram forwarding attribution; other channel origins are copied without attribution.
 - Identifiable-user posts are copied and receive one generated `by <alias or Telegram display name>` credit. Hidden-user names can have persistent aliases keyed by the exact forwarded sender name; they remain separate from user-ID aliases.
-- Preparation continues while scheduled publishing is paused. Nickname changes refresh only untouched generated credits; admin edits and removed/rewritten credits are preserved.
+- Preparation continues while scheduled publishing is paused. A queue-channel admin edit freezes the whole logical post, including its album members and separate credit; renewal and publication can carry it unchanged, and later nickname changes do not rewrite it.
+- Prepared legacy rows that lack reliable edit history are conservatively frozen during migration. Their visible content and credits are kept as stored, with automatic nickname refresh disabled.
 - Direct posts composed in the queue are copied without a byline.
 - Albums are collected briefly and count as one logical queue item. A separate generated credit remains part of that same logical item.
 - Scheduled and manual publish-next actions consider ready items in queue order, skip definite no-output failures within one bounded pass, and stop when a send may have produced output or Telegram reports a shared outage/access condition.
 - A source is deleted only after the complete destination output is recorded. Ambiguous sends stop for admin review; they are never silently retried.
+- A definitely rejected scheduled send can retry only until five minutes after its original slot. The deadline survives restart; pausing or a successful manual publication cancels the retry.
 - The Bot API retains unconsumed updates for at most 24 hours, so the process must be monitored. It cannot enumerate missed queue history.
 - `/queue` links each stable item number to its current queue-channel source; an album links to its first current member. The displayed queue age is total time since the item was first enqueued and does not reset on renewal. `/health` reports physical source age separately.
 - Ordinary Bot API deletion has a 48-hour age limit. At 36 hours, a sequential worker drains due renewals using conservative per-message pacing while SQLite keeps the immutable logical FIFO order. Renewals continue when scheduled publishing is paused and visibly move messages to the bottom of the private channel.
-- Renewal requires the complete replacement set before old sources are deleted. Uncertain or partial results preserve the originals for admin review. A Telegram flood wait is persisted as a shared cooldown across outbound mutations and survives restart.
+- Renewal requires the complete replacement set before old sources are deleted. Uncertain or partial results preserve the originals for admin review. A Telegram flood wait is persisted as a shared cooldown across outbound mutations and survives restart. Repeated waits stay in one incident; recovery is reported only after a delivered warning and confirmed recovery evidence.
 - Queue and destination IDs are numeric Telegram chat IDs. Publication slots are strict daily `HH:MM UTC` values, with at most 96 slots.
 
 ## Admin commands
 
 `/start` and `/manage` open the dashboard. The bot also supports `/queue`, `/schedule`, `/whitelist`, `/authors`, `/health`, `/recover`, and `/cancel`. Every command, text prompt, and callback requires the configured numeric admin ID and a private chat.
+
+Private replies and prompts are stored for delivery independently from command execution. Retrying a reply never replays the admin action, and ambiguous sends are retained for review rather than resent blindly.
 
 The recovery flow accepts a private queue-channel link or an ordered selection of message IDs. Unknown messages are recovered ready to publish as shown, preserving each member's forwarding mode without adding a credit or guessing an author. Append `--credit-last` when the final selected standalone text message is an explicit separate credit. Eligible recovered items can instead be sent through preparation with the **Apply preparation rules** action. Recovery is explicit: it cannot discover which posts were missed during downtime.
 

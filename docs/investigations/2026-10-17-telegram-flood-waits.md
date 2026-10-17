@@ -2,7 +2,7 @@
 
 Investigation date: 2026-10-17. Production snapshot: approximately 09:29 UTC / 11:29 Europe/Prague. Production and local HEAD both ran `9866e598b9076e816b088bd26014b0c2ec16ac97`.
 
-Status: causes reproduced, production evidence collected, and both design rounds answered. See the [agreed behavior and implementation outline](../telegram-reliability.md); final confirmation of shared understanding precedes application implementation. No application behavior, production data, service state, or Telegram messages were changed during this investigation.
+Status: historical production evidence and decision record. The local implementation was completed in checkpoints `049cc4b`, `dace0e2`, `bb95315`, `1f109c7`, `2a53996`, `0702856`, `2840155`, and `fc9d09e`. No production data, service state, or Telegram messages were changed as part of that work. The snapshot, event counts, and causes below describe the October 17 investigation window, not current production state.
 
 ## Confirmed cause
 
@@ -77,21 +77,15 @@ Production message metadata cannot prove whether #86 received an admin edit: gen
 
 Telegram's documented [text-edit](https://core.telegram.org/bots/api#editmessagetext) and [caption-edit](https://core.telegram.org/bots/api#editmessagecaption) parameters provide no expected content version or conditional edit. Consequently, a guard can prevent initiating future mutations after an observed admin edit; it cannot promise to revoke an already-initiated remote request. The collision policy must be explicit. Source renewal currently copies the current representation without text/caption edits and can preserve protected content unchanged.
 
-## Reproductions and controls
+## Reproductions and regression coverage
 
-Run from the repository root, without production credentials or network access:
+The original diagnostic probes were removed after tests covered the corrected behavior at the relevant service and repository seams. Run those regressions without production credentials or network access:
 
 ```sh
-bun scripts/diagnostics/nickname-refresh-loop.ts
-bun scripts/diagnostics/telegram-flood-waits.ts
-bun scripts/diagnostics/admin-edit-protection.ts
+bun test test/preparation.test.ts test/publisher.test.ts test/scheduler.test.ts test/admin-reliability.test.ts test/admin.test.ts test/operations.test.ts test/telegram-admission.test.ts test/recovery.test.ts test/migration.test.ts
 ```
 
-These are frozen diagnostic probes that assert the observed defects and their controls, not regression expectations for corrected behavior. A future fix should replace them with tests asserting the agreed behavior at the same seams.
-
-The original desired-behavior tests failed deterministically twice: an unseen warning still produced `Resolved`, an admin reply was rejected locally, and an expired publication retry left the item queued with a terminal failed occurrence. The combined run took approximately 0.06–0.15 seconds. The separate credit-refresh test failed its requirement that unchanged nicknames finish preparation.
-
-The existing preparation, cooldown, scheduler, and operations suites still pass: 42 tests and 163 assertions. They do not cover the preexisting-nickname enqueue case or the combined failure paths reproduced above. Both saved diagnostic scripts also ran successfully, confirming all observed defect signatures and their controls. No fix has been applied or validated.
+The focused reliability batch passed with 103 tests and 469 assertions; the admin suite passed with 32 tests and 182 assertions after the health view gained durable action counts. The full required repository gate is `bun run check:all`; its final result is recorded below after completion.
 
 Ranked explanations and distinguishing evidence:
 
@@ -123,7 +117,7 @@ Round two answered on 2026-10-17; all recommendations accepted:
 - **Q7: Retained reply semantics — accepted.** Replies survive restart; newer dashboard/health/queue requests supersede obsolete views, while distinct action confirmations remain separate.
 - **Q8: In-flight edit collision — accepted.** Stop automatic work and request review, without a bot rewrite; accepted admin edits block initiating further edits. An already-initiated Telegram request cannot be revoked; that transport boundary remains explicit.
 
-The refresh revision invariant itself is a correctness defect; its implementation must preserve nickname changes that occur during preparation and the permanent admin-edit rule. No application changes are being made before the interview reaches shared understanding.
+The refresh revision invariant was implemented together with enqueue revision capture, edit freezing, durable request evidence, and restart reconciliation. Telegram still offers no conditional edit API, so a request already initiated before an admin edit cannot be revoked; an observed collision remains review work rather than triggering a compensating rewrite.
 
 No unresolved product decisions remain. The accepted editorial-protection and bounded-retry decisions are recorded in ADRs 0006 and 0007. The glossary names credit refresh, publication occurrence, admin-edited messages, and frozen posts; storage revisions, notification thresholds, and retry policy do not belong in the glossary.
 
@@ -136,3 +130,20 @@ The Bot API's `retry_after` is the required wait before repeating a request foll
 ## Evidence handling
 
 Production evidence came from read-only service status, journal entries, and narrowly selected SQLite operational fields. Credentials, author identities, and post contents were excluded. The database was opened read-only. No live API probes were sent. The deployed SHA matches local code, so the isolated reproductions exercise the incident's implementation.
+
+## Local implementation verification
+
+The corrected regression coverage is in the normal test suite; the three standalone defect probes above were removed. The final local verification passed:
+
+- `bun run check:all` — passed.
+- 371 tests and 1,661 assertions passed.
+- Application line coverage: 91.39%; function coverage: 93.39%. The configured aggregate and per-file thresholds were unchanged.
+- Deployment activation/rollback/path-validation and SQLite backup suites passed.
+
+The implementation adds durable queue edit protection and request receipts, safe five-minute scheduled retries, shared Telegram pacing and incident tracking, and a persistent admin action/reply outbox. Migration 6 conservatively freezes prepared legacy rows whose edit history cannot be proven; stored visible credits remain as-is and automatic nickname refresh stops for those rows.
+
+Remaining platform and rollout limits:
+
+- Telegram provides no conditional edit API. A request already dispatched before an admin edit cannot be revoked; an observed collision stays in review and does not trigger a compensating rewrite.
+- The Bot API has no ordinary channel-message deletion update. The queue can learn about source deletion only when a normal operation next encounters that source.
+- No live Telegram compatibility probe, staging rollout, or production deployment was performed as part of the local implementation. Those remain separate operator acceptance steps in the deployment and compatibility runbooks.

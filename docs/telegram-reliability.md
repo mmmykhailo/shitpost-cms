@@ -1,8 +1,8 @@
 # Telegram reliability and admin control
 
-Decisions agreed on 2026-10-17 after the [production investigation](investigations/2026-10-17-telegram-flood-waits.md). Both interview rounds are answered. Final confirmation of shared understanding precedes application implementation. This document supersedes earlier preparation-plan language that allows nickname refresh after a body-only admin edit or leaves scheduled flood-wait retries undefined.
+Decisions agreed on 2026-10-17 after the [production investigation](investigations/2026-10-17-telegram-flood-waits.md). Both interview rounds are answered. This is the product decision authority and supersedes earlier preparation-plan language that allows nickname refresh after a body-only admin edit or leaves scheduled flood-wait retries undefined.
 
-The complete coding handoff is [the detailed implementation plan](telegram-reliability-implementation-plan.md), including migrations, interfaces, transaction boundaries, failure states, and regression checks. Writing that plan does not mean application changes have been implemented.
+The [detailed implementation plan](telegram-reliability-implementation-plan.md) records migrations, interfaces, transaction boundaries, failure states, regressions, and the completed local verification. No production rollout is implied.
 
 ## Agreed behavior
 

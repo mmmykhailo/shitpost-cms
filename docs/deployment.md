@@ -154,6 +154,27 @@ ssh -i ./administrator_key -o IdentitiesOnly=yes \
 
 The application database, WAL/SHM files, backups, environment file, and cache are never part of release cleanup.
 
-## 8. Enablement gate
+## 8. Telegram reliability schema rollout
+
+The application applies additive SQLite migrations 6–11 at startup. The normal release flow makes a pre-start backup before opening the database; verify that backup exists and keep the service single-instance. The migration adds editorial protection, scheduled retry/request evidence, shared Telegram admission and incident state, admin action receipts and reply outbox, prompt delivery state, and provisional edit/request evidence. Reapplying migrations is idempotent.
+
+Migration 6 protects prepared legacy rows whose old edit history cannot be proven. The row keeps its stored content and visible credit, but automatic nickname refresh is disabled. Raw legacy rows without evidence of preparation or editing keep their prior status. The migration does not reconstruct old content or infer who edited a message.
+
+Verify rollout using existing state only:
+
+1. Confirm systemd is active and `ready.json` names the expected full release SHA and process ID.
+2. In the configured admin's private chat, inspect `/health`. Check database status, shared pause, flood incident, scheduled retry, admin replies, admin actions, uncertain operation counts, and frozen-post counts. Nonzero pending or uncertain counts describe durable work and should be reviewed, not cleared by editing SQLite.
+3. If a database integrity/version check is needed, use a read-only connection and placeholders for local paths:
+
+   ```sh
+   DATABASE_PATH=/srv/shitpost-cms/data/bot.sqlite
+   sqlite3 -readonly "$DATABASE_PATH" 'PRAGMA integrity_check; SELECT MAX(version) FROM schema_migrations;'
+   ```
+
+4. Compare the freeze counts with the queue view and confirm a protected legacy post still displays its stored credit. Do not trigger test sends, edits, or callback actions against production as a rollout probe.
+
+These checks are observational. If readiness or database integrity fails, stop the rollout and follow the restore procedure; retain the pre-start backup and inspect durable uncertain work before resuming normal operations.
+
+## 9. Enablement gate
 
 Do not enable production scheduling merely because a workflow file exists. First close the P0/P1 findings in `IMPLEMENTATION_REVIEW.md`, complete and record the disposable real-Telegram checklist, raise the coverage gate to 90% for the deployment safety scope, and complete staging deploy/upgrade/forced-rollback/reboot/restore acceptance. Production should first be deployed paused, checked with `/health`, and resumed only after an explicit operator decision.

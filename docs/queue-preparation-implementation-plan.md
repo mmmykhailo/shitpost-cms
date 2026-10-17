@@ -1,8 +1,10 @@
-# Implementation plan: prepared Telegram queue and nicknames for hidden senders
+# Historical implementation plan: prepared Telegram queue and hidden-sender nicknames
+
+This is the original 2026-10-15 design handoff, not a statement of current implementation status. Its open implementation tasks have been superseded by the [2026-10-17 reliability decisions](telegram-reliability.md) and [reliability implementation plan](telegram-reliability-implementation-plan.md). In particular, the current rule freezes the whole logical post after any accepted admin edit.
 
 The [2026-10-17 reliability decisions](telegram-reliability.md) supersede this plan wherever it permits nickname refresh after an admin body edit or leaves flood-wait recovery, retained replies, and scheduled retries undefined. Any admin edit now freezes the whole logical post permanently.
 
-Status: implementation handoff, written 2026-10-15. This file is self-contained. It consolidates the product decisions from the interview and the code investigation. It describes future implementation; it does not claim that any of the code changes below already exist.
+Status: historical implementation handoff, written 2026-10-15. It consolidates the product decisions from the interview and code investigation as they stood then. Its task list is superseded by the reliability implementation plan; consult the latter for current behavior and verification.
 
 Audience: an implementing coding model that needs explicit scope, repository locations, interfaces, ordering, failure rules, and acceptance tests. Implement the entire plan when asked to implement it. Do not reopen settled product questions, introduce a second Telegram connection, or silently reduce the scope to nickname lookup alone.
 
