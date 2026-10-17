@@ -417,6 +417,193 @@ const migrations: readonly Migration[] = [
       `ALTER TABLE operation_outputs ADD COLUMN source_member_key TEXT`,
     ],
   },
+  {
+    version: 6,
+    statements: [
+      `ALTER TABLE queue_items ADD COLUMN editorial_frozen_at INTEGER`,
+      `ALTER TABLE queue_items ADD COLUMN editorial_freeze_reason TEXT CHECK (editorial_freeze_reason IN ('admin_edit','admin_delete','legacy_edit_evidence','legacy_unverified'))`,
+      `ALTER TABLE queue_items ADD COLUMN editorial_freeze_message_id INTEGER`,
+      `ALTER TABLE queue_items ADD COLUMN editorial_freeze_update_id INTEGER`,
+      `ALTER TABLE queue_items ADD COLUMN nickname_revision_wanted_key TEXT`,
+      `ALTER TABLE queue_items ADD COLUMN nickname_revision_applied_key TEXT`,
+      `ALTER TABLE pending_queue_updates ADD COLUMN unmatched_edit_at INTEGER`,
+      `ALTER TABLE pending_queue_updates ADD COLUMN unmatched_edit_update_id INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN request_state TEXT NOT NULL DEFAULT 'legacy' CHECK (request_state IN ('legacy','queued','in_flight','accepted','rejected','unknown'))`,
+      `ALTER TABLE queue_generated_events ADD COLUMN request_started_at INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN request_finished_at INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN observed_after_update_id INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN expected_edit_date INTEGER`,
+      `ALTER TABLE queue_generated_events ADD COLUMN valid_until INTEGER`,
+      `CREATE TEMP TABLE telegram_reliability_migration_timestamp (value INTEGER NOT NULL)`,
+      `INSERT INTO telegram_reliability_migration_timestamp (value) VALUES (unixepoch('now') * 1000)`,
+      `UPDATE queue_items SET nickname_revision_wanted_key = 'none', nickname_revision_applied_key = 'none'
+       WHERE json_extract(origin_json, '$.kind') NOT IN ('user','hidden_user')`,
+      `UPDATE queue_items
+       SET editorial_frozen_at = (SELECT value FROM telegram_reliability_migration_timestamp),
+           editorial_freeze_reason = 'legacy_edit_evidence'
+       WHERE status NOT IN ('done','deleted','deleted_external')
+         AND json_extract(attribution_json, '$.ownership') = 'admin'`,
+      `UPDATE queue_items
+       SET editorial_frozen_at = (SELECT value FROM telegram_reliability_migration_timestamp),
+           editorial_freeze_reason = 'legacy_edit_evidence',
+           editorial_freeze_message_id = (
+             SELECT p.telegram_message_id FROM pending_queue_updates p
+             JOIN queue_messages m ON m.queue_chat_id = p.queue_chat_id AND m.telegram_message_id = p.telegram_message_id
+             WHERE m.item_id = queue_items.id AND m.source_generation = queue_items.source_generation
+               AND m.removed_at IS NULL AND p.state = 'ingested' AND p.update_kind = 'edit'
+             ORDER BY COALESCE(p.telegram_update_id, 0) DESC, p.received_at DESC LIMIT 1
+           ),
+           editorial_freeze_update_id = (
+             SELECT p.telegram_update_id FROM pending_queue_updates p
+             JOIN queue_messages m ON m.queue_chat_id = p.queue_chat_id AND m.telegram_message_id = p.telegram_message_id
+             WHERE m.item_id = queue_items.id AND m.source_generation = queue_items.source_generation
+               AND m.removed_at IS NULL AND p.state = 'ingested' AND p.update_kind = 'edit'
+             ORDER BY COALESCE(p.telegram_update_id, 0) DESC, p.received_at DESC LIMIT 1
+           )
+       WHERE status NOT IN ('done','deleted','deleted_external') AND editorial_frozen_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM queue_messages m
+           JOIN pending_queue_updates p ON p.queue_chat_id = m.queue_chat_id AND p.telegram_message_id = m.telegram_message_id
+           WHERE m.item_id = queue_items.id AND m.source_generation = queue_items.source_generation
+             AND m.removed_at IS NULL AND p.state = 'ingested' AND p.update_kind = 'edit'
+         )`,
+      `UPDATE queue_items
+       SET editorial_frozen_at = (SELECT value FROM telegram_reliability_migration_timestamp),
+           editorial_freeze_reason = 'legacy_unverified'
+       WHERE status NOT IN ('done','deleted','deleted_external')
+         AND representation_kind = 'prepared' AND editorial_frozen_at IS NULL`,
+      `UPDATE queue_generated_events
+       SET state = 'obsolete'
+       WHERE event_kind = 'edit' AND state = 'pending'
+         AND ((operation_family = 'preparation' AND EXISTS (
+                SELECT 1 FROM queue_preparation_operations p
+                WHERE p.id = queue_generated_events.operation_id AND p.state IN ('done','failed')
+              )) OR (operation_family <> 'preparation' AND EXISTS (
+                SELECT 1 FROM operations o
+                WHERE o.id = queue_generated_events.operation_id AND o.state IN ('done','failed')
+              )))`,
+      `DROP TABLE telegram_reliability_migration_timestamp`,
+    ],
+  },
+  {
+    version: 7,
+    statements: [
+      `ALTER TABLE schedule_runs ADD COLUMN retry_not_before INTEGER`,
+      `ALTER TABLE schedule_runs ADD COLUMN retry_deadline_at INTEGER`,
+      `ALTER TABLE schedule_runs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0)`,
+      `ALTER TABLE schedule_runs ADD COLUMN claim_token TEXT`,
+      `ALTER TABLE schedule_runs ADD COLUMN claim_boot_id TEXT`,
+      `ALTER TABLE schedule_runs ADD COLUMN cancelled_at INTEGER`,
+      `ALTER TABLE schedule_runs ADD COLUMN cancel_reason TEXT`,
+      `UPDATE schedule_runs SET retry_deadline_at = occurrence_at + 300000 WHERE retry_deadline_at IS NULL`,
+      `CREATE INDEX schedule_runs_retry_due_idx ON schedule_runs(status, retry_not_before, retry_deadline_at)`,
+      `CREATE TABLE schedule_publication_attempts (
+        occurrence_at INTEGER NOT NULL,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+        operation_id TEXT NOT NULL UNIQUE,
+        item_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (occurrence_at, attempt_no),
+        FOREIGN KEY (occurrence_at) REFERENCES schedule_runs(occurrence_at),
+        FOREIGN KEY (operation_id) REFERENCES operations(id),
+        FOREIGN KEY (item_id) REFERENCES queue_items(id)
+      )`,
+      `ALTER TABLE operations ADD COLUMN request_evidence_version INTEGER NOT NULL DEFAULT 0 CHECK (request_evidence_version >= 0)`,
+      `CREATE TABLE operation_request_attempts (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        request_ordinal INTEGER NOT NULL CHECK (request_ordinal > 0),
+        method TEXT NOT NULL,
+        target_chat_id INTEGER NOT NULL,
+        step_key TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        state TEXT NOT NULL CHECK (state IN ('in_flight','accepted','rejected','unknown')),
+        error_kind TEXT,
+        known_output_ids_json TEXT,
+        UNIQUE (operation_id, request_ordinal),
+        FOREIGN KEY (operation_id) REFERENCES operations(id) ON DELETE CASCADE
+      )`,
+      `CREATE INDEX operation_request_attempts_operation_idx ON operation_request_attempts(operation_id, request_ordinal)`,
+    ],
+  },
+  {
+    version: 8,
+    statements: [
+      `CREATE TABLE telegram_admission_state (
+        scope_key TEXT PRIMARY KEY,
+        not_before INTEGER NOT NULL CHECK (not_before >= 0),
+        updated_at INTEGER NOT NULL
+      )`,
+      `CREATE TABLE telegram_incidents (
+        id TEXT PRIMARY KEY,
+        condition_key TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active','recovering','resolved')),
+        first_failure_at INTEGER NOT NULL,
+        last_failure_at INTEGER NOT NULL,
+        cooldown_until INTEGER NOT NULL,
+        quiet_until INTEGER NOT NULL,
+        last_relevant_success_at INTEGER,
+        action_required INTEGER NOT NULL DEFAULT 0 CHECK (action_required IN (0,1)),
+        warning_outbox_id TEXT,
+        warning_delivered_at INTEGER,
+        recovery_outbox_id TEXT,
+        recovery_delivered_at INTEGER,
+        resolved_at INTEGER
+      )`,
+      `CREATE UNIQUE INDEX telegram_incidents_open_condition_idx ON telegram_incidents(condition_key) WHERE state <> 'resolved'`,
+      `CREATE INDEX telegram_incidents_state_idx ON telegram_incidents(state, first_failure_at)`,
+    ],
+  },
+  {
+    version: 9,
+    statements: [
+      `CREATE TABLE admin_update_receipts (
+        update_id INTEGER PRIMARY KEY CHECK (update_id >= 0),
+        admin_id INTEGER NOT NULL,
+        action_kind TEXT NOT NULL,
+        action_payload_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('queued','running','applied','uncertain','rejected')),
+        boot_id TEXT,
+        claim_token TEXT,
+        operation_id TEXT,
+        result_json TEXT,
+        accepted_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`,
+      `CREATE INDEX admin_update_receipts_recovery_idx ON admin_update_receipts(state, updated_at)`,
+      `CREATE TABLE admin_response_outbox (
+        id TEXT PRIMARY KEY,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        update_id INTEGER,
+        response_ordinal INTEGER CHECK (response_ordinal IS NULL OR response_ordinal >= 0),
+        admin_chat_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('view','confirmation','prompt','warning','recovery','control')),
+        descriptor_version INTEGER NOT NULL DEFAULT 1 CHECK (descriptor_version > 0),
+        descriptor_json TEXT NOT NULL,
+        coalesce_key TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending','sending','sent','uncertain','failed','cancelled')),
+        created_at INTEGER NOT NULL,
+        next_attempt_at INTEGER NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        claim_token TEXT,
+        claim_boot_id TEXT,
+        lease_expires_at INTEGER,
+        request_started_at INTEGER,
+        telegram_message_id INTEGER CHECK (telegram_message_id IS NULL OR telegram_message_id > 0),
+        sent_at INTEGER,
+        last_error_kind TEXT,
+        last_error_description TEXT,
+        FOREIGN KEY (update_id) REFERENCES admin_update_receipts(update_id) ON DELETE SET NULL
+      )`,
+      `CREATE INDEX admin_response_outbox_due_idx ON admin_response_outbox(state, next_attempt_at, created_at)`,
+      `CREATE INDEX admin_response_outbox_coalesce_idx ON admin_response_outbox(coalesce_key, state, created_at)`,
+      `ALTER TABLE admin_prompts ADD COLUMN generation_id TEXT`,
+      `ALTER TABLE admin_prompts ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'active' CHECK (delivery_state IN ('pending','active'))`,
+      `ALTER TABLE admin_prompts ADD COLUMN delivery_outbox_id TEXT`,
+      `UPDATE admin_prompts SET generation_id = 'legacy:' || admin_id WHERE generation_id IS NULL`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

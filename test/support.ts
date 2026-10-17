@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDatabase, type AppDatabase } from "../src/db/database";
 import type { LogFields, Logger } from "../src/logger";
-import type { DeliveryMode } from "../src/types";
+import type { Clock, DeliveryMode } from "../src/types";
 
 export type TestDatabase = {
   directory: string;
@@ -27,6 +27,39 @@ export const createTestDatabase = (prefix = "queuebot-test"): TestDatabase => {
       database.close();
       rmSync(directory, { recursive: true, force: true });
     },
+  };
+};
+
+export type ControlledClock = Clock & {
+  advance(milliseconds: number): void;
+  flush(): Promise<void>;
+  pendingSleeps(): number[];
+};
+
+/** A manually advanced clock for races and continuous-worker tests. */
+export const createControlledClock = (initialTime: number): ControlledClock => {
+  if (!Number.isSafeInteger(initialTime) || initialTime < 0) throw new Error("Clock time must be a nonnegative safe integer");
+  let current = initialTime;
+  const sleepers: Array<{ deadline: number; resolve(): void }> = [];
+  return {
+    now: () => current,
+    sleep: (milliseconds) => new Promise<void>((resolve) => {
+      if (!Number.isFinite(milliseconds)) throw new Error("Sleep duration must be finite");
+      if (milliseconds <= 0) { resolve(); return; }
+      sleepers.push({ deadline: current + milliseconds, resolve });
+    }),
+    advance: (milliseconds) => {
+      if (!Number.isFinite(milliseconds) || milliseconds < 0) throw new Error("Clock advance must be a nonnegative finite number");
+      current += milliseconds;
+      for (let index = sleepers.length - 1; index >= 0; index -= 1) {
+        if (sleepers[index]!.deadline <= current) sleepers.splice(index, 1)[0]!.resolve();
+      }
+    },
+    flush: async () => {
+      // Drain a bounded chain of promise reactions without advancing simulated time.
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    },
+    pendingSleeps: () => sleepers.map((sleeper) => sleeper.deadline - current),
   };
 };
 

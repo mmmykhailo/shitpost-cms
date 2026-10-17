@@ -20,19 +20,35 @@ export const createDatabase = (path: string): AppDatabase => {
       // Best effort on platforms without POSIX permissions.
     }
     applyMigrations(raw);
+    let transactionDepth = 0;
+    let savepointSequence = 0;
     return {
       path,
       raw,
       close: () => raw.close(),
       transaction: <T>(work: () => T): T => {
-        raw.exec("BEGIN IMMEDIATE");
+        const outermost = transactionDepth === 0;
+        const savepoint = outermost ? undefined : `internal_${++savepointSequence}`;
+        raw.exec(outermost ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
+        transactionDepth += 1;
         try {
           const result = work();
-          raw.exec("COMMIT");
+          if ((typeof result === "object" && result !== null || typeof result === "function") && typeof (result as { then?: unknown }).then === "function") {
+            // Avoid an unhandled rejection when rejecting an accidentally async callback.
+            void Promise.resolve(result).catch(() => undefined);
+            throw new Error("Database transaction callbacks must finish synchronously");
+          }
+          raw.exec(outermost ? "COMMIT" : `RELEASE ${savepoint}`);
           return result;
         } catch (error) {
-          raw.exec("ROLLBACK");
+          if (outermost) raw.exec("ROLLBACK");
+          else {
+            raw.exec(`ROLLBACK TO ${savepoint}`);
+            raw.exec(`RELEASE ${savepoint}`);
+          }
           throw error;
+        } finally {
+          transactionDepth -= 1;
         }
       },
     };
