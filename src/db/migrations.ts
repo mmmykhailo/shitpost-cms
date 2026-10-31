@@ -639,6 +639,19 @@ const migrations: readonly Migration[] = [
       `CREATE INDEX preparation_request_attempts_operation_idx ON preparation_request_attempts(operation_id, request_ordinal)`,
     ],
   },
+  {
+    version: 12,
+    statements: [
+      `CREATE TABLE recent_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        level TEXT NOT NULL CHECK (level IN ('debug','info','warn','error')),
+        event TEXT NOT NULL,
+        fields_json TEXT NOT NULL
+      )`,
+      `CREATE INDEX recent_logs_at_idx ON recent_logs(at DESC, id DESC)`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

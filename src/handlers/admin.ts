@@ -14,7 +14,8 @@ import type { AdminUpdateRepository } from "../db/admin-update-repository";
 import type { OrphanRepository } from "../db/orphan-repository";
 import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { PreparationRepository } from "../db/preparation-repository";
-import type { AppConfig } from "../config";
+import type { RecentLogRepository } from "../db/recent-log-repository";
+import type { AppConfig, LogLevel } from "../config";
 import type { Logger } from "../logger";
 import type { TelegramGateway } from "../telegram";
 import type { PublicationOutcome, PublicationService } from "../services/publisher";
@@ -42,6 +43,7 @@ type AdminDeps = {
   recovery: RecoveryService;
   health: HealthService;
   logger: Logger;
+  recentLogs?: RecentLogRepository;
   operationTracker?: OperationTracker;
   now: () => number;
 };
@@ -173,7 +175,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     [await button(deps, "Queue", "queue"), await button(deps, "Publish next now", "publish")],
     [await button(deps, "Schedule", "schedule"), await button(deps, "Whitelist", "whitelist")],
     [await button(deps, "Author names", "authors"), await button(deps, "Health", "health")],
-    [await button(deps, "Safety review", "safety")],
+    [await button(deps, "Safety review", "safety"), await button(deps, "Logs", "logs")],
   ]);
 
   const sendDashboard = async (ctx: Context): Promise<void> => {
@@ -373,6 +375,42 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     await enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:hidden-author`);
   };
 
+  const sendLogs = async (ctx: Context, args = ""): Promise<void> => {
+    const parts = args.trim().split(/\s+/u).filter(Boolean);
+    let level: LogLevel | undefined;
+    if (["debug", "info", "warn", "error"].includes(parts[0] ?? "")) level = parts.shift() as LogLevel;
+    if (parts.length > 1 || (parts.length === 1 && (!/^[1-9]\d?$/u.test(parts[0]!) || Number(parts[0]) > 50))) {
+      enqueueReply(ctx, "Usage: /logs [debug|info|warn|error] [1–50]");
+      return;
+    }
+    const limit = parts.length ? Number(parts[0]) : 20;
+    const rows = deps.recentLogs?.recent({ ...(level === undefined ? {} : { level }), limit });
+    let text = "Recent logs · newest first · UTC";
+    if (rows === undefined) text += "\nLogs are unavailable.";
+    else if (rows.length === 0) text += "\nNo recent logs found.";
+    else {
+      const footer = "\nMore details omitted. Use /logs with a smaller count.";
+      let truncated = false;
+      const compact = (value: string, maximum: number): string => {
+        const clean = value.replace(/[\u0000-\u001F\u007F]/gu, " ");
+        if (clean.length <= maximum) return clean;
+        truncated = true;
+        const end = clean.charCodeAt(maximum - 2);
+        return clean.slice(0, maximum - (end >= 0xD800 && end <= 0xDBFF ? 2 : 1)) + "…";
+      };
+      for (const row of rows) {
+        const fields = Object.entries(row.fields).filter(([, value]) => value !== undefined);
+        const details = fields.slice(0, 6).map(([key, value]) => `${compact(key, 40)}=${compact(String(value), 100)}`).join(" · ");
+        if (fields.length > 6) truncated = true;
+        const line = `\n${new Date(row.at).toISOString()} ${row.level.toUpperCase()} ${compact(row.event, 120)}${details ? ` · ${details}` : ""}`;
+        if (text.length + line.length + footer.length > 3900) { truncated = true; break; }
+        text += line;
+      }
+      if (truncated) text += footer;
+    }
+    enqueueReply(ctx, text, { link_preview_options: { is_disabled: true }, reply_markup: keyboard([[button(deps, "Refresh", "logs")], [button(deps, "Back", "dashboard")]]) }, "view", `admin:${deps.config.adminUserId}:view:logs`);
+  };
+
   const sendHealth = async (ctx: Context): Promise<void> => {
     const health = deps.health.snapshot();
     const oldest = health.oldestPhysicalAgeMs === undefined ? "none" : formatAge(health.oldestPhysicalAgeMs);
@@ -534,6 +572,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         return sendHiddenAuthor(ctx, payload.hiddenAuthorId, "Hidden sender nickname removed.");
       }
       case "health": return sendHealth(ctx);
+      case "logs": return sendLogs(ctx);
       case "recovery_apply_preparation": {
         if (itemId === undefined) return enqueueReply(ctx, "Invalid recovered item.");
         const item = deps.queue.findItemById(itemId);
@@ -804,6 +843,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   command("whitelist", sendWhitelist);
   command("authors", sendAuthors);
   command("health", sendHealth);
+  command("logs", async (ctx) => sendLogs(ctx, ctx.message?.text?.replace(/^\/logs(?:@\w+)?(?:\s|$)/u, "") ?? ""));
   command("recover", async (ctx) => {
     await beginPrompt(ctx, {
       kind: "recover",
