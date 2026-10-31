@@ -11,6 +11,7 @@ import { createDatabase, type AppDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
 import { createAdminResponseRepository } from "./db/admin-response-repository";
 import { createRecentLogRepository } from "./db/recent-log-repository";
+import { createInstagramFeedbackRepository } from "./db/instagram-feedback-repository";
 import { createAdminUpdateRepository } from "./db/admin-update-repository";
 import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
@@ -34,6 +35,7 @@ import { createRenewalWorker } from "./services/renewal-worker";
 import { createPreparationService } from "./services/preparation";
 import { createInstagramDownloader, InstagramDownloadError } from "./services/instagram-downloader";
 import { createInstagramFeedback } from "./services/instagram-feedback";
+import { createInstagramFeedbackWorker } from "./services/instagram-feedback-worker";
 import { createPreparationWorker } from "./services/preparation-worker";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
@@ -126,6 +128,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const schedule = createScheduleRepository(database);
   const admin = createAdminRepository(database);
   const adminResponses = createAdminResponseRepository(database);
+  const instagramFeedbackRepository = createInstagramFeedbackRepository(database);
   const adminUpdates = createAdminUpdateRepository(database);
   const generated = createGeneratedMessageRepository(database);
   const generatedEvents = createGeneratedEventRepository(database);
@@ -166,6 +169,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const interruptedRuns = schedule.recoverInterruptedRuns(clock.now());
   if (interruptedRuns > 0) logger.warn("interrupted_schedule_runs_recovered", { count: interruptedRuns });
   const recoveredResponses = adminResponses.recover(clock.now(), bootId);
+  instagramFeedbackRepository.recover(clock.now(), bootId);
   if (recoveredResponses.requeued + recoveredResponses.uncertain > 0) logger.warn("admin_responses_recovered", recoveredResponses);
   const interruptedAdminUpdates = adminUpdates.markInterruptedUncertain(clock.now());
   if (interruptedAdminUpdates > 0) logger.warn("admin_updates_recovered_uncertain", { count: interruptedAdminUpdates });
@@ -317,7 +321,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     }
     return downloadInstagram(url, signal);
   };
-  const instagramFeedback = createInstagramFeedback({ queue, responses: adminResponses, adminUserId: Number(config.adminUserId), queueChannelId: config.queueChannelId, now: clock.now });
+  const instagramFeedback = createInstagramFeedback({ queue, feedback: instagramFeedbackRepository, adminUserId: Number(config.adminUserId), queueChannelId: config.queueChannelId, now: clock.now });
+  const instagramFeedbackWorker = createInstagramFeedbackWorker({ feedback: instagramFeedbackRepository, admin, gateway, clock, logger, bootId, cooldown: telegramCooldown, adminUserId: Number(config.adminUserId) });
   const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown, instagramDownloader, onInstagramProgress: instagramFeedback });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
   const publicationCoordinator = createPublicationCoordinator();
@@ -405,6 +410,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const startBackgroundWork = (): void => {
     supervisor.start("admin_actions", (signal) => adminActionWorker.run(signal));
     supervisor.start("admin_responses", (signal) => adminResponseWorker.run(signal));
+    supervisor.start("instagram_feedback", (signal) => instagramFeedbackWorker.run(signal));
     supervisor.start("telegram_incidents", async (signal) => {
       while (!signal.aborted && !stopped) {
         try { telegramIncidents.evaluate(clock.now()); }
@@ -499,6 +505,9 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
           if (category === undefined) continue;
           const key = `item_issue:${item.id}`;
           activeConditions.add(key);
+          // The editable import status already carries this exact failure and
+          // its review controls. Keep normal alerts as a delivery-failure fallback.
+          if (instagramFeedbackRepository.handlesIssue(item.id, item.contentVersion)) continue;
           const rawReason = item.lastError ?? item.lastErrorCode ?? category;
           const reason = rawReason.replace(/[\u0000-\u001F\u007F]/gu, " ").replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/giu, "<operation>").replace(/\s+/gu, " ").trim().slice(0, 700);
           const normalizedReason = reason.toLowerCase().replace(/\b\d{10,}\b/gu, "<id>").replace(/\b(?:operation|op)(?:\s+id)?\s*[:=]?\s*[^ ]+/giu, "operation <id>");

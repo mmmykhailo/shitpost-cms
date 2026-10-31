@@ -1,4 +1,4 @@
-import type { AdminResponseRepository } from "../db/admin-response-repository";
+import type { InstagramFeedbackRepository } from "../db/instagram-feedback-repository";
 import type { QueueRepository } from "../db/repositories";
 import { buildQueueMessageLink } from "../domain/telegram-message-link";
 import { sanitizeRecentLog } from "../logger";
@@ -13,7 +13,7 @@ export type InstagramProgress = {
 };
 
 export const createInstagramFeedback = (input: {
-  responses: AdminResponseRepository;
+  feedback: InstagramFeedbackRepository;
   queue: QueueRepository;
   adminUserId: number;
   queueChannelId: ChatId;
@@ -39,18 +39,16 @@ export const createInstagramFeedback = (input: {
     ...(progress.retryAt === undefined ? [] : [`Retry at ${new Date(progress.retryAt).toISOString()} (UTC).`]),
     ...(sourceLink === undefined ? [] : [`Queue source: ${sourceLink}`]),
   ].join("\n");
-  input.responses.enqueue({
+  input.feedback.update({
+    itemId: progress.itemId,
     adminChatId: input.adminUserId,
-    kind: "view",
-    dedupeKey: `instagram-progress:${progress.operationId}:${progress.phase}`,
-    coalesceKey: `instagram-progress:${progress.itemId}`,
-    descriptor: {
-      version: 1, text, disableLinkPreview: true,
-      replyMarkup: { kind: "inline_keyboard", rows: [[
+    operationId: progress.operationId,
+    phase: progress.phase,
+    text,
+    replyMarkup: { kind: "inline_keyboard", rows: [[
         ...(item === undefined ? [] : [{ text: "Queue item", action: "queue_item", payload: { itemId: item.id }, itemVersion: item.contentVersion }]),
         { text: "Logs", action: "logs", payload: {} },
       ]] },
-    },
     now: input.now(),
   });
 };

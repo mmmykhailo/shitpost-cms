@@ -64,6 +64,7 @@ export type ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyb
 export type AdminMessageInput = SendTextInput & { replyMarkup?: ReplyMarkup; linkPreviewIsDisabled?: boolean };
 
 export type EditAdminMessageInput = {
+  linkPreviewIsDisabled?: boolean;
   chatId: ChatId;
   messageId: MessageId;
   text: string;
@@ -240,8 +241,9 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
   };
 
   const editAdminMessage = async (input: EditAdminMessageInput): Promise<void> => {
-    const options: { reply_markup?: InlineKeyboardMarkup } = {};
+    const options: { reply_markup?: InlineKeyboardMarkup; link_preview_options?: { is_disabled: boolean } } = {};
     if (input.replyMarkup !== undefined) options.reply_markup = input.replyMarkup;
+    if (input.linkPreviewIsDisabled !== undefined) options.link_preview_options = { is_disabled: input.linkPreviewIsDisabled };
     await call("editMessageText", () => api.editMessageText(input.chatId, input.messageId, input.text, options));
   };
 
