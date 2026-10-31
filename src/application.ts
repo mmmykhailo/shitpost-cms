@@ -6,10 +6,11 @@ import { parseConfig, type AppConfig } from "./config";
 import { classifyTelegramError } from "./errors";
 import { buildQueueMessageLink } from "./domain/telegram-message-link";
 import { fingerprintSnapshotContent } from "./domain/message";
-import { createLogger, safeErrorDescription, type Logger } from "./logger";
+import { createLogger, safeErrorDescription, withRecentLogs, type Logger } from "./logger";
 import { createDatabase, type AppDatabase } from "./db/database";
 import { createAdminRepository } from "./db/admin-repository";
 import { createAdminResponseRepository } from "./db/admin-response-repository";
+import { createRecentLogRepository } from "./db/recent-log-repository";
 import { createAdminUpdateRepository } from "./db/admin-update-repository";
 import { createAlertRepository } from "./db/alert-repository";
 import { createGeneratedMessageRepository, createPolicyRepository, createQueueRepository, createScheduleRepository } from "./db/repositories";
@@ -32,6 +33,7 @@ import { createRenewalService } from "./services/renewal";
 import { createRenewalWorker } from "./services/renewal-worker";
 import { createPreparationService } from "./services/preparation";
 import { createInstagramDownloader, InstagramDownloadError } from "./services/instagram-downloader";
+import { createInstagramFeedback } from "./services/instagram-feedback";
 import { createPreparationWorker } from "./services/preparation-worker";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
@@ -112,9 +114,11 @@ export const waitForShutdownStage = async (
 export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const processLike = options.process ?? process;
   const config = options.config ?? parseConfig();
-  const logger = options.logger ?? createLogger(config.logLevel);
+  const baseLogger = options.logger ?? createLogger(config.logLevel);
   const database = options.database ?? (options.databaseFactory ?? createDatabase)(config.databasePath);
   const clock = options.clock ?? systemClock;
+  const recentLogs = createRecentLogRepository(database);
+  const logger = withRecentLogs(baseLogger, (level, event, fields) => recentLogs.append({ at: clock.now(), level, event, fields }), config.logLevel);
   const bootId = options.bootId ?? randomUUID();
   const bootStartedAt = clock.now();
   const queue = createQueueRepository(database, { bootId });
@@ -313,7 +317,8 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     }
     return downloadInstagram(url, signal);
   };
-  const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown, instagramDownloader });
+  const instagramFeedback = createInstagramFeedback({ queue, responses: adminResponses, adminUserId: Number(config.adminUserId), queueChannelId: config.queueChannelId, now: clock.now });
+  const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown, instagramDownloader, onInstagramProgress: instagramFeedback });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
   const publicationCoordinator = createPublicationCoordinator();
   const publisher = createPublicationService({
@@ -352,6 +357,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
       { command: "whitelist", description: "Manage channel whitelist" },
       { command: "authors", description: "Manage author aliases" },
       { command: "health", description: "Show health" },
+      { command: "logs", description: "View recent bot logs" },
       { command: "recover", description: "Recover an explicit queue message" },
       { command: "cancel", description: "Cancel the current prompt" },
     ], { scope: { type: "chat", chat_id: config.adminUserId } }),
@@ -371,6 +377,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const backup = createBackupService({ database, directory: join(config.dataDirectory, "backups"), logger, now: clock.now });
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
   registerAdminHandlers(bot, {
+    recentLogs,
     config,
     queue,
     policy,

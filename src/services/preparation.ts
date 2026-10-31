@@ -5,6 +5,7 @@ import { classifyPublicationPlan, isInlineCaptionContent, isSeparateBylineConten
 import { fingerprintSnapshotContent, snapshotFromMessage } from "../domain/message";
 import { parseInstagramReel } from "../domain/instagram-reel";
 import { InstagramDownloadError, type InstagramDownloader } from "./instagram-downloader";
+import type { InstagramProgress } from "./instagram-feedback";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
 import type { PreparationRepository } from "../db/preparation-repository";
 import type { PreparationRequestRepository } from "../db/preparation-request-repository";
@@ -61,6 +62,7 @@ const canonicalEditPayload = (snapshot: StoredMessageSnapshot, edit: "text" | "c
 export type PreparationService = ReturnType<typeof createPreparationService>;
 
 export const createPreparationService = (input: {
+  onInstagramProgress?: (progress: InstagramProgress) => void;
   instagramDownloader?: InstagramDownloader;
   queue: QueueRepository;
   preparation: PreparationRepository;
@@ -352,15 +354,26 @@ export const createPreparationService = (input: {
     const knownOutputIds: MessageId[] = [];
     let mutationMayHaveStarted = false;
     let guard = claim.guard;
+    let importingInstagram = false;
+    const report = (phase: InstagramProgress["phase"], details: { reason?: string; retryAt?: number } = {}): void => {
+      if (!importingInstagram) return;
+      const progress = { itemId: claim.itemId, operationId: claim.operationId, phase, ...details };
+      const level = phase === "failed" || phase === "uncertain" ? "error" : phase === "retry" || phase === "cancelled" ? "warn" : "info";
+      input.logger[level](`instagram_import_${phase}`, progress);
+      try { input.onInstagramProgress?.(progress); }
+      catch { input.logger.warn("instagram_feedback_enqueue_failed", { itemId: claim.itemId, operationId: claim.operationId }); }
+    };
     try {
       let item = input.queue.findItemById(claim.itemId);
       if (!item) throw new Error("Claimed preparation item disappeared");
       const members = input.queue.getCapturedMembers(item.id, claim.guard.capturedSourceGeneration, claim.sourceIds);
       if (members.length === 0) throw new Error("Claimed preparation source set is empty");
       if (claim.kind === "prepare" && members.length === 1 && members[0]!.snapshot.instagramReel) {
+        importingInstagram = true;
         const source = members[0]!;
         const fail = (status: "blocked" | "needs_edit" | "needs_review", code: string, description: string): PreparationOutcome => {
           input.preparation.markFailed(claim.operationId, status, code, description, input.clock.now());
+          report("failed", { reason: description });
           return { kind: "blocked", itemId: item!.id, status, reason: code, operationId: claim.operationId };
         };
         const reel = parseInstagramReel(source.snapshot.text ?? "", source.snapshot.entities);
@@ -394,6 +407,7 @@ export const createPreparationService = (input: {
           }, input.clock.now());
           let downloaded: Awaited<ReturnType<InstagramDownloader>>;
           try {
+            report("downloading");
             downloaded = await input.instagramDownloader(reel.url, signal);
           } catch (error) {
             if (signal?.aborted) throw new TelegramLocalDeferralError("protection_changed", input.clock.now(), "Reel download interrupted by shutdown");
@@ -402,6 +416,7 @@ export const createPreparationService = (input: {
             if (failure.retryable && attempts < 2) {
               const retry = input.clock.now() + Math.max(attempts === 0 ? 60_000 : 300_000, failure.retryAfterMs ?? 0);
               input.preparation.scheduleRetry(claim.operationId, retry, "instagram_transient", failure.message, input.clock.now());
+              report("retry", { reason: failure.message, retryAt: retry });
               return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
             }
             return fail("blocked", failure.code, failure.message);
@@ -414,12 +429,14 @@ export const createPreparationService = (input: {
                 assertDispatchable(claim);
                 input.preparation.setPhase(claim.operationId, "transfer_pending", input.clock.now());
                 mutationMayHaveStarted = true;
+                report("uploading");
               }, work: () => input.gateway.sendVideo!({ chatId: input.queueChannelId, path: downloaded.path, caption, captionEntities, supportsStreaming: downloaded.supportsStreaming, disableNotification: true, ...(signal === undefined ? {} : { signal }) }) });
             } catch (error) {
               const normalized = classifyTelegramError(error, "sendVideo");
               if (normalized.kind === "rate_limited") {
                 const retry = retryAt(normalized, input.clock.now());
                 input.preparation.scheduleRetry(claim.operationId, retry, normalized.kind, normalized.description, input.clock.now());
+                report("retry", { reason: normalized.description, retryAt: retry });
                 return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
               }
               if (["permission_denied", "destination_unavailable", "unsupported_content", "invalid_content_or_entities", "content_protected", "unknown_permanent"].includes(normalized.kind)) return fail("blocked", normalized.kind, normalized.description);
@@ -437,6 +454,7 @@ export const createPreparationService = (input: {
             try { await runRequest({ operationId: claim.operationId, itemId: item.id, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "old-sources", work: () => input.gateway.deleteMessages(input.queueChannelId, installed.oldSourceIds) }); }
             catch (error) { const normalized = classifyTelegramError(error, "deleteMessages"); if (normalized.kind !== "source_missing") cleanupError = normalized.description; }
             input.preparation.finishCleanup(claim.operationId, input.clock.now(), cleanupError);
+            report("ready", cleanupError === undefined ? {} : { reason: "Video is ready. Cleanup of the original queue message will be retried." });
             return { kind: "prepared", itemId: item.id, preparationState: installed.preparationState, operationId: claim.operationId };
           } finally {
             await downloaded.cleanup().catch(() => input.logger.warn("instagram_temp_cleanup_failed", { itemId: item!.id }));
@@ -744,30 +762,36 @@ export const createPreparationService = (input: {
         const current = input.queue.findItemById(claim.itemId);
         if (!current || current.preparationOperationId !== claim.operationId || current.contentVersion !== guard.expectedContentVersion || current.sourceGeneration !== guard.capturedSourceGeneration) {
           // An edit/deletion owns the new state. Preserve its collision evidence.
+          report(current?.preparationState === "uncertain" ? "uncertain" : "cancelled");
           return { kind: "blocked", itemId: claim.itemId, status: current?.status ?? "needs_review", reason: "protection_changed", operationId: claim.operationId };
         }
         if (knownOutputIds.length > 0) {
           if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
             input.preparation.markUncertain(claim.operationId, "local_deferral_after_output", "Preparation outputs could not be removed after local Telegram deferral", input.clock.now());
+            report("uncertain", { reason: "Preparation outputs could not be removed after local Telegram deferral." });
             return { kind: "uncertain", itemId: claim.itemId, operationId: claim.operationId };
           }
         } else if (mutationMayHaveStarted) {
           input.preparation.markUncertain(claim.operationId, "local_deferral_after_request", normalized.description, input.clock.now());
+          report("uncertain", { reason: normalized.description });
           return { kind: "uncertain", itemId: claim.itemId, operationId: claim.operationId };
         }
         const retry = retryAt(normalized, input.clock.now());
         input.preparation.scheduleRetry(claim.operationId, retry, "local_deferral", normalized.description, input.clock.now());
         if (normalized.localDeferralReason === "protection_changed") input.preparation.markPreparationNeeded(claim.itemId, claim.kind === "refresh" ? "refresh" : "initial", input.clock.now());
+        report("retry", { reason: normalized.description, retryAt: retry });
         return { kind: "retry_scheduled", itemId: claim.itemId, retryAt: retry, operationId: claim.operationId };
       }
       input.logger.error("preparation_failed", { itemId: claim.itemId, operationId: claim.operationId, kind: normalized.kind, error: normalized.description });
       if (!mutationMayHaveStarted) {
         try { input.preparation.markFailed(claim.operationId, "needs_review", normalized.kind, normalized.description, input.clock.now()); }
         catch { /* Keep an already transitioned operation as the durable owner. */ }
+        report("failed", { reason: normalized.description });
         return { kind: "blocked", itemId: claim.itemId, status: "needs_review", reason: normalized.kind, operationId: claim.operationId };
       }
       try { input.preparation.markUncertain(claim.operationId, normalized.kind, normalized.description, input.clock.now()); }
       catch { /* Preserve the first durable owner/state if reconciliation already changed it. */ }
+      report("uncertain", { reason: normalized.description });
       return { kind: "uncertain", itemId: claim.itemId, operationId: claim.operationId };
     } finally {
       done?.();

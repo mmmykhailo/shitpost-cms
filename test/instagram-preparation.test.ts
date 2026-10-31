@@ -6,6 +6,7 @@ import { createPreparationRepository } from "../src/db/preparation-repository";
 import { createPreparationRequestRepository } from "../src/db/preparation-request-repository";
 import { createPolicyRepository, createQueueRepository } from "../src/db/repositories";
 import { createPreparationService } from "../src/services/preparation";
+import type { InstagramProgress } from "../src/services/instagram-feedback";
 import { InstagramDownloadError, type InstagramDownloader } from "../src/services/instagram-downloader";
 import type { TelegramGateway } from "../src/telegram";
 import { asChatId, asMessageId, asUserId, type MessageEntity, type StoredMessageSnapshot } from "../src/types";
@@ -64,7 +65,7 @@ const makeDownloader = () => {
   return { download, calls, get cleanups() { return cleanups; } };
 };
 
-const serviceFor = (h: ReturnType<typeof open>, gateway: TelegramGateway, download: InstagramDownloader, options: { clock?: ReturnType<typeof createFakeClock>; cooldown?: TelegramCooldown } = {}) => createPreparationService({
+const serviceFor = (h: ReturnType<typeof open>, gateway: TelegramGateway, download: InstagramDownloader, options: { clock?: ReturnType<typeof createFakeClock>; cooldown?: TelegramCooldown; onInstagramProgress?: (progress: InstagramProgress) => void } = {}) => createPreparationService({
   queue: h.queue, policy: h.policy, preparation: h.preparation, requestEvidence: h.requestEvidence,
   gateway, queueChannelId: asChatId(-100), bootId: "reels-test", clock: createFakeClock(NOW),
   logger: createLoggerSpy().logger, instagramDownloader: download, ...options,
@@ -76,6 +77,52 @@ const enqueue = (h: ReturnType<typeof open>, snapshot = reelSnapshot(), mode: "c
 };
 
 describe("Instagram Reel preparation", () => {
+  test("reports download, upload and prepared stages in order without claiming publication", async () => {
+    const h = open(); enqueue(h);
+    const progress: InstagramProgress[] = [];
+    expect((await serviceFor(h, makeGateway().gateway, makeDownloader().download, { onInstagramProgress: (event) => progress.push(event) }).prepareNext()).kind).toBe("prepared");
+    expect(progress.map((event) => event.phase)).toEqual(["downloading", "uploading", "ready"]);
+    expect(progress.every((event) => event.itemId === 1 && event.operationId === "reel-prep-1")).toBe(true);
+  });
+
+  test("reports retries and terminal failures while retaining the original source", async () => {
+    const h = open(); enqueue(h);
+    const progress: InstagramProgress[] = [];
+    const download: InstagramDownloader = async () => { throw new InstagramDownloadError("limited", "Instagram is temporarily unavailable", true); };
+    const outcome = await serviceFor(h, makeGateway().gateway, download, { onInstagramProgress: (event) => progress.push(event) }).prepareNext();
+    expect(outcome.kind).toBe("retry_scheduled");
+    expect(progress.map((event) => event.phase)).toEqual(["downloading", "retry"]);
+    expect(progress[1]?.retryAt).toBe(NOW + 60_000);
+    expect(h.queue.currentSourceIds(1)).toEqual([asMessageId(100)]);
+    const failed = open(); enqueue(failed);
+    const events: InstagramProgress[] = [];
+    const permanent: InstagramDownloader = async () => { throw new InstagramDownloadError("inaccessible", "This video is inaccessible"); };
+    expect((await serviceFor(failed, makeGateway().gateway, permanent, { onInstagramProgress: (event) => events.push(event) }).prepareNext()).kind).toBe("blocked");
+    expect(events.map((event) => event.phase)).toEqual(["downloading", "failed"]);
+    expect(events[1]?.reason).toBe("This video is inaccessible");
+  });
+
+  test("reports ambiguous uploads as uncertain and isolates notification failures", async () => {
+    const h = open(); enqueue(h);
+    const progress: InstagramProgress[] = [];
+    const fake = makeGateway();
+    fake.gateway.sendVideo = async () => { throw { kind: "transient_network", description: "Upload response lost" }; };
+    expect((await serviceFor(h, fake.gateway, makeDownloader().download, { onInstagramProgress: (event) => progress.push(event) }).prepareNext()).kind).toBe("uncertain");
+    expect(progress.map((event) => event.phase)).toEqual(["downloading", "uploading", "uncertain"]);
+    const second = open(); enqueue(second);
+    expect((await serviceFor(second, makeGateway().gateway, makeDownloader().download, { onInstagramProgress: () => { throw new Error("outbox unavailable"); } }).prepareNext()).kind).toBe("prepared");
+    expect(second.queue.findItemById(1)?.preparationState).toBe("ready");
+  });
+
+  test("reports invalid input before downloading", async () => {
+    const h = open(); enqueue(h, reelSnapshot({ text: `${REEL} https://www.instagram.com/reel/OTHER/` }));
+    const progress: InstagramProgress[] = [];
+    const downloader = makeDownloader();
+    expect((await serviceFor(h, makeGateway().gateway, downloader.download, { onInstagramProgress: (event) => progress.push(event) }).prepareNext()).kind).toBe("blocked");
+    expect(progress.map((event) => event.phase)).toEqual(["failed"]);
+    expect(downloader.calls).toHaveLength(0);
+  });
+
   test("uploads the video with Telegram description and formatting, strips the URL, and installs a copy with user credit", async () => {
     const h = open();
     enqueue(h, reelSnapshot({ text: `😀 Description\n${REEL}`, entities: [{ type: "bold", offset: 3, length: 11 }, { type: "url", offset: 15, length: REEL.length }] }));
