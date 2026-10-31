@@ -59,7 +59,13 @@ function resolvePayload(payload: unknown, shortcode: string): { url: string; req
     if (Array.isArray(current)) { for (const child of current) pending.push(child); continue; }
     if (!object(current)) continue;
     if (current.shortcode === shortcode || current.code === shortcode) {
-      if (current.is_video === false) return fail('unsupported_media', 'The Instagram post is not a video.');
+      if (current.__typename === 'GraphSidecar' || current.media_type === 8 || Array.isArray(current.carousel_media)
+        || object(current.edge_sidecar_to_children) && Array.isArray(current.edge_sidecar_to_children.edges)) {
+        return fail('unsupported_media', 'Instagram carousel posts are not supported. Send a single-video post or upload the video manually.');
+      }
+      if (current.is_video === false || current.__typename === 'GraphImage' || current.media_type === 1) {
+        return fail('unsupported_media', 'The Instagram post is a photo, not a video. Send a single-video post.');
+      }
       let url = typeof current.video_url === 'string' ? current.video_url : undefined;
       if (!url && Array.isArray(current.video_versions)) {
         const versions = current.video_versions.filter((entry): entry is JsonObject => object(entry) && typeof entry.url === 'string');
@@ -343,8 +349,8 @@ export function createInstagramDownloader(options: { directory: string; cookie?:
       await previous;
       controller.signal.throwIfAborted();
       const canonical = approvedUrl(raw, false);
-      const match = /^\/reel\/([A-Za-z0-9_-]+)\/$/.exec(canonical.pathname);
-      if (!match || canonical.search || canonical.hash) return fail('invalid_url', 'Submit a canonical Instagram Reel URL.');
+      const match = /^\/(?:reel|p)\/([A-Za-z0-9_-]+)\/$/.exec(canonical.pathname);
+      if (!match || canonical.search || canonical.hash) return fail('invalid_url', 'Submit a canonical Instagram Reel or /p/ video URL.');
       const request = async (initial: URL, media: boolean): Promise<Response> => {
         let target = initial;
         for (let redirects = 0; redirects <= 3; redirects++) {
@@ -369,7 +375,7 @@ export function createInstagramDownloader(options: { directory: string; cookie?:
               const retryAfterMs = retry && Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Number.isFinite(retryDate) ? Math.max(0, retryDate - Date.now()) : undefined;
               throw new InstagramDownloadError('rate_limited', 'Instagram is rate limiting downloads. Retry later.', true, retryAfterMs);
             }
-            throw new InstagramDownloadError(response.status >= 500 ? 'upstream_error' : 'inaccessible', 'Instagram could not provide this Reel.', response.status >= 500);
+            throw new InstagramDownloadError(response.status >= 500 ? 'upstream_error' : 'inaccessible', 'Instagram could not provide this video post.', response.status >= 500);
           }
           return response;
         }

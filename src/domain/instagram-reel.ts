@@ -21,18 +21,18 @@ function validEntity(text: string, entity: MessageEntity): boolean {
 function reelUrl(value: string): string | false | undefined {
   let url: URL;
   try { url = new URL(value); } catch {
-    return /^[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[^/@]*@)?(?:www\.)?instagram\.com(?::[^/]*)?\/reels?(?:\/|$)/iu.test(value) ? false : undefined;
+    return /^[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[^/@]*@)?(?:www\.)?instagram\.com(?::[^/]*)?\/(?:reels?|p)(?:\/|$)/iu.test(value) ? false : undefined;
   }
   if (url.hostname !== "instagram.com" && url.hostname !== "www.instagram.com") return undefined;
   const literalPath = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]+(\/[^?#]*)/u.exec(value)?.[1];
-  if (!/^\/reels?(?:\/|$)/u.test(url.pathname) && !/^\/reels?(?:\/|$)/u.test(literalPath ?? "")) return undefined;
+  if (!/^\/(?:reels?|p)(?:\/|$)/u.test(url.pathname) && !/^\/(?:reels?|p)(?:\/|$)/u.test(literalPath ?? "")) return undefined;
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password || url.port) return false;
   // Validate the literal path as well: URL normalizes dot segments and backslashes.
-  const path = /^\/reels?\/([A-Za-z0-9_-]+)\/?$/u.exec(literalPath ?? "");
-  return path ? `https://www.instagram.com/reel/${path[1]}/` : false;
+  const path = /^\/(reels?|p)\/([A-Za-z0-9_-]+)\/?$/u.exec(literalPath ?? "");
+  return path ? `https://www.instagram.com/${path[1] === "p" ? "p" : "reel"}/${path[2]}/` : false;
 }
 
-/** Detect a single Reel and preserve only the Telegram-authored caption (UTF-16 offsets). */
+/** Detect a single Reel or video post and preserve only the Telegram-authored caption (UTF-16 offsets). */
 export function parseInstagramReel(text: string, entities: readonly MessageEntity[] = []): InstagramReelInput | undefined {
   const valid = entities.filter((entity) => validEntity(text, entity));
   const links: Link[] = [];
@@ -52,11 +52,11 @@ export function parseInstagramReel(text: string, entities: readonly MessageEntit
   const urls = new Set<string>();
   for (const link of links) {
     const url = reelUrl(link.url);
-    if (url === false) return { kind: "invalid", reason: "Invalid Instagram Reel URL. Use /reel/<shortcode>/ or /reels/<shortcode>/." };
+    if (url === false) return { kind: "invalid", reason: "Invalid Instagram video URL. Use /reel/<shortcode>/, /reels/<shortcode>/ or /p/<shortcode>/." };
     if (url) { urls.add(url); selected.push(link); }
   }
   if (urls.size === 0) return undefined;
-  if (urls.size > 1) return { kind: "invalid", reason: "Submit one Instagram Reel per message." };
+  if (urls.size > 1) return { kind: "invalid", reason: "Submit one Instagram video link per message." };
 
   const deleted = new Uint8Array(text.length);
   const unlinked = new Set(selected.flatMap((link) => link.entity ? [link.entity] : []));

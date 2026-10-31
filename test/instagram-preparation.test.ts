@@ -77,6 +77,16 @@ const enqueue = (h: ReturnType<typeof open>, snapshot = reelSnapshot(), mode: "c
 };
 
 describe("Instagram Reel preparation", () => {
+  test("imports a /p/ video link with its Telegram description and normal user byline", async () => {
+    const h = open();
+    enqueue(h, reelSnapshot({ text: "My description\nhttps://www.instagram.com/p/Deu_SjmxMEi/?igsh=tracking" }));
+    const fake = makeGateway(); const downloader = makeDownloader();
+    expect((await serviceFor(h, fake.gateway, downloader.download).prepareNext()).kind).toBe("prepared");
+    expect(downloader.calls).toEqual(["https://www.instagram.com/p/Deu_SjmxMEi/"]);
+    expect(fake.uploads[0]?.caption).toBe("My description\n\nby Alice Example");
+    expect(h.queue.findItemById(1)).toMatchObject({ preparationState: "ready", contentType: "video" });
+  });
+
   test("reports download, upload and prepared stages in order without claiming publication", async () => {
     const h = open(); enqueue(h);
     const progress: InstagramProgress[] = [];

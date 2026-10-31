@@ -64,6 +64,43 @@ describe('native Instagram downloader', () => {
     await output.cleanup(); await output.cleanup();
     expect(await readdir(directory)).toEqual([]);
   }));
+  test('downloads a single-video /p/ post using its original path and exact shortcode', () => setup(async directory => {
+    const post = 'https://www.instagram.com/p/Deu_SjmxMEi/';
+    const requests: string[] = [];
+    const media = fixture();
+    const fake = (async (input: string | URL | Request) => {
+      requests.push(String(input));
+      return String(input).includes('cdninstagram') ? new Response(Uint8Array.from(media)) : Response.json({ items: [{ code: 'unrelated', video_url: 'https://evil.example/x' }, { code: 'Deu_SjmxMEi', media_type: 2, is_video: true, video_url: cdn }] });
+    }) as unknown as typeof fetch;
+    const output = await createInstagramDownloader({ directory, fetch: fake })(post);
+    expect(requests).toEqual([post, cdn]);
+    expect(Array.from(await readFile(output.path))).toEqual(Array.from(media));
+    await output.cleanup();
+  }));
+  test.each([
+    { __typename: 'GraphSidecar', is_video: true, video_url: cdn },
+    { media_type: 8, carousel_media: [{ shortcode: 'ABC_12', video_url: cdn }] },
+    { carousel_media: [{ shortcode: 'ABC_12', video_url: cdn }] },
+    { edge_sidecar_to_children: { edges: [{ node: { shortcode: 'ABC_12', video_url: cdn } }] } },
+  ])('rejects a carousel before selecting its child video: %j', payload => setup(async directory => {
+    let requests = 0;
+    const fake = (async () => { requests++; return Response.json({ shortcode: 'ABC_12', ...payload }); }) as unknown as typeof fetch;
+    try {
+      await createInstagramDownloader({ directory, fetch: fake })('https://www.instagram.com/p/ABC_12/');
+      throw new Error('expected carousel rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(InstagramDownloadError);
+      expect((error as InstagramDownloadError).code).toBe('unsupported_media');
+      expect((error as Error).message).toContain('carousel');
+    }
+    expect(requests).toBe(1);
+    expect(await readdir(directory)).toEqual([]);
+  }));
+  test.each([{ __typename: 'GraphImage' }, { media_type: 1 }, { is_video: false }])('rejects a /p/ photo explicitly: %j', payload => setup(async directory => {
+    const download = createInstagramDownloader({ directory, fetch: responder(fixture(), { shortcode: 'ABC_12', video_url: cdn, ...payload }) });
+    await expect(download('https://www.instagram.com/p/ABC_12/')).rejects.toThrow('photo, not a video');
+    expect(await readdir(directory)).toEqual([]);
+  }));
   test('supports JSON hydration scripts and video_versions, without sending cookies to CDN', () => setup(async directory => {
     const requests: { url: string; cookie: string | null }[] = [];
     const fake = (async (input: string | URL | Request, init?: RequestInit) => {

@@ -18,13 +18,21 @@ describe("Instagram Reel input", () => {
     expect(parse("https://INSTAGRAM.com:443/reel/Ab_12-/").url).toBe(reel);
   });
 
+  test("canonicalizes video post links while preserving their /p/ path and Telegram caption", () => {
+    expect(parse("My caption\nhttp://instagram.com/p/Deu_SjmxMEi?igsh=tracking")).toEqual({ kind: "reel", url: "https://www.instagram.com/p/Deu_SjmxMEi/", caption: "My caption", entities: [] });
+    const text = "watch";
+    expect(parse(text, [{ type: "text_link", offset: 0, length: 5, url: "https://instagram.com/p/Deu_SjmxMEi/" }]).caption).toBe("watch");
+  });
+
   test.each([
-    "ordinary text", "https://instagram.com/p/ABC/", "https://instagram.com/stories/user/123/",
+    "ordinary text", "https://instagram.com/stories/user/123/",
     "https://instagram.com/user/", "https://instagram.com/share/reel/ABC/", "https://instagram.com/reelish/ABC/",
     "https://instagram.com.evil.test/reel/ABC/", "https://evilinstagram.com/reel/ABC/", "https://m.instagram.com/reel/ABC/",
   ])("leaves unrelated content alone: %s", (text) => expect(parseInstagramReel(text)).toBeUndefined());
 
   test.each([
+    "https://instagram.com/p/", "https://instagram.com/p", "https://instagram.com/p/a.b/", "https://instagram.com/p/ABC/extra",
+    "https://instagram.com/p/ABC/../other/", "https://instagram.com:bad/p/ABC/", "ftp://instagram.com/p/ABC/",
     "https://instagram.com/reel/", "https://instagram.com/reels", "https://instagram.com/reel/a.b/",
     "https://instagram.com/reel/é/", "https://instagram.com/reel/%41/", "https://instagram.com/reel/ABC/extra",
     "https://instagram.com:bad/reel/ABC/", "https://instagram.com/reel/ABC/../other/", "https://instagram.com/reel/../p/ABC/",
@@ -33,7 +41,7 @@ describe("Instagram Reel input", () => {
 
   test("deduplicates all copies of the same Reel but rejects multiple Reels", () => {
     expect(parse(`${reel}\nhttp://instagram.com/reels/Ab_12-?igsh=x\ncaption`).caption).toBe("caption");
-    expect(parseInstagramReel(`${reel} https://instagram.com/reel/other/`)).toEqual({ kind: "invalid", reason: "Submit one Instagram Reel per message." });
+    expect(parseInstagramReel(`${reel} https://instagram.com/reel/other/`)).toEqual({ kind: "invalid", reason: "Submit one Instagram video link per message." });
   });
 
   test("keeps surrounding punctuation, unrelated URLs and intentional internal spaces", () => {
@@ -115,6 +123,7 @@ describe("Instagram import snapshot marker", () => {
 
   test("marks new valid, invalid and hidden Reel text candidates", () => {
     expect(snapshot({ text: reel }).instagramReel).toBe(true);
+    expect(snapshot({ text: "https://instagram.com/p/Deu_SjmxMEi/" }).instagramReel).toBe(true);
     expect(snapshot({ text: "https://instagram.com/reel/invalid/path" }).instagramReel).toBe(true);
     expect(snapshot({ text: "watch", entities: [{ type: "text_link", offset: 0, length: 5, url: reel }] }).instagramReel).toBe(true);
   });

@@ -26,6 +26,12 @@ describe("durable Instagram preparation contracts", () => {
     expect(validatePreparationContractV1(validatePreparationContractV1(contract))).toEqual(contract);
   });
 
+  test("preserves canonical /p/ video URLs in persisted contracts", () => {
+    const contract = importedContract();
+    contract.importVideo!.url = "https://www.instagram.com/p/Deu_SjmxMEi/";
+    expect(validatePreparationContractV1(JSON.parse(JSON.stringify(contract)))).toEqual(contract);
+  });
+
   test("retains ordinary legacy preparation contracts without an import discriminator", () => {
     const { importVideo: _import, ...legacy } = importedContract();
     const contract: PreparationContractV1 = {
@@ -45,6 +51,7 @@ describe("durable Instagram preparation contracts", () => {
   });
 
   test.each([
+    "https://www.instagram.com/p/ABC", "https://www.instagram.com/p/ABC/?tracking=x", "https://www.instagram.com/p/ABC/extra/",
     "http://www.instagram.com/reel/Ab_12-/", "https://instagram.com/reel/Ab_12-/", "https://www.instagram.com/reels/Ab_12-/",
     "https://www.instagram.com/reel/Ab_12-", `${reel}?tracking=secret`, `${reel}#fragment`,
     "https://user:pass@www.instagram.com/reel/Ab_12-/", "https://www.instagram.com:8443/reel/Ab_12-/",

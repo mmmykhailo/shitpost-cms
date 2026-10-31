@@ -1,12 +1,12 @@
 # Instagram Reels queue import
 
-Status: implemented locally on 2026-10-31 using the existing Bun runtime and no additional runtime dependencies. This document records the design and acceptance criteria. Live Instagram access and real Telegram playback remain unverified; no deployment was performed.
+Status: implemented locally on 2026-10-31 using the existing Bun runtime and no additional runtime dependencies. This document records the design and acceptance criteria. An anonymous live download of `https://www.instagram.com/p/Deu_SjmxMEi/` succeeded locally through the TypeScript adapter and passed MP4 validation with streaming support; the temporary video was removed. Production-host Instagram access and real Telegram playback remain unverified.
 
 Implementation notes: candidate opt-in is stored as `instagramReel` on newly observed text snapshots, and the versioned `importVideo` action extends the existing preparation contract. Retry counts and deadlines reuse durable preparation operations rather than introducing a new table or migration. Accepted upload request IDs are retained as output evidence even across an edit collision or a crash before output persistence. Unknown upload echoes are quarantined using the captured caption, media type, target chat and bounded request time; known output IDs provide exact correlation. Temporary files use a per-database namespace cleared before the first import after singleton startup.
 
 ## 1. User-visible behavior
 
-When a text message containing an Instagram Reel URL reaches the configured queue channel, prepare a native Telegram video in place of the text submission. Keep the same logical queue item and queue order. Publish the prepared video through the existing publisher.
+When a text message containing an Instagram Reel URL or a single-video `/p/` post URL reaches the configured queue channel, prepare a native Telegram video in place of the text submission. Keep the same logical queue item and queue order. Publish the prepared video through the existing publisher. Photo and carousel posts produce an explicit unsupported-media issue.
 
 - Use only text supplied in the Telegram message as the video caption. Remove the Reel URL, including its tracking query. Preserve the rest of the description and its supported formatting.
 - Never use, persist, log, or embed Instagram descriptions, titles, usernames, or author metadata. Extraction may encounter that data internally; it must not cross the downloader adapter boundary. Do not create metadata or description sidecar files.
@@ -31,7 +31,7 @@ A link-only forwarded user submission has only the generated credit as visible c
 
 ## 2. Downloader examples and recommendation
 
-These are implementation references, not evidence that downloads currently succeed from our production host. Repository documentation, dependency manifests, and the selected TypeScript extractor/downloader source were inspected; no live Instagram or Telegram download was performed.
+These are implementation references, not evidence that downloads currently succeed from our production host. Repository documentation, dependency manifests, and the selected TypeScript extractor/downloader source were inspected. The local live Instagram check is recorded above; no real Telegram upload or playback check was performed.
 
 | Project | Documented approach | Useful lesson |
 | --- | --- | --- |
@@ -58,11 +58,11 @@ Initial scope: standalone text submissions with one distinct Reel. Do not interp
 Add a pure parser in `src/domain/instagram-reel.ts`:
 
 1. Read Telegram `url` and `text_link` entities first, with a fallback for ordinary pasted URLs in stored text. Work in UTF-16 offsets, as Telegram entities and existing byline helpers do.
-2. Parse through `URL`, allow HTTPS and HTTP Instagram URLs, require the exact host `instagram.com` or `www.instagram.com`, reject credentials and nondefault ports, and allow only `/reel/<shortcode>/` and `/reels/<shortcode>/`. Validate shortcode characters as ASCII letters, digits, `_` and `-`, without assuming a fixed length. Canonicalize to `https://www.instagram.com/reel/<shortcode>/` and discard query/fragment before downloading.
+2. Parse through `URL`, allow HTTPS and HTTP Instagram URLs, require the exact host `instagram.com` or `www.instagram.com`, reject credentials and nondefault ports, and allow `/reel/<shortcode>/`, `/reels/<shortcode>/`, and `/p/<shortcode>/`. Validate shortcode characters as ASCII letters, digits, `_` and `-`, without assuming a fixed length. Canonicalize Reel aliases to `https://www.instagram.com/reel/<shortcode>/` and preserve `/p/` for video-post URLs; discard query/fragment before downloading.
 3. Strip every occurrence of the selected Reel's visible URL from the caption. A `text_link` retains its visible label as description text but loses its Instagram hyperlink entity. Deduplicate repeated links to the same shortcode. Preserve unrelated URLs and text.
 4. Remove URL-only lines and trim outside whitespace; preserve internal paragraphs, emoji, punctuation, and intentional text whitespace elsewhere. Rebase entities after deletions, split supported formatting spans where needed, and discard invalid/empty entities and hyperlinks spanning deleted content. Validate the resulting entities before upload. Avoid broad whitespace collapsing.
 5. Multiple distinct Reels produce `needs_review`, with a request to submit one Reel per message. Never silently select the first or publish all URLs as text.
-6. A Reel-shaped Instagram URL with an invalid shortcode produces an input issue. Other Instagram paths (`/p/`, stories, profiles, audio pages, and share redirect URLs) remain ordinary text in v1; document the accepted forms. Add redirect/share support only after an explicit compatibility design.
+6. A supported Instagram URL with an invalid shortcode produces an input issue. Other Instagram paths (stories, profiles, audio pages, and share redirect URLs) remain ordinary text; document the accepted forms. Reject photos and carousel roots before considering any child media, and never silently select the first video from an album. Add redirect/share support only after an explicit compatibility design.
 
 Persist an import candidate when the logical submission is created, before normal text preparation can mark it ready. Detection must run after generated-message suppression and pending-update finalization, not directly in the synchronous channel handler. For raw edits, recompute the candidate from the latest snapshot and invalidate any stale import attempt.
 
