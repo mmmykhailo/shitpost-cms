@@ -1,5 +1,6 @@
 import type { Message } from "grammy/types";
 import { createHash } from "node:crypto";
+import { parseInstagramReel } from "./instagram-reel";
 import { asChatId, asMessageId, asUserId, type ContentType, type MessageEntity, type SemanticOrigin, type StoredMessageSnapshot } from "../types";
 
 const entity = (value: { type: string; offset: number; length: number; url?: string; user?: { id: number; first_name: string; last_name?: string }; language?: string; custom_emoji_id?: string }): MessageEntity => {
@@ -139,6 +140,7 @@ export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdat
     result.text = message.text;
     const textEntities = entities(message.entities);
     if (textEntities !== undefined) result.entities = textEntities;
+    if (message.media_group_id === undefined && parseInstagramReel(message.text, textEntities) !== undefined) result.instagramReel = true;
   }
   if ("caption" in message && message.caption !== undefined) {
     result.caption = message.caption;

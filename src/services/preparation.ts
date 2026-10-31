@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { appendInlineByline, CAPTION_LIMIT, TEXT_LIMIT, separateByline } from "../domain/byline";
 import { botInlineAttribution, inspectInlineCreditEdit } from "../domain/attribution";
 import { classifyPublicationPlan, isInlineCaptionContent, isSeparateBylineContent } from "../domain/origin-policy";
-import { fingerprintSnapshotContent } from "../domain/message";
+import { fingerprintSnapshotContent, snapshotFromMessage } from "../domain/message";
+import { parseInstagramReel } from "../domain/instagram-reel";
+import { InstagramDownloadError, type InstagramDownloader } from "./instagram-downloader";
 import type { PolicyRepository, QueueRepository } from "../db/repositories";
 import type { PreparationRepository } from "../db/preparation-repository";
 import type { PreparationRequestRepository } from "../db/preparation-request-repository";
@@ -59,6 +61,7 @@ const canonicalEditPayload = (snapshot: StoredMessageSnapshot, edit: "text" | "c
 export type PreparationService = ReturnType<typeof createPreparationService>;
 
 export const createPreparationService = (input: {
+  instagramDownloader?: InstagramDownloader;
   queue: QueueRepository;
   preparation: PreparationRepository;
   requestEvidence?: PreparationRequestRepository;
@@ -344,7 +347,7 @@ export const createPreparationService = (input: {
     }
   };
 
-  const prepareClaim = async (claim: NonNullable<ReturnType<PreparationRepository["claimNextPreparation"]>>): Promise<PreparationOutcome> => {
+  const prepareClaim = async (claim: NonNullable<ReturnType<PreparationRepository["claimNextPreparation"]>>, signal?: AbortSignal): Promise<PreparationOutcome> => {
     const done = input.operationTracker?.begin(claim.operationId);
     const knownOutputIds: MessageId[] = [];
     let mutationMayHaveStarted = false;
@@ -354,6 +357,92 @@ export const createPreparationService = (input: {
       if (!item) throw new Error("Claimed preparation item disappeared");
       const members = input.queue.getCapturedMembers(item.id, claim.guard.capturedSourceGeneration, claim.sourceIds);
       if (members.length === 0) throw new Error("Claimed preparation source set is empty");
+      if (claim.kind === "prepare" && members.length === 1 && members[0]!.snapshot.instagramReel) {
+        const source = members[0]!;
+        const fail = (status: "blocked" | "needs_edit" | "needs_review", code: string, description: string): PreparationOutcome => {
+          input.preparation.markFailed(claim.operationId, status, code, description, input.clock.now());
+          return { kind: "blocked", itemId: item!.id, status, reason: code, operationId: claim.operationId };
+        };
+        const reel = parseInstagramReel(source.snapshot.text ?? "", source.snapshot.entities);
+        if (reel !== undefined) {
+          if (item.editorialFrozenAt !== undefined) return fail("needs_review", "instagram_editorial_freeze", "Reel submission was edited. Review it or submit a new message to import the video.");
+          if (reel.kind === "invalid") return fail("needs_review", "instagram_invalid_input", reel.reason);
+          if (!input.instagramDownloader || !input.gateway.sendVideo) return fail("blocked", "instagram_unavailable", "Instagram import is unavailable in this runtime. Upload the video manually.");
+          const credit = input.policy.resolveCreditPolicy(item.origin);
+          input.queue.reconcileNicknamePolicy(item.id, credit);
+          const plan = classifyPublicationPlan({ origin: item.origin, contentType: "video", channelIsWhitelisted: false, ...(credit.alias === undefined ? {} : { alias: credit.alias }) });
+          if (plan.kind === "blocked") return fail("needs_review", plan.reason, "Telegram author origin requires review.");
+          let caption = reel.caption;
+          let captionEntities = reel.entities;
+          let attribution: AttributionDescriptor = { ownership: "none" };
+          try {
+            if (caption.length > CAPTION_LIMIT) throw new Error("Telegram description exceeds the video caption limit");
+            if (plan.kind === "copy_with_inline_byline") {
+              const rendered = appendInlineByline(caption, plan.name, CAPTION_LIMIT, captionEntities);
+              attribution = botInlineAttribution(caption, rendered.addedText, source.memberKey, "inline_caption", credit.revision);
+              caption = rendered.text;
+              captionEntities = rendered.entities ?? [];
+            }
+          } catch {
+            return fail("needs_edit", "instagram_caption_invalid", "Telegram description and author credit must fit the 1024-character video caption limit with valid formatting.");
+          }
+          input.preparation.persistContract(claim.operationId, {
+            version: 1, kind: "prepare", itemId: item.id, capturedContentVersion: claim.guard.capturedContentVersion,
+            capturedSourceGeneration: claim.guard.capturedSourceGeneration, originalOrigin: item.origin, deliveryMode: "copy",
+            capturedMembers: members, steps: [], targetNicknameRevision: credit.revision, targetNicknameKey: credit.revisionKey, attribution,
+            importVideo: { version: 1, kind: "instagram_reel", url: reel.url, caption, captionEntities },
+          }, input.clock.now());
+          let downloaded: Awaited<ReturnType<InstagramDownloader>>;
+          try {
+            downloaded = await input.instagramDownloader(reel.url, signal);
+          } catch (error) {
+            if (signal?.aborted) throw new TelegramLocalDeferralError("protection_changed", input.clock.now(), "Reel download interrupted by shutdown");
+            const failure = error instanceof InstagramDownloadError ? error : new InstagramDownloadError("instagram_transient", "Instagram download failed. Retry later or upload the video manually.", true);
+            const attempts = input.preparation.importFailureCount(item.id, claim.guard.capturedContentVersion);
+            if (failure.retryable && attempts < 2) {
+              const retry = input.clock.now() + Math.max(attempts === 0 ? 60_000 : 300_000, failure.retryAfterMs ?? 0);
+              input.preparation.scheduleRetry(claim.operationId, retry, "instagram_transient", failure.message, input.clock.now());
+              return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
+            }
+            return fail("blocked", failure.code, failure.message);
+          }
+          try {
+            let message;
+            try {
+              message = await runRequest({ operationId: claim.operationId, itemId: item.id, method: "sendVideo", targetChatId: Number(input.queueChannelId), stepKey: "instagram-video", beforeDispatch: () => {
+                if (signal?.aborted) throw new TelegramLocalDeferralError("protection_changed", input.clock.now(), "Reel upload cancelled before dispatch");
+                assertDispatchable(claim);
+                input.preparation.setPhase(claim.operationId, "transfer_pending", input.clock.now());
+                mutationMayHaveStarted = true;
+              }, work: () => input.gateway.sendVideo!({ chatId: input.queueChannelId, path: downloaded.path, caption, captionEntities, supportsStreaming: downloaded.supportsStreaming, disableNotification: true, ...(signal === undefined ? {} : { signal }) }) });
+            } catch (error) {
+              const normalized = classifyTelegramError(error, "sendVideo");
+              if (normalized.kind === "rate_limited") {
+                const retry = retryAt(normalized, input.clock.now());
+                input.preparation.scheduleRetry(claim.operationId, retry, normalized.kind, normalized.description, input.clock.now());
+                return { kind: "retry_scheduled", itemId: item.id, retryAt: retry, operationId: claim.operationId };
+              }
+              if (["permission_denied", "destination_unavailable", "unsupported_content", "invalid_content_or_entities", "content_protected", "unknown_permanent"].includes(normalized.kind)) return fail("blocked", normalized.kind, normalized.description);
+              throw error;
+            }
+            const snapshot = snapshotFromMessage(message);
+            snapshot.origin = item.origin;
+            snapshot.contentFingerprint = fingerprintSnapshotContent(snapshot);
+            const member: PreparedMember = { memberKey: source.memberKey, messageId: snapshot.messageId, role: "content", deliveryMode: "copy", snapshot };
+            knownOutputIds.push(snapshot.messageId);
+            input.preparation.recordOutput(claim.operationId, { chatId: input.queueChannelId, messageId: snapshot.messageId, ordinal: 0, outputKey: `${claim.operationId}:${snapshot.messageId}`, stepKey: "instagram-video", sourceMemberKey: source.memberKey, role: "content", snapshot }, input.clock.now());
+            input.preparation.recordCompleteResult(claim.operationId, { members: [member], attribution, nicknameRevisionApplied: credit.revision, nicknameRevisionAppliedKey: credit.revisionKey }, input.clock.now());
+            const installed = input.preparation.installPreparedGeneration(claim.operationId, input.clock.now());
+            let cleanupError: string | undefined;
+            try { await runRequest({ operationId: claim.operationId, itemId: item.id, method: "deleteMessages", targetChatId: Number(input.queueChannelId), family: "cleanup", stepKey: "old-sources", work: () => input.gateway.deleteMessages(input.queueChannelId, installed.oldSourceIds) }); }
+            catch (error) { const normalized = classifyTelegramError(error, "deleteMessages"); if (normalized.kind !== "source_missing") cleanupError = normalized.description; }
+            input.preparation.finishCleanup(claim.operationId, input.clock.now(), cleanupError);
+            return { kind: "prepared", itemId: item.id, preparationState: installed.preparationState, operationId: claim.operationId };
+          } finally {
+            await downloaded.cleanup().catch(() => input.logger.warn("instagram_temp_cleanup_failed", { itemId: item!.id }));
+          }
+        }
+      }
       if (item.editorialFrozenAt !== undefined) {
         const adopted = input.preparation.completeInPlacePreparation(guard, members, item.attribution ?? { ownership: "none" }, item.nicknameRevisionApplied ?? item.nicknameRevisionWanted ?? 0, input.clock.now(), item.nicknameRevisionAppliedKey ?? item.nicknameRevisionWantedKey ?? "none");
         return { kind: "prepared", itemId: item.id, preparationState: adopted.preparationState, operationId: claim.operationId };
@@ -652,6 +741,11 @@ export const createPreparationService = (input: {
     } catch (error) {
       const normalized = classifyTelegramError(error);
       if (normalized.kind === "local_deferral") {
+        const current = input.queue.findItemById(claim.itemId);
+        if (!current || current.preparationOperationId !== claim.operationId || current.contentVersion !== guard.expectedContentVersion || current.sourceGeneration !== guard.capturedSourceGeneration) {
+          // An edit/deletion owns the new state. Preserve its collision evidence.
+          return { kind: "blocked", itemId: claim.itemId, status: current?.status ?? "needs_review", reason: "protection_changed", operationId: claim.operationId };
+        }
         if (knownOutputIds.length > 0) {
           if (!await cleanupKnownOutputs(claim, knownOutputIds)) {
             input.preparation.markUncertain(claim.operationId, "local_deferral_after_output", "Preparation outputs could not be removed after local Telegram deferral", input.clock.now());
@@ -686,10 +780,11 @@ export const createPreparationService = (input: {
     catch (error) { return classifyTelegramError(error, "deleteMessages").kind === "source_missing"; }
   };
 
-  const prepareNext = async (): Promise<PreparationOutcome> => {
+  const prepareNext = async (signal?: AbortSignal): Promise<PreparationOutcome> => {
+    if (signal?.aborted) return { kind: "empty" };
     const claim = input.preparation.claimNextPreparation(input.clock.now(), input.bootId);
     if (!claim) return { kind: "empty" };
-    return prepareClaim(claim);
+    return prepareClaim(claim, signal);
   };
 
   const cleanupPending = async (limit = 25): Promise<number> => {

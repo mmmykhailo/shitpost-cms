@@ -1,4 +1,6 @@
 import type { Api } from "grammy";
+import { InputFile } from "grammy";
+import { INSTAGRAM_UPLOAD_TIMEOUT_MS } from "./domain/instagram-reel";
 import type { Chat, ForceReply, InlineKeyboardMarkup, Message, MessageEntity as GrammyMessageEntity, ReplyKeyboardMarkup, ReplyKeyboardRemove } from "@grammyjs/types";
 import { classifyTelegramError } from "./errors";
 import { asMessageId, type ChatId, type MessageId, type MessageEntity, type UserId } from "./types";
@@ -75,6 +77,7 @@ export type AnswerCallbackInput = {
 };
 
 export type TelegramGateway = {
+  sendVideo?(input: { chatId: ChatId; path: string; caption: string; captionEntities?: readonly MessageEntity[]; supportsStreaming?: boolean; disableNotification?: boolean; signal?: AbortSignal }): Promise<Message.VideoMessage>;
   /** The API adapter dispatches mutations through the shared admission transformer. */
   dispatchManaged?: true;
   getBotIdentity(): Promise<BotIdentity>;
@@ -275,6 +278,19 @@ export const createTelegramGateway = (api: Api, adminChatId: ChatId): TelegramGa
     editText,
     editCaption,
     sendText,
+    sendVideo: async (input) => call("sendVideo", async () => {
+      const deadline = AbortSignal.timeout(INSTAGRAM_UPLOAD_TIMEOUT_MS);
+      const signal = input.signal === undefined ? deadline : AbortSignal.any([input.signal, deadline]);
+      const message = await api.sendVideo(input.chatId, new InputFile(input.path), {
+        caption: input.caption,
+        ...(input.captionEntities === undefined ? {} : { caption_entities: toTelegramEntities(input.captionEntities)! }),
+        ...(input.supportsStreaming === undefined ? {} : { supports_streaming: input.supportsStreaming }),
+        ...(input.disableNotification === undefined ? {} : { disable_notification: input.disableNotification }),
+      }, signal);
+      returnedMessageId(message.message_id, "sendVideo", "response");
+      if (!message.video || message.chat.id !== input.chatId) throw ambiguousSendResult("sendVideo", "response did not contain the requested video", [asMessageId(message.message_id)]);
+      return message;
+    }),
     deleteMessages: async (chatId, messageIds) => {
       if (messageIds.length === 0) return;
       const numericIds = messageIds.map((messageId, index) => assertOutboundMessageId(messageId, `Telegram deletion message ID at index ${index}`));

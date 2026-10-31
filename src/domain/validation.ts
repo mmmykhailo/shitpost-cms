@@ -168,6 +168,10 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     result.linkPreviewOptions = linkOptions;
   }
   if (candidate.replyMarkup !== undefined) result.replyMarkup = record(candidate.replyMarkup);
+  if (candidate.instagramReel !== undefined) {
+    if (candidate.instagramReel !== true || result.contentType !== "text" || result.mediaGroupId !== undefined) throw new StoredDataValidationError("instagramReel requires standalone text");
+    result.instagramReel = true;
+  }
   return result;
 };
 
@@ -312,6 +316,13 @@ export const validatePreparationContractV1 = (value: unknown): PreparationContra
   }
   const targetName = optionalString(candidate.targetName, "contract.targetName");
   if (targetName !== undefined) result.targetName = targetName;
+  if (candidate.importVideo !== undefined) {
+    const imported = record(candidate.importVideo);
+    if (imported.version !== 1 || imported.kind !== "instagram_reel" || typeof imported.url !== "string" || !/^https:\/\/www\.instagram\.com\/reel\/[A-Za-z0-9_-]+\/$/u.test(imported.url) || typeof imported.caption !== "string" || imported.caption.length > 1024 || candidate.kind !== "prepare" || result.deliveryMode !== "copy" || capturedMembers.length !== 1 || steps.length !== 0 || capturedMembers[0]!.snapshot.contentType !== "text" || capturedMembers[0]!.albumKey !== undefined) throw new StoredDataValidationError("Invalid Instagram import contract");
+    const captionEntities = validateEntities(imported.captionEntities, "importVideo.captionEntities") ?? [];
+    if (captionEntities.some((entity) => entity.offset + entity.length > (imported.caption as string).length)) throw new StoredDataValidationError("Instagram caption entity is outside the caption");
+    result.importVideo = { version: 1, kind: "instagram_reel", url: imported.url, caption: imported.caption, captionEntities };
+  }
   const keys = new Set(capturedMembers.map((member) => member.memberKey));
   if (keys.size !== capturedMembers.length || steps.some((step) => step.members.some((member) => !keys.has(member.memberKey)))) throw new StoredDataValidationError("Preparation contract source associations are inconsistent");
   return result;

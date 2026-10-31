@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { readFile, rm } from "node:fs/promises";
 import { Bot } from "grammy";
 import { parseConfig, type AppConfig } from "./config";
 import { classifyTelegramError } from "./errors";
@@ -30,6 +31,7 @@ import { createPublicationCoordinator } from "./services/publication-coordinator
 import { createRenewalService } from "./services/renewal";
 import { createRenewalWorker } from "./services/renewal-worker";
 import { createPreparationService } from "./services/preparation";
+import { createInstagramDownloader, InstagramDownloadError } from "./services/instagram-downloader";
 import { createPreparationWorker } from "./services/preparation-worker";
 import { createSchedulerService } from "./services/scheduler";
 import { createOrphanCleanupService } from "./services/orphan-cleanup";
@@ -290,7 +292,28 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   }
 
   const ingestion = createIngestionService({ queueChannelId: config.queueChannelId, queue, policy, generated, events: generatedEvents, pending, logger, now: clock.now });
-  const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown });
+  const instagramCacheDirectory = join(config.dataDirectory, `${basename(config.databasePath)}.instagram-cache`);
+  let instagramCacheReady: Promise<void> | undefined;
+  let previousCookie: string | undefined;
+  let downloadInstagram = createInstagramDownloader({ directory: instagramCacheDirectory });
+  const instagramDownloader = async (url: string, signal?: AbortSignal) => {
+    // The database singleton is held, and no import has started in this boot.
+    // Recovery uses Telegram evidence, so prior-boot temporary files are disposable.
+    await (instagramCacheReady ??= rm(instagramCacheDirectory, { recursive: true, force: true }));
+    let cookie: string | undefined;
+    if (config.instagramCookieFile) {
+      try {
+        cookie = (await readFile(config.instagramCookieFile, "utf8")).trim();
+        if (!cookie || /[\r\n\0]/u.test(cookie)) throw new Error("Invalid cookie header");
+      } catch { throw new InstagramDownloadError("instagram_cookie_configuration", "Instagram cookie file is unavailable or invalid. Check the configured secret file."); }
+    }
+    if (cookie !== previousCookie) {
+      downloadInstagram = createInstagramDownloader({ directory: instagramCacheDirectory, ...(cookie === undefined ? {} : { cookie }) });
+      previousCookie = cookie;
+    }
+    return downloadInstagram(url, signal);
+  };
+  const preparation = createPreparationService({ queue, preparation: preparationRepository, requestEvidence: preparationRequest, policy, gateway, queueChannelId: config.queueChannelId, bootId, clock, logger, operationTracker, cooldown: telegramCooldown, instagramDownloader });
   const preparationWorker = createPreparationWorker({ preparation, cooldown: telegramCooldown, clock, logger });
   const publicationCoordinator = createPublicationCoordinator();
   const publisher = createPublicationService({

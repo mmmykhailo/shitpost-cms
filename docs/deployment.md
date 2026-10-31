@@ -2,6 +2,10 @@
 
 This runbook assumes a fresh Debian stable or Ubuntu LTS VPS, systemd, outbound HTTPS/DNS access, and SSH access for an administrator. The bot does not listen on an inbound application port.
 
+Instagram Reel imports use the existing Bun runtime without Python, yt-dlp, FFmpeg, or a browser installation. If authenticated public-Reel access is needed, configure `INSTAGRAM_COOKIE_FILE` in the service environment to point to an absolute, service-readable mode-0600 file containing one Cookie header value (not a Netscape cookie export). Keep it outside code releases, backups and the import cache; rotate its contents when needed. The current deployment workflow rewrites `bot.env`, so preserve this optional setting through an appropriate systemd environment override rather than relying on edits to that generated file.
+
+Temporary videos live under `data/<database-filename>.instagram-cache`, within the existing service write permissions. Files are removed after each attempt; leftovers are cleared before the first import in a new singleton boot. Backups contain SQLite, not these temporary files. A fresh deployment must verify real Instagram access, sound and Telegram mobile playback with representative public Reels; offline tests cannot establish those properties. Unsupported or inaccessible media remains an actionable queue issue.
+
 ## 1. Provision a host
 
 Generate a dedicated, passphrase-free Ed25519 key for GitHub Actions. Keep the private file outside the repository:

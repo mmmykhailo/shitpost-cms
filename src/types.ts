@@ -65,6 +65,8 @@ export type MessageEntity = {
 };
 
 export type StoredMessageSnapshot = {
+  /** Opt-in on newly observed standalone Reel submissions; absent on legacy rows. */
+  instagramReel?: true;
   schemaVersion: 1 | 2;
   chatId: ChatId;
   messageId: MessageId;
@@ -113,6 +115,7 @@ export type AttributionDescriptor =
 export type TransferStep = { stepKey: string; mode: DeliveryMode; grouped: boolean; members: readonly PreparedMember[] };
 
 export type PreparationContractV1 = {
+  importVideo?: { version: 1; kind: "instagram_reel"; url: string; caption: string; captionEntities: readonly MessageEntity[] };
   version: 1;
   kind: "prepare" | "refresh";
   itemId: number;

@@ -166,7 +166,26 @@ export const createIngestionService = (input: {
         }
         continue;
       }
-      if (pending.candidateOperationId && input.queue.preparationOperationState(pending.candidateOperationId) === "uncertain") continue;
+      if (pending.candidateOperationId) {
+        const preparationState = input.queue.preparationOperationState(pending.candidateOperationId);
+        if (preparationState === "uncertain") {
+          const uncertainImport = input.queue.uncertainInstagramImportCandidate(pending.snapshot);
+          if (uncertainImport?.operationId === pending.candidateOperationId) {
+            input.pending.markState(pending.queueChatId, pending.telegramMessageId, "quarantined_renewal_candidate", now, uncertainImport.operationId, "An uncertain Instagram upload may have created this update");
+          }
+          continue;
+        }
+        if ((preparationState === "done" || preparationState === "failed") && pending.lastError === "An uncertain Instagram upload may have created this update") {
+          input.pending.markState(pending.queueChatId, pending.telegramMessageId, "discarded", now, pending.candidateOperationId, "Instagram upload uncertainty was resolved by an admin");
+          continue;
+        }
+      }
+      const uncertainImport = input.queue.uncertainInstagramImportCandidate(pending.snapshot);
+      if (uncertainImport) {
+        input.pending.markState(pending.queueChatId, pending.telegramMessageId, "quarantined_renewal_candidate", now, uncertainImport.operationId, "An uncertain Instagram upload may have created this update");
+        input.logger.warn("instagram_upload_candidate_quarantined", { operationId: uncertainImport.operationId, itemId: uncertainImport.itemId, messageId: pending.telegramMessageId });
+        continue;
+      }
       const candidate = input.queue.renewalCandidateOperation(pending.queueChatId);
       if (candidate) {
         input.pending.markState(pending.queueChatId, pending.telegramMessageId, "quarantined_renewal_candidate", now, candidate.operationId, "A renewal operation may have created this update");

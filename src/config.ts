@@ -4,6 +4,7 @@ import { asChatId, asUserId, type ChatId, type UserId } from "./types";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type AppConfig = {
+  instagramCookieFile?: string;
   botToken: string;
   adminUserId: UserId;
   queueChannelId: ChatId;
@@ -56,6 +57,8 @@ export const parseConfig = (
     throw new Error("LOG_LEVEL must be one of debug, info, warn, error");
   }
   const rawReleaseSha = environment.RELEASE_SHA?.trim() || undefined;
+  const instagramCookieFile = environment.INSTAGRAM_COOKIE_FILE?.trim() || undefined;
+  if (instagramCookieFile !== undefined && (!isAbsolute(instagramCookieFile) || /[\0\r\n]/u.test(instagramCookieFile))) throw new Error("INSTAGRAM_COOKIE_FILE must be an absolute path without control characters");
   const runtimeStatusPath = environment.RUNTIME_STATUS_PATH?.trim() || undefined;
   if (rawReleaseSha === undefined && runtimeStatusPath !== undefined) throw new Error("RELEASE_SHA is required when RUNTIME_STATUS_PATH is set");
   if (rawReleaseSha !== undefined && runtimeStatusPath === undefined) throw new Error("RUNTIME_STATUS_PATH is required when RELEASE_SHA is set");
@@ -66,6 +69,7 @@ export const parseConfig = (
     throw new Error("RUNTIME_STATUS_PATH must be an absolute path without control characters");
   }
   return {
+    ...(instagramCookieFile === undefined ? {} : { instagramCookieFile }),
     botToken,
     adminUserId: asUserId(adminUserId),
     queueChannelId: asChatId(queueChannelId),

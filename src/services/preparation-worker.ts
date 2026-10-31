@@ -44,7 +44,7 @@ export const createPreparationWorker = (input: {
           result.nextWakeAt = deadline;
           break;
         }
-        const outcome = await input.preparation.prepareNext();
+        const outcome = await input.preparation.prepareNext(signal);
         if (outcome.kind === "empty") break;
         result.attempts += 1;
         if (outcome.kind === "retry_scheduled") result.nextWakeAt = Math.max(outcome.retryAt, input.cooldown.notBefore());

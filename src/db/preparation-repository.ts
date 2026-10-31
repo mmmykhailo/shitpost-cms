@@ -94,7 +94,18 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
   });
 
   const recordOutput = (operationId: string, output: PreparationOutput, now: number): void => database.transaction(() => {
-    const row = assertOwner(operationId);
+    let row: PreparationRow;
+    try { row = assertOwner(operationId); }
+    catch (error) {
+      // A successful upload response can arrive after an admin edit supersedes
+      // its claim. Retain proven output ownership without installing stale data.
+      const late = operation(operationId);
+      const known = database.raw.query(`SELECT 1 FROM preparation_request_attempts attempt, json_each(attempt.known_output_ids_json) known
+        WHERE attempt.operation_id = ? AND attempt.method = 'sendVideo' AND attempt.target_chat_id = ?
+          AND attempt.state IN ('accepted','unknown') AND known.value = ? LIMIT 1`).get(operationId, output.chatId, output.messageId);
+      if (!late || !["running", "outputs_recorded", "uncertain"].includes(late.state) || !known || !validatePreparationContractV1(JSON.parse(late.contract_json) as unknown).importVideo) throw error;
+      row = late;
+    }
     if (!Number.isSafeInteger(output.chatId) || !Number.isSafeInteger(output.messageId) || output.messageId <= 0 || !Number.isSafeInteger(output.ordinal) || output.ordinal < 0 || !output.outputKey || !output.stepKey) throw new Error("Invalid preparation output evidence");
     const existingPrep = database.raw.query("SELECT operation_id, ordinal, output_key, step_key FROM queue_preparation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(output.chatId, output.messageId) as { operation_id: string; ordinal: number; output_key: string; step_key: string } | null;
     const existingOperation = database.raw.query("SELECT operation_id FROM operation_outputs WHERE chat_id = ? AND telegram_message_id = ?").get(output.chatId, output.messageId) as { operation_id: string } | null;
@@ -169,6 +180,8 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
     const installed = database.raw.query(`UPDATE queue_items SET source_generation = ?, first_message_id = ?, content_type = ?, physical_created_at = ?, representation_kind = 'prepared', preparation_state = ?, preparation_operation_id = NULL, attribution_json = ?, nickname_revision_applied = ?, nickname_revision_applied_key = ?, nickname_revision_wanted = ?, nickname_revision_wanted_key = ?, prepared_at = ? WHERE id = ? AND preparation_operation_id = ? AND content_version = ? AND source_generation = ?`)
       .run(generation, primary.messageId, primary.snapshot.contentType, now, nextPreparationState, asJson(validateAttributionDescriptor(result.attribution)), result.nicknameRevisionApplied, appliedKey, wantedRevision, wantedKey, now, row.item_id, operationId, progress.effectiveContentVersion, row.captured_source_generation);
     if (Number(installed.changes) !== 1) throw conflict("Prepared generation lost its guarded install");
+    const contract = validatePreparationContractV1(JSON.parse(row.contract_json) as unknown);
+    if (contract.importVideo) database.raw.query("UPDATE queue_items SET delivery_mode = 'copy' WHERE id = ?").run(row.item_id);
     const oldSourceIds = JSON.parse(row.source_ids_json) as MessageId[];
     database.raw.query("UPDATE queue_preparation_operations SET state = 'cleanup_pending', phase = 'source_cleanup_pending', target_source_generation = ?, updated_at = ? WHERE id = ?").run(generation, now, operationId);
     return { itemId: row.item_id, oldSourceIds, preparationState: nextPreparationState };
@@ -280,6 +293,20 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
   const heartbeatOperations = (now: number, bootId: string): number => Number(database.raw.query("UPDATE queue_preparation_operations SET lease_expires_at = ?, updated_at = ? WHERE boot_id = ? AND state IN ('running','outputs_recorded','cleanup_pending')").run(now + leaseMs, now, bootId).changes);
 
   const recoverExpiredOperations = (now: number, bootId: string): { requeued: number; uncertain: number; cleanupPending: number } => database.transaction(() => {
+    // Accepted response evidence may be committed just before a crash, before
+    // recordOutput. Preserve those IDs for echo suppression and admin cleanup.
+    const imports = database.raw.query(`SELECT qpo.* FROM queue_preparation_operations qpo
+      WHERE qpo.state IN ('running','outputs_recorded','uncertain')
+        AND json_extract(qpo.contract_json, '$.importVideo.kind') = 'instagram_reel'`).all() as PreparationRow[];
+    for (const imported of imports) {
+      const contract = validatePreparationContractV1(JSON.parse(imported.contract_json) as unknown);
+      const known = database.raw.query(`SELECT attempt.target_chat_id AS chat_id, known.value AS message_id
+        FROM preparation_request_attempts attempt, json_each(attempt.known_output_ids_json) known
+        WHERE attempt.operation_id = ? AND attempt.method = 'sendVideo' AND attempt.state IN ('accepted','unknown')
+          AND NOT EXISTS (SELECT 1 FROM queue_preparation_outputs output WHERE output.operation_id = attempt.operation_id AND output.chat_id = attempt.target_chat_id AND output.telegram_message_id = known.value)`)
+        .all(imported.id) as Array<{ chat_id: number; message_id: number }>;
+      for (const output of known) recordOutput(imported.id, { chatId: output.chat_id, messageId: output.message_id, ordinal: 0, outputKey: `${imported.id}:${output.message_id}`, stepKey: "instagram-video", sourceMemberKey: contract.capturedMembers[0]!.memberKey, role: "content" }, now);
+    }
     const rows = database.raw.query("SELECT * FROM queue_preparation_operations WHERE state IN ('running','outputs_recorded','cleanup_pending') AND (lease_expires_at <= ? OR boot_id <> ?)").all(now, bootId) as PreparationRow[];
     let requeued = 0; let uncertain = 0; let cleanupPending = 0;
     for (const row of rows) {
@@ -355,5 +382,7 @@ export const createPreparationRepository = (database: AppDatabase, options: { le
       .run(row.item_id, operationId, JSON.stringify({ action, trackedOutputs: hasOutputs }), now);
   });
 
-  return { claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, markEditRequestStarted, markEditRequestAccepted, markEditRequestRejected, markEditRequestUnknown, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
+  const importFailureCount = (itemId: number, contentVersion: number): number => Number((database.raw.query("SELECT COUNT(*) AS count FROM queue_preparation_operations WHERE item_id = ? AND captured_content_version = ? AND error_code = 'instagram_transient'").get(itemId, contentVersion) as { count: number }).count);
+
+  return { importFailureCount, claimNextPreparation, persistContract, setPhase, recordOutput, expectEdit, markEditRequestStarted, markEditRequestAccepted, markEditRequestRejected, markEditRequestUnknown, recordCompleteResult, installPreparedGeneration, completeInPlacePreparation, completeInPlaceRefresh, markFailed, markUncertain, scheduleRetry, markPreparationNeeded, markMemberMissing, heartbeatOperations, recoverExpiredOperations, finishCleanup, listCleanupPending, operationEvidence, releaseForResolution };
 };

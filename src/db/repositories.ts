@@ -1,5 +1,6 @@
 import type { AppDatabase } from "./database";
 import { randomUUID } from "node:crypto";
+import { INSTAGRAM_UPLOAD_TIMEOUT_MS } from "../domain/instagram-reel";
 import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
 import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
@@ -1528,6 +1529,29 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
   };
 
+  const uncertainInstagramImportCandidate = (snapshot: StoredMessageSnapshot): { operationId: string; itemId: number } | undefined => {
+    if (snapshot.contentType !== "video" || snapshot.mediaGroupId !== undefined) return undefined;
+    // Telegram can deliver the channel echo after a lost response or a restart.
+    // Correlate it with one unresolved upload using both its payload and the
+    // bounded Telegram creation time, rather than holding all future videos.
+    const row = database.raw.query(`SELECT qpo.id AS operation_id, qi.id AS item_id
+      FROM queue_preparation_operations qpo JOIN queue_items qi ON qi.id = qpo.item_id
+      JOIN preparation_request_attempts attempt ON attempt.operation_id = qpo.id
+      WHERE qi.queue_chat_id = ? AND qpo.state = 'uncertain'
+        AND json_extract(qpo.contract_json, '$.importVideo.version') = 1
+        AND json_extract(qpo.contract_json, '$.importVideo.kind') = 'instagram_reel'
+        AND attempt.method = 'sendVideo' AND attempt.target_chat_id = ?
+        AND attempt.state IN ('in_flight','unknown','accepted')
+        AND (EXISTS (SELECT 1 FROM json_each(COALESCE(attempt.known_output_ids_json, '[]')) known WHERE known.value = ?)
+          OR ((attempt.known_output_ids_json IS NULL OR attempt.known_output_ids_json = '[]')
+            AND json_extract(qpo.contract_json, '$.importVideo.caption') = ?
+            AND ? BETWEEN attempt.started_at - 5000 AND MIN(COALESCE(attempt.finished_at, qpo.updated_at), attempt.started_at + ?) + 5000))
+        AND qi.status NOT IN ('done','deleted','deleted_external')
+      ORDER BY attempt.started_at, qpo.id LIMIT 1`)
+      .get(snapshot.chatId, snapshot.chatId, snapshot.messageId, snapshot.caption ?? "", snapshot.telegramDate, INSTAGRAM_UPLOAD_TIMEOUT_MS) as { operation_id: string; item_id: number } | null;
+    return row ? { operationId: row.operation_id, itemId: row.item_id } : undefined;
+  };
+
   const preparationOperationState = (operationId: string): string | undefined => {
     const row = database.raw.query("SELECT state FROM queue_preparation_operations WHERE id = ?").get(operationId) as { state: string } | null;
     return row?.state;
@@ -1628,6 +1652,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     renewalCandidateOperation,
     preparationOutputOperation,
     preparationCandidateOperation,
+    uncertainInstagramImportCandidate,
     preparationOperationState,
     setBootId,
     heartbeatOperations,
