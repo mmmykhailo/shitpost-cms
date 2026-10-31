@@ -652,6 +652,40 @@ const migrations: readonly Migration[] = [
       `CREATE INDEX recent_logs_at_idx ON recent_logs(at DESC, id DESC)`,
     ],
   },
+  {
+    version: 13,
+    statements: [
+      `CREATE TABLE instagram_feedback (
+        item_id INTEGER PRIMARY KEY,
+        admin_chat_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reply_markup_json TEXT,
+        revision INTEGER NOT NULL,
+        applied_revision INTEGER NOT NULL DEFAULT 0,
+        message_id INTEGER,
+        state TEXT NOT NULL CHECK (state IN ('pending','idle','claimed','uncertain','failed')),
+        next_attempt_at INTEGER NOT NULL,
+        claim_token TEXT,
+        claim_boot_id TEXT,
+        claim_json TEXT,
+        lease_expires_at INTEGER,
+        request_started_at INTEGER,
+        last_error_code TEXT,
+        updated_at INTEGER NOT NULL
+      )`,
+      `CREATE TABLE instagram_feedback_operations (
+        item_id INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        PRIMARY KEY (item_id, operation_id),
+        FOREIGN KEY (item_id) REFERENCES instagram_feedback(item_id) ON DELETE CASCADE
+      )`,
+      `CREATE INDEX instagram_feedback_due_idx ON instagram_feedback(state, next_attempt_at)`,
+      `UPDATE admin_response_outbox SET state = 'cancelled', last_error_kind = 'superseded'
+       WHERE state = 'pending' AND coalesce_key LIKE 'instagram-progress:%'`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {
