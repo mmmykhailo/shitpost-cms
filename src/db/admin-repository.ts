@@ -34,7 +34,7 @@ export const createAdminRepository = (database: AppDatabase) => {
     try {
       state = validateJsonPayload(JSON.parse(row.state_json) as unknown, "admin prompt");
     } catch (error) {
-      if (!(error instanceof StoredDataValidationError)) throw error;
+      if (!(error instanceof StoredDataValidationError) && !(error instanceof SyntaxError)) throw error;
       database.raw.query("DELETE FROM admin_prompts WHERE admin_id = ?").run(adminId);
       return undefined;
     }
@@ -62,7 +62,7 @@ export const createAdminRepository = (database: AppDatabase) => {
     try {
       payload = validateJsonPayload(JSON.parse(row.payload_json) as unknown, "callback token");
     } catch (error) {
-      if (!(error instanceof StoredDataValidationError)) throw error;
+      if (!(error instanceof StoredDataValidationError) && !(error instanceof SyntaxError)) throw error;
       return undefined;
     }
     const result: { action: string; payload: unknown; itemVersion?: number; legacy?: true } = { action: row.action, payload };
@@ -99,11 +99,17 @@ export const createAdminRepository = (database: AppDatabase) => {
   };
 
   const purgeExpiredTokensAndPrompts = (now: number): { tokens: number; prompts: number } => database.transaction(() => {
-    database.raw.query("DELETE FROM callback_tokens WHERE delivery_outbox_id IN (SELECT id FROM admin_response_outbox WHERE state IN ('failed','cancelled'))").run();
-    const rows = database.raw.query("SELECT token, action, consumed_at, expires_at FROM callback_tokens").all() as Array<{ token: string; action: string; consumed_at: number | null; expires_at: number }>;
-    let tokens = 0;
+    let tokens = Number(database.raw.query("DELETE FROM callback_tokens WHERE delivery_outbox_id IN (SELECT id FROM admin_response_outbox WHERE state IN ('failed','cancelled'))").run().changes);
+    const rows = database.raw.query("SELECT ct.token, ct.action, ct.payload_json, ct.consumed_at, ct.expires_at, ao.sent_at FROM callback_tokens ct LEFT JOIN admin_response_outbox ao ON ao.id = ct.delivery_outbox_id").all() as Array<{ token: string; action: string; consumed_at: number | null; expires_at: number; sent_at: number | null; payload_json: string }>;
     for (const row of rows) {
-      if (!isReusableAction(row.action) && ((row.consumed_at !== null && row.consumed_at < now - 7 * 86_400_000) || (row.expires_at > 0 && row.expires_at < now))) {
+      let invalidatedOldAction = false;
+      if (!isReusableAction(row.action) && row.sent_at !== null && row.sent_at < now - 90 * 86_400_000) {
+        try {
+          const payload = validateJsonPayload(JSON.parse(row.payload_json), "callback token");
+          invalidatedOldAction = typeof payload.actionState === "string" && payload.actionState !== actionState(row.action, payload);
+        } catch { invalidatedOldAction = true; }
+      }
+      if (invalidatedOldAction || (!isReusableAction(row.action) && ((row.consumed_at !== null && row.consumed_at < now - 7 * 86_400_000) || (row.expires_at > 0 && row.expires_at < now)))) {
         tokens += Number(database.raw.query("DELETE FROM callback_tokens WHERE token = ?").run(row.token).changes);
       }
     }

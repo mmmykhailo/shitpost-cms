@@ -1301,3 +1301,22 @@ test("manages signature nicknames across pages, delayed replies, and stale remov
     expect(h.policy.getSignatureAuthor(author.id)?.nickname).toBeNull();
   } finally { h.close(); }
 });
+
+test("delayed resolution replies refuse changed evidence without adopting output", async () => {
+  const h = createHarness();
+  try {
+    const prepared = prepareUncertainPublication(h, 23001, [777]);
+    await h.run(commandUpdate(23001, 23001, "queue"));
+    let menu = h.lastSent();
+    await h.run(callbackUpdate(23002, "review", h.callbackData(menu, "Resolve #1"), menu.message));
+    menu = h.lastSent();
+    await h.run(callbackUpdate(23003, "exact", h.callbackData(menu, "Enter exact destination IDs"), menu.message));
+    const question = h.lastSent();
+    h.clock.advance(86_400_000);
+    h.database.raw.query("UPDATE queue_items SET content_version = content_version + 1 WHERE id = 1").run();
+    await h.run(replyUpdate(23004, 23004, "777", question.message));
+    expect(h.lastSent().message.text).toContain("resolution evidence changed");
+    expect(h.queue.findItemById(prepared.item.id)?.status).toBe("uncertain_publish");
+    expect(h.admin.getPrompt(ADMIN_ID, h.clock.now())).toBeUndefined();
+  } finally { h.close(); }
+});

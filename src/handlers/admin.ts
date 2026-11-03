@@ -162,18 +162,15 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
 
   const beginPrompt = (ctx: Context, spec: PromptSpec): void => {
     const generationId = randomUUID();
+    const state = spec.state as Record<string, unknown>;
+    const guardedState = typeof state.itemId === "number" ? { ...state, actionState: deps.admin.actionState("resolution_prompt", state) } : state;
     const descriptor: AdminResponseDescriptor = { version: 1, text: spec.text, replyMarkup: { kind: "force_reply", ...(spec.placeholder === undefined ? {} : { placeholder: spec.placeholder }) }, prompt: { adminId: deps.config.adminUserId, generationId, kind: spec.kind } };
     deps.updates.transaction(() => {
       clearPrompt();
       const queued = deps.responses.enqueue({ adminChatId: deps.config.adminUserId, updateId: ctx.update.update_id, kind: "prompt", descriptor, now: deps.now() });
-      deps.admin.setPendingPrompt(deps.config.adminUserId, spec.kind, spec.state, generationId, queued.record.id, deps.now());
+      deps.admin.setPendingPrompt(deps.config.adminUserId, spec.kind, guardedState, generationId, queued.record.id, deps.now());
       deps.updates.finish(ctx.update.update_id, "applied", { handled: true, promptQueued: true }, deps.now());
     });
-  };
-
-  const deleteCallbackMenu = (ctx: Context, action: string): void => {
-    void ctx;
-    void action;
   };
 
   const dashboardKeyboard = (): AdminReplyMarkupIntent => keyboard([
@@ -473,6 +470,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       enqueueReply(ctx, "Reply to the active admin prompt to continue, or use /cancel.");
       return true;
     }
+    const targetState = prompt.state as Record<string, unknown>;
+    if (typeof targetState.itemId === "number" && (typeof targetState.actionState !== "string" || targetState.actionState !== deps.admin.actionState("resolution_prompt", targetState))) {
+      clearPrompt();
+      enqueueReply(ctx, "This item's resolution evidence changed. Open Queue and review it again.", { reply_markup: keyboard([[button(deps, "Queue", "queue")]]) });
+      return true;
+    }
     if (prompt.kind === "slot_add") {
       try {
         const slot = parseUtcSlot(text);
@@ -591,7 +594,6 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (!resolved) return enqueueReply(ctx, token && deps.admin.callbackWasProcessed(deps.config.adminUserId, token)
       ? "This confirmation was already processed." : "This button is no longer available. Open a fresh menu.", { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });
     if ("legacy" in resolved && resolved.legacy && !isReusableAction(resolved.action)) return enqueueReply(ctx, "This older confirmation needs a fresh review.", { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });
-    deleteCallbackMenu(ctx, resolved.action);
     const payload = (resolved.payload && typeof resolved.payload === "object" ? resolved.payload : {}) as Record<string, unknown>;
     if (typeof payload.actionState === "string" && payload.actionState !== deps.admin.actionState(resolved.action, payload)) {
       return enqueueReply(ctx, (resolved.action === "publish_execute" ? "The ready queue changed; reopen the dashboard." : resolved.action === "queue_delete_confirm" ? "This item or its source changed. Review it again before deleting." : "The state for this confirmation changed. Review the item or setting again."), { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });

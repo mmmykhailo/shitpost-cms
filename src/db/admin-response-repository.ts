@@ -197,7 +197,7 @@ export const createAdminResponseRepository = (database: AppDatabase) => {
     if (oldest.oldest !== null) result.oldestPendingAt = oldest.oldest;
     return result;
   };
-  const purgeTerminal = (before: number): number => Number(database.raw.query("DELETE FROM admin_response_outbox WHERE state IN ('sent','failed','cancelled') AND created_at < ?").run(before).changes);
+  const purgeTerminal = (before: number): number => Number(database.raw.query("DELETE FROM admin_response_outbox WHERE state IN ('sent','failed','cancelled') AND created_at < ? AND NOT EXISTS (SELECT 1 FROM callback_tokens ct WHERE ct.delivery_outbox_id = admin_response_outbox.id AND ct.consumed_at IS NULL)").run(before).changes);
 
   return { find, findByDedupeKey, enqueue, claimDue, markRequestStarted, markSent, markSentWithAcknowledgement, retry, finishFailed, cancel, cancelByDedupeKey, cancelPending, rearmCancelled, rearmSent, recover, counts, purgeTerminal };
 };
