@@ -75,3 +75,15 @@ _Avoid_: Paused publication, blocked post, frozen message
 **Publication occurrence**:
 One scheduled opportunity to publish a post, at a configured UTC time on a particular date.
 _Avoid_: Queue item, recurring schedule, publication attempt
+
+**Queue author**:
+The person who submitted a post to the queue channel, distinct from the original sender of a forwarded post. A queue author can be identifiable by account or known only through the post's signature.
+_Avoid_: Original sender, channel author
+
+**Queue signature**:
+The exact author name displayed on a queue-channel submission when Telegram exposes no identifiable account. Posts in the same queue with the same signature share its custom nickname.
+_Avoid_: Username, hidden forwarded name
+
+**Credit identity**:
+The person selected for a generated author credit, after giving original-user attribution and friendly-channel forwarding precedence over the queue author.
+_Avoid_: Forward origin, sender chat

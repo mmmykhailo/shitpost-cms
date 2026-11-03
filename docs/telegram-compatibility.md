@@ -24,4 +24,10 @@ The real Telegram checklist remains a deployment prerequisite. It requires a dis
 18. Recovery defaults to the selected messages as shown, and an explicit `--credit-last` bundle transfers its content and standalone credit as one queue item.
 19. A materially changed or recurring issue sends a new notification; an unchanged issue is deduplicated, and failed delivery retries with newly issued callback tokens.
 
+20. Queue-channel posts with profile-linked author signatures expose the expected `from` identity; signature-only posts expose top-level `author_signature`. Confirm both from redacted fixtures for this channel configuration. Do not confuse a forwarded post's signature with the queue submitter.
+21. Direct posts and unlisted-channel copies receive one queue-author nickname credit. Original-user forwards and friendly-channel forwards retain precedence, including Instagram imports that force copy delivery.
+22. A direct album gets one fallback credit; **Queue signatures** supports selection, nickname replacement/removal, and pagination. Admin edits preserve the final visible post.
+23. **First #N** changes the logical publication order without moving Telegram messages or resetting queue age; renewal keeps the promoted position and author credit.
+24. A saved private menu still opens current views after a bot restart and more than ten minutes; repeating navigation works. A valid old confirmation executes once, a changed confirmation explains the changed state, and a delayed reply to the active question still works.
+
 The listed checks are still unverified against live Telegram; the automated suite uses fake transport and local clocks. Record the date, observed Bot API behavior, and any plan changes here before enabling production scheduling. In particular, a failed origin-preservation check blocks the Bot API renewal design. No live Telegram credentials or disposable channels were available during implementation.

@@ -1,6 +1,6 @@
 # Queue priority, queue-author credits, and durable private menus
 
-Investigation date: 2026-11-04. Status: implementation plan; no runtime changes made.
+Investigation date: 2026-11-04. Status: implemented on 2026-11-04. The following records the approved design and investigation; current behavior is summarized in README and `docs/queue-preparation.md`.
 
 ## 1. Requested outcome and working assumptions
 
@@ -288,3 +288,17 @@ Then run `bun run check` and the repository's deployment safety checks (`bun run
 Extend `docs/telegram-compatibility.md` with a disposable-channel check of the actual author fields delivered for this channel configuration, original-user/friendly-channel precedence, one album, signature nickname behavior, front movement, and an old menu after restart. Never log full production message payloads or credentials to obtain fixtures.
 
 Completion means all three behaviors work together: an old queue menu can open a fresh promotion confirmation; the promoted item keeps its correct generated author credit through renewal; a later nickname change refreshes that credit without resetting order or age; and stale mutation evidence produces a concrete reason while navigation remains available.
+
+
+## 9. Implementation record
+
+- Added reusable versioned navigation and durable one-shot mutation confirmations, with transactional mutation/defer receipts, state evidence guards, resource generations, persistent active prompts, and legacy-button fallback.
+- Added guarded First/Last controls using integer logical positions, preserving item identity, source/queue ages, content versions, credits, and error evidence.
+- Added queue-author capture, exact queue-signature nicknames, selected credit identity, nickname refresh, and preservation through preparation, Instagram import, renewal, restart, publication, and admin freeze.
+- Reused existing prepared contracts: captured member snapshots preserve author metadata, while captured nickname revision keys and rendered target names retain the selected credit in operation evidence. No new contract version was required.
+- Historical author metadata is not recoverable from snapshots that never stored it; these posts retain their prior behavior. Already-purged opaque legacy callbacks cannot be reconstructed.
+- Local tests use representative payload fixtures and fake transports. The live Telegram acceptance checklist remains unverified.
+
+Final automated validation: `bun run check:all` passed with **647 tests, 0 failures**, including the coverage gate and deployment/backup checks. Added regressions cover old/repeated navigation, restart and retention, one-shot confirmations, resource replacement, delayed resolution replies, queue ordering guards, author precedence, signature identity, direct media/albums, Instagram import, nickname refresh, and the combined renewal/restart/publication lifecycle.
+
+Valid unconsumed confirmations retain their delivery record so future retention can inspect their evidence. Invalidated confirmations from menus delivered more than 90 days ago are purged; consumed confirmations are purged after seven days. Definitely failed/cancelled delivery tokens are removed, while ambiguous deliveries retain their evidence.

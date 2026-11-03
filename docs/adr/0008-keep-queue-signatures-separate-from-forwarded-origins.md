@@ -1,0 +1,3 @@
+# Credit the queue author separately from the forwarded origin
+
+Direct queue submissions and unlisted-channel/chat copies can need an author credit without changing their delivery origin. Capture the queue author separately, give original-user and friendly-channel attribution precedence, and use account nicknames when Telegram identifies the submitter; a signature-only author instead has an exact-name nickname scoped to this queue, separate from account and hidden-forward identities. This preserves forwarding and editorial behavior while accepting that identical signatures share a nickname and cannot safely be linked to accounts by display name.
