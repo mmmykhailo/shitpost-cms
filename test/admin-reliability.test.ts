@@ -174,7 +174,7 @@ describe("admin response outbox", () => {
     expect(sentPayload?.entities).toEqual([{ type: "bold", offset: 0, length: 6 }]);
     expect(sentPayload?.linkPreviewIsDisabled).toBe(true);
     const markup = sentPayload?.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
-    expect(markup.inline_keyboard[0]?.[0]?.callback_data).toMatch(/^v1:/);
+    expect(markup.inline_keyboard[0]?.[0]?.callback_data).toMatch(/^v2:/);
   });
 
   test("maps managed response receipts and missing receipts to safe durable states", async () => {

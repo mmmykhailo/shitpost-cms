@@ -82,6 +82,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const queue = createQueueRepository(database, { bootId: "admin-test" });
   const policy = createPolicyRepository(database);
   const schedule = createScheduleRepository(database);
+  const clock = createFakeClock(NOW);
   const admin = createAdminRepository(database);
   const responses = createAdminResponseRepository(database);
   const updates = createAdminUpdateRepository(database);
@@ -215,7 +216,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
       }),
     } as AdminDeps["health"],
     logger,
-    now: () => NOW,
+    now: clock.now,
   } as AdminDeps;
   registerAdminHandlers(bot, deps);
   const responseWorker = createAdminResponseWorker({
@@ -225,7 +226,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     adminChatId: ADMIN_CHAT_ID,
     adminUserId: ADMIN_ID,
     bootId: "admin-test",
-    clock: createFakeClock(NOW),
+    clock,
     logger,
   });
   const actionWorker = createAdminActionWorker({
@@ -242,13 +243,14 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     queueChatId: Number(QUEUE_CHAT_ID),
     targetChatId: Number(TARGET_CHAT_ID),
     bootId: "admin-test",
-    clock: createFakeClock(NOW),
+    clock,
     logger,
     setCommands: async () => bot.api.setMyCommands([{ command: "start", description: "Open queue manager" }], { scope: { type: "chat", chat_id: ADMIN_ID } }),
   });
 
   return {
     bot,
+    clock,
     database,
     queue,
     policy,
@@ -606,7 +608,7 @@ describe("admin schedule handlers", () => {
       await harness.run(callbackUpdate(52, "callback-malformed", "other:payload", menu.message));
 
       expect(harness.deleted).toEqual([]);
-      expect(harness.lastSent().message.text).toBe("Stale action.");
+      expect(harness.lastSent().message.text).toBe("This button is no longer available. Open a fresh menu.");
     } finally {
       harness.close();
     }
@@ -930,7 +932,7 @@ describe("admin command, queue, and publication handlers", () => {
       const staleToken = harness.admin.createCallbackToken(ADMIN_ID, "queue_move_end", { itemId: stale.id }, NOW, stale.contentVersion);
       harness.queue.updateSnapshot(QUEUE_CHAT_ID, 952, snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(952), editDate: NOW + 1, text: "changed" }));
       await harness.run(callbackUpdate(349, "stale", `v1:${staleToken}`, makeMessage(349, "menu", BOT_INFO)));
-      expect(harness.lastSent().message.text).toContain("changed");
+      expect(harness.lastSent().message.text).toContain("Move queue item");
 
       const missing = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(953) }), NOW + 3).item;
       const missingToken = harness.admin.createCallbackToken(ADMIN_ID, "queue_delete_confirm", { itemId: missing.id }, NOW, missing.contentVersion);
@@ -1190,5 +1192,57 @@ describe("admin uncertainty resolution handlers", () => {
     } finally {
       renewalDelete.close();
     }
+  });
+});
+
+
+describe("durable private menus", () => {
+  test("reuses navigation after time, retention, and repeated clicks, while prompts remain bound", async () => {
+    const h = createHarness();
+    try {
+      await h.run(commandUpdate(20001, 20001, "manage"));
+      const original = h.lastSent();
+      const queueButton = h.callbackData(original, "Queue");
+      expect(queueButton).toBe("v2:queue");
+      h.clock.advance(8 * 86_400_000);
+      h.admin.purgeExpiredTokensAndPrompts(h.clock.now());
+      await h.run(callbackUpdate(20002, "old-menu", queueButton, original.message));
+      expect(h.lastSent().message.text).toContain("Queue · logical order");
+      await h.run(callbackUpdate(20003, "old-menu-again", queueButton, original.message));
+      expect(h.lastSent().message.text).toContain("Queue · logical order");
+      await h.run(callbackUpdate(20004, "old-schedule", h.callbackData(original, "Schedule"), original.message));
+      const menu = h.lastSent();
+      await h.run(callbackUpdate(20005, "question", h.callbackData(menu, "Add UTC slot"), menu.message));
+      const question = h.lastSent();
+      h.clock.advance(86_400_000);
+      h.admin.purgeExpiredTokensAndPrompts(h.clock.now());
+      await h.run(replyUpdate(20006, 20006, "12:34", question.message));
+      expect(h.schedule.slots()).toContain(12 * 60 + 34);
+    } finally { h.close(); }
+  });
+
+  test("old valid confirmations execute once and replaced resource confirmations are stale", async () => {
+    const h = createHarness();
+    try {
+      h.schedule.addSlot(600, ADMIN_ID, NOW);
+      await h.run(commandUpdate(20101, 20101, "schedule"));
+      const menu = h.lastSent();
+      const removal = h.callbackData(menu, "Remove 10:00 UTC");
+      h.clock.advance(86_400_000);
+      await h.run(callbackUpdate(20102, "old-remove", removal, menu.message));
+      expect(h.schedule.slots()).toEqual([]);
+      h.schedule.addSlot(600, ADMIN_ID, h.clock.now());
+      await h.run(callbackUpdate(20103, "old-remove-repeat", removal, menu.message));
+      expect(h.lastSent().message.text).toContain("already processed");
+      expect(h.schedule.slots()).toEqual([600]);
+      await h.run(commandUpdate(20104, 20104, "schedule"));
+      const replacementMenu = h.lastSent();
+      const stale = h.callbackData(replacementMenu, "Remove 10:00 UTC");
+      h.schedule.removeSlot(600, ADMIN_ID, h.clock.now());
+      h.schedule.addSlot(600, ADMIN_ID, h.clock.now());
+      await h.run(callbackUpdate(20105, "stale-remove", stale, replacementMenu.message));
+      expect(h.lastSent().message.text).toContain("changed");
+      expect(h.schedule.slots()).toEqual([600]);
+    } finally { h.close(); }
   });
 });

@@ -1,3 +1,4 @@
+import { encodeReusableCallback } from "../domain/admin-callback";
 import { randomUUID } from "node:crypto";
 import type { AdminResponseKind, AdminResponseRecord, AdminResponseRepository } from "../db/admin-response-repository";
 import type { AdminRepository } from "../db/admin-repository";
@@ -51,11 +52,11 @@ export const createAdminResponseWorker = (input: {
     acknowledgeDelivered(dedupeKey: string, fingerprint: string | undefined, mode: "periodic" | "on_change" | "resolution", now: number): void;
   };
 }) => {
-  const renderKeyboard = (markup: AdminReplyMarkupIntent, now: number): unknown => {
+  const renderKeyboard = (markup: AdminReplyMarkupIntent, now: number, outboxId?: string): unknown => {
     if (markup.kind === "force_reply") return { force_reply: true, ...(markup.placeholder === undefined ? {} : { input_field_placeholder: markup.placeholder }) };
     return { inline_keyboard: markup.rows.map((row) => row.map((button) => ({
       text: button.text,
-      callback_data: `v1:${input.admin.createCallbackToken(input.adminUserId, button.action, button.payload, now, button.itemVersion)}`,
+      callback_data: encodeReusableCallback(button.action, button.payload) ?? `v1:${input.admin.createCallbackToken(input.adminUserId, button.action, button.payload, now, button.itemVersion, 0, outboxId)}`,
     }))) };
   };
 
@@ -117,7 +118,7 @@ export const createAdminResponseWorker = (input: {
       const recordPayload = typeof payload === "object" && payload !== null ? payload as Record<string, unknown> : undefined;
       if (recordPayload === undefined) throw new Error("Telegram send payload is unavailable at dispatch");
       ensureStillEligible();
-      if (record.descriptor.replyMarkup !== undefined) recordPayload.reply_markup = renderKeyboard(record.descriptor.replyMarkup, input.clock.now());
+      if (record.descriptor.replyMarkup !== undefined) recordPayload.reply_markup = renderKeyboard(record.descriptor.replyMarkup, input.clock.now(), record.id);
       if (!input.responses.markRequestStarted(record.id, claimToken, input.clock.now())) throw new TelegramLocalDeferralError("cancelled", input.clock.now(), "Admin response was cancelled before delivery");
       started = true;
     };
@@ -127,7 +128,7 @@ export const createAdminResponseWorker = (input: {
     try {
       if (input.gateway.dispatchManaged === true) {
         const placeholder = record.descriptor.replyMarkup === undefined ? undefined
-          : record.descriptor.replyMarkup.kind === "force_reply" ? renderKeyboard(record.descriptor.replyMarkup, input.clock.now())
+          : record.descriptor.replyMarkup.kind === "force_reply" ? renderKeyboard(record.descriptor.replyMarkup, input.clock.now(), record.id)
             : { inline_keyboard: [] };
         const replyMarkup = placeholder as Parameters<TelegramGateway["sendAdminMessage"]>[0]["replyMarkup"];
         await withTelegramMutationScope(scope, () => input.gateway.sendAdminMessage({
@@ -140,7 +141,7 @@ export const createAdminResponseWorker = (input: {
       } else {
         ensureStillEligible();
         const now = input.clock.now();
-        const replyMarkup = record.descriptor.replyMarkup === undefined ? undefined : renderKeyboard(record.descriptor.replyMarkup, now) as Parameters<TelegramGateway["sendAdminMessage"]>[0]["replyMarkup"];
+        const replyMarkup = record.descriptor.replyMarkup === undefined ? undefined : renderKeyboard(record.descriptor.replyMarkup, now, record.id) as Parameters<TelegramGateway["sendAdminMessage"]>[0]["replyMarkup"];
         if (!input.responses.markRequestStarted(record.id, claimToken, now)) throw new TelegramLocalDeferralError("cancelled", now, "Admin response was cancelled before delivery");
         started = true;
         const messageId = await input.gateway.sendAdminMessage({ chatId: record.adminChatId as never, text: record.descriptor.text, ...(record.descriptor.entities === undefined ? {} : { entities: record.descriptor.entities as never }), ...(record.descriptor.disableLinkPreview === undefined ? {} : { linkPreviewIsDisabled: record.descriptor.disableLinkPreview }), ...(replyMarkup === undefined ? {} : { replyMarkup }) });

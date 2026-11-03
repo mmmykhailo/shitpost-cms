@@ -260,8 +260,8 @@ describe("operations safety net", () => {
     expect(admin.consumeCallbackToken(999, expired, 400)).toBeUndefined();
     expect(admin.consumeCallbackToken(7, expired, 401)).toBeUndefined();
 
-    const valid = admin.createCallbackToken(7, "publish", { item: 2 }, 500, 3, 100);
-    expect(admin.consumeCallbackToken(7, valid, 501)).toEqual({ action: "publish", payload: { item: 2 }, itemVersion: 3 });
+    const valid = admin.createCallbackToken(7, "publish_execute", { item: 2 }, 500, 3, 100);
+    expect(admin.consumeCallbackToken(7, valid, 501)).toEqual({ action: "publish_execute", payload: { item: 2 }, itemVersion: 3 });
     expect(admin.consumeCallbackToken(7, valid, 502)).toBeUndefined();
 
     const corrupt = admin.createCallbackToken(7, "corrupt", { item: 3 }, 600, undefined, 100);

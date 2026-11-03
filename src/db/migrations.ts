@@ -686,6 +686,20 @@ const migrations: readonly Migration[] = [
        WHERE state = 'pending' AND coalesce_key LIKE 'instagram-progress:%'`,
     ],
   },
+  {
+    version: 14,
+    statements: [
+      `ALTER TABLE callback_tokens ADD COLUMN legacy_token INTEGER NOT NULL DEFAULT 1`,
+      `ALTER TABLE callback_tokens ADD COLUMN delivery_outbox_id TEXT`,
+      `UPDATE admin_prompts SET expires_at = 0`,
+      `CREATE TABLE admin_resource_revisions (resource TEXT PRIMARY KEY, revision INTEGER NOT NULL)`,
+      ...["channel_whitelist", "schedule_slots"].flatMap((table) => ["INSERT", "UPDATE", "DELETE"].map((event) =>
+        `CREATE TRIGGER ${table}_${event.toLowerCase()}_revision AFTER ${event} ON ${table} BEGIN
+          INSERT INTO admin_resource_revisions(resource, revision) VALUES ('${table}:' || ${event === "DELETE" ? "OLD" : "NEW"}.${table === "channel_whitelist" ? "chat_id" : "minute_of_day"}, 1)
+          ON CONFLICT(resource) DO UPDATE SET revision = revision + 1;
+        END`)),
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {
