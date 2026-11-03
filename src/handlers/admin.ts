@@ -1,3 +1,4 @@
+import { canReorder } from "../domain/queue-item";
 import { decodeReusableCallback, isReusableAction } from "../domain/admin-callback";
 import type { Bot, Context } from "grammy";
 import { classifyTelegramError } from "../errors";
@@ -251,8 +252,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       else if (item.preparationState === "uncertain") actions.push(button(deps, `Resolve preparation #${item.id}`, "preparation_uncertain", { itemId: item.id }, item.contentVersion));
       else if (item.maintenanceStatus === "uncertain_renewal") actions.push(button(deps, `Resolve renewal #${item.id}`, "renewal_uncertain", { itemId: item.id }, item.contentVersion));
       else if (["blocked", "needs_edit", "needs_review", "delete_blocked"].includes(item.status)) actions.push(button(deps, `Retry #${item.id}`, "queue_retry", { itemId: item.id }, item.contentVersion));
-      actions.push(button(deps, `Move #${item.id}`, "queue_move_end", { itemId: item.id }, item.contentVersion));
       rows.push(actions);
+      if (canReorder(item)) rows.push([
+        button(deps, `First #${item.id}`, "queue_move_first", { itemId: item.id }),
+        button(deps, `Last #${item.id}`, "queue_move_end", { itemId: item.id }),
+      ]);
     }
     const navigation: Array<Awaited<ReturnType<typeof button>>> = [];
     if (offset > 0) navigation.push(button(deps, "Previous", "queue", { offset: Math.max(0, offset - pageSize) }));
@@ -686,19 +690,22 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         deps.admin.audit("queue_retry", String(deps.config.adminUserId), deps.now(), itemId, undefined, { previousStatus: item.status });
         return sendQueue(ctx);
       }
+      case "queue_move_first":
       case "queue_move_end": {
         if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
         const item = deps.queue.findItemById(itemId);
-        if (!item) return enqueueReply(ctx, "Queue item no longer exists.");
-        const confirm = button(deps, "Confirm move to end", "queue_move_execute", { itemId }, item.contentVersion);
-        return enqueueReply(ctx, `Move queue item #${itemId} to the FIFO end?`, { reply_markup: keyboard([[confirm], [button(deps, "Cancel", "queue")]]) });
+        if (!item || !canReorder(item)) return enqueueReply(ctx, "This item is no longer available to move; an operation or issue resolution may be in progress.");
+        const first = resolved.action === "queue_move_first";
+        const confirm = button(deps, first ? "Confirm move to first" : "Confirm move to end", first ? "queue_move_first_execute" : "queue_move_execute", { itemId, position: item.logicalSequence });
+        return enqueueReply(ctx, `Move queue item #${itemId} to the ${first ? "first position" : "FIFO end"}? Items with unresolved issues are still skipped.`, { reply_markup: keyboard([[confirm], [button(deps, "Cancel", "queue")]]) });
       }
+      case "queue_move_first_execute":
       case "queue_move_execute": {
-        if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
-        const item = deps.queue.findItemById(itemId);
-        if (!item || item.status === "done" || item.status === "deleted" || item.status === "deleted_external") return enqueueReply(ctx, "Queue item changed; reopen the queue.");
-        deps.queue.moveToEnd(itemId, deps.now());
-        deps.admin.audit("queue_moved_to_end", String(deps.config.adminUserId), deps.now(), itemId, undefined, { contentVersion: item.contentVersion });
+        if (itemId === undefined || typeof payload.position !== "number") return enqueueReply(ctx, "Review the queue again before moving this item.");
+        const outcome = resolved.action === "queue_move_first_execute"
+          ? deps.queue.moveToFirst(itemId, deps.now(), payload.position, deps.config.adminUserId)
+          : deps.queue.moveToEnd(itemId, deps.now(), payload.position, deps.config.adminUserId);
+        if (outcome !== "moved") enqueueReply(ctx, outcome === "already_first" || outcome === "already_last" ? `Queue item #${itemId} is already ${outcome === "already_first" ? "first" : "last"}.` : `Queue item #${itemId} cannot be moved (${outcome.replaceAll("_", " ")}). Review the queue again.`);
         return sendQueue(ctx);
       }
       case "queue_uncertain": {

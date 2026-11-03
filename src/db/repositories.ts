@@ -1,7 +1,7 @@
 import type { AppDatabase } from "./database";
 import { randomUUID } from "node:crypto";
 import { INSTAGRAM_UPLOAD_TIMEOUT_MS } from "../domain/instagram-reel";
-import { assertStatusTransition, isSourceBearing, type QueueItemRecord } from "../domain/queue-item";
+import { assertStatusTransition, isSourceBearing, canReorder, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
 import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { inspectInlineCreditEdit } from "../domain/attribution";
@@ -1476,10 +1476,24 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return nextGeneration;
   });
 
-  const moveToEnd = (itemId: number, now: number): void => database.transaction(() => {
-    const nextSequence = database.raw.query("SELECT COALESCE(MAX(logical_sequence), 0) + 1 AS value FROM queue_items").get() as { value: number };
-    database.raw.query("UPDATE queue_items SET logical_sequence = ?, last_error_code = 'moved_to_end', last_error = NULL WHERE id = ? AND status NOT IN ('done','deleted','deleted_external')").run(nextSequence.value, itemId);
+  const move = (itemId: number, direction: "first" | "end", now: number, expectedPosition?: number, adminId?: number): "moved" | "already_first" | "already_last" | "missing" | "terminal" | "busy" | "position_changed" => database.transaction(() => {
+    const item = findItemById(itemId);
+    if (!item) return "missing";
+    if (["done", "deleted", "deleted_external"].includes(item.status)) return "terminal";
+    if (!canReorder(item) || database.raw.query("SELECT 1 FROM operations WHERE item_id = ? AND state IN ('running','outputs_recorded','cleanup_pending','uncertain') UNION ALL SELECT 1 FROM queue_preparation_operations WHERE item_id = ? AND state IN ('running','outputs_recorded','cleanup_pending','uncertain') LIMIT 1").get(itemId, itemId)) return "busy";
+    if (expectedPosition !== undefined && item.logicalSequence !== expectedPosition) return "position_changed";
+    const boundary = database.raw.query(`SELECT id FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external') ORDER BY logical_sequence ${direction === "first" ? "ASC" : "DESC"} LIMIT 1`).get() as { id: number };
+    if (boundary.id === itemId) return direction === "first" ? "already_first" : "already_last";
+    const edge = database.raw.query(`SELECT ${direction === "first" ? "MIN" : "MAX"}(logical_sequence) AS value FROM queue_items`).get() as { value: number };
+    const position = edge.value + (direction === "first" ? -1 : 1);
+    if (!Number.isSafeInteger(position)) throw new RangeError("Queue position limit reached; the order was not changed");
+    const changed = database.raw.query("UPDATE queue_items SET logical_sequence = ? WHERE id = ? AND logical_sequence = ?").run(position, itemId, item.logicalSequence);
+    if (Number(changed.changes) !== 1) return "position_changed";
+    database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?)").run(`queue_moved_to_${direction}`, String(adminId ?? "admin"), itemId, JSON.stringify({ previousPosition: item.logicalSequence, position }), now);
+    return "moved";
   });
+  const moveToFirst = (itemId: number, now: number, expectedPosition?: number, adminId?: number) => move(itemId, "first", now, expectedPosition, adminId);
+  const moveToEnd = (itemId: number, now: number, expectedPosition?: number, adminId?: number) => move(itemId, "end", now, expectedPosition, adminId);
 
   const statusCounts = (): Record<string, number> => {
     const counts: Record<string, number> = {};
@@ -1643,6 +1657,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     resolveUncertainRenewal,
     adoptUncertainRenewalGeneration,
     moveToEnd,
+    moveToFirst,
     statusCounts,
     currentSourceIds,
     getCurrentSnapshotSet,

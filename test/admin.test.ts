@@ -916,10 +916,10 @@ describe("admin command, queue, and publication handlers", () => {
       const second = harness.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(951) }), NOW + 1).item;
       await harness.run(commandUpdate(343, 343, "queue"));
       menu = harness.lastSent();
-      await harness.run(callbackUpdate(344, "move", harness.callbackData(menu, `Move #${second.id}`), menu.message));
+      await harness.run(callbackUpdate(344, "move", harness.callbackData(menu, `Last #${second.id}`), menu.message));
       confirmation = harness.lastSent();
       await harness.run(callbackUpdate(345, "move-confirm", harness.callbackData(confirmation, "Confirm move to end"), confirmation.message));
-      expect(harness.queue.findItemById(second.id)?.lastErrorCode).toBe("moved_to_end");
+      expect(harness.queue.listActive().at(-1)?.id).toBe(second.id);
 
       await harness.run(commandUpdate(346, 346, "queue"));
       menu = harness.lastSent();
@@ -1245,4 +1245,23 @@ describe("durable private menus", () => {
       expect(h.schedule.slots()).toEqual([600]);
     } finally { h.close(); }
   });
+});
+
+test("promotes an item from an old queue view with a fresh guarded confirmation", async () => {
+  const h = createHarness();
+  try {
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(21001) }), NOW);
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(21002) }), NOW + 1);
+    await h.run(commandUpdate(21001, 21001, "queue"));
+    const menu = h.lastSent();
+    h.clock.advance(86_400_000);
+    await h.run(callbackUpdate(21002, "first", h.callbackData(menu, "First #2"), menu.message));
+    const confirmation = h.lastSent();
+    const token = h.callbackData(confirmation, "Confirm move to first");
+    await h.run(callbackUpdate(21003, "confirm-first", token, confirmation.message));
+    expect(h.queue.listActive().map(i => i.id)).toEqual([2, 1]);
+    await h.run(callbackUpdate(21004, "confirm-first-again", token, confirmation.message));
+    expect(h.lastSent().message.text).toContain("already processed");
+    expect(h.queue.listActive().map(i => i.id)).toEqual([2, 1]);
+  } finally { h.close(); }
 });

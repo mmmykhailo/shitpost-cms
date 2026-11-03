@@ -87,3 +87,10 @@ export const assertStatusTransition = (from: QueueItemStatus, to: QueueItemStatu
 
 export const sortSnapshots = (snapshots: readonly StoredMessageSnapshot[]): StoredMessageSnapshot[] =>
   [...snapshots].sort((left, right) => left.messageId - right.messageId).map((snapshot, ordinal) => ({ ...snapshot, ordinal }));
+
+/** Reordering never clears a publishing, preparation, renewal, or review claim. */
+export const canReorder = (item: QueueItemRecord): boolean =>
+  ["queued", "blocked", "needs_edit", "needs_review"].includes(item.status)
+  && item.maintenanceStatus === "idle" && item.maintenanceOperationId === undefined
+  && item.claimedOperationId === undefined && item.preparationOperationId === undefined
+  && item.preparationState !== "uncertain";
