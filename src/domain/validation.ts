@@ -1,4 +1,4 @@
-import type { AttributionDescriptor, ContentType, DeliveryMode, ExecutionProgress, MemberRole, MessageEntity, PreparationContractV1, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot, TransferStep } from "../types";
+import type { CreditIdentity, QueueAuthor, AttributionDescriptor, ContentType, DeliveryMode, ExecutionProgress, MemberRole, MessageEntity, PreparationContractV1, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot, TransferStep } from "../types";
 import { asChatId, asMessageId, asUserId, type MessageId } from "../types";
 
 export class StoredDataValidationError extends Error {
@@ -104,6 +104,29 @@ const validateEntities = (value: unknown, field: string): readonly MessageEntity
   return value.map(validateEntity);
 };
 
+export const validateQueueAuthor = (value: unknown): QueueAuthor => {
+  const candidate = record(value);
+  if (candidate.kind === "user") {
+    const user = validateSemanticOrigin(candidate);
+    if (user.kind !== "user" || !Number.isSafeInteger(user.userId) || user.userId <= 0) throw new StoredDataValidationError("Invalid queue author user");
+    return user;
+  }
+  if (candidate.kind === "signature" && typeof candidate.exactName === "string" && candidate.exactName.trim().length > 0) return { kind: "signature", exactName: candidate.exactName };
+  throw new StoredDataValidationError("Invalid queue author");
+};
+
+export const validateCreditIdentity = (value: unknown): CreditIdentity => {
+  const candidate = record(value);
+  if (candidate.kind === "signature") {
+    const author = validateQueueAuthor(candidate);
+    if (author.kind !== "signature") throw new StoredDataValidationError("Invalid signature identity");
+    return { ...author, queueChatId: asChatId(integer(candidate.queueChatId, "queueChatId")) };
+  }
+  const origin = validateSemanticOrigin(value);
+  if (origin.kind !== "user" && origin.kind !== "hidden_user") throw new StoredDataValidationError("Invalid credit identity");
+  return origin;
+};
+
 export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnapshot => {
   const candidate = record(value);
   if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) throw new StoredDataValidationError("Unsupported snapshot schema version");
@@ -143,6 +166,7 @@ export const validateStoredMessageSnapshot = (value: unknown): StoredMessageSnap
     if (updateId < 0) throw new StoredDataValidationError("telegramUpdateId must be non-negative");
     result.telegramUpdateId = updateId;
   }
+  if (candidate.queueAuthor !== undefined) result.queueAuthor = validateQueueAuthor(candidate.queueAuthor);
   if (candidate.nativeOrigin !== undefined) result.nativeOrigin = validateSemanticOrigin(candidate.nativeOrigin);
   const contentFingerprint = optionalString(candidate.contentFingerprint, "contentFingerprint");
   if (contentFingerprint !== undefined) {

@@ -700,6 +700,24 @@ const migrations: readonly Migration[] = [
         END`)),
     ],
   },
+  {
+    version: 15,
+    statements: [
+      `ALTER TABLE queue_items ADD COLUMN queue_author_json TEXT`,
+      `ALTER TABLE queue_items ADD COLUMN credit_identity_json TEXT`,
+      `UPDATE queue_items SET credit_identity_json = origin_json WHERE json_extract(origin_json, '$.kind') IN ('user','hidden_user')`,
+      `CREATE TABLE known_queue_signature_authors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_chat_id INTEGER NOT NULL,
+        exact_name TEXT NOT NULL COLLATE BINARY,
+        nickname TEXT,
+        alias_revision INTEGER NOT NULL DEFAULT 0,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        UNIQUE(queue_chat_id, exact_name)
+      )`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

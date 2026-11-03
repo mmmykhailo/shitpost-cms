@@ -56,7 +56,7 @@ export const createAdminResponseWorker = (input: {
     if (markup.kind === "force_reply") return { force_reply: true, ...(markup.placeholder === undefined ? {} : { input_field_placeholder: markup.placeholder }) };
     return { inline_keyboard: markup.rows.map((row) => row.map((button) => ({
       text: button.text,
-      callback_data: encodeReusableCallback(button.action, button.payload) ?? `v1:${input.admin.createCallbackToken(input.adminUserId, button.action, button.payload, now, button.itemVersion, 0, outboxId)}`,
+      callback_data: encodeReusableCallback(button.action, button.payload) ?? `v1:${input.admin.createCallbackToken(input.adminUserId, button.action, { ...(button.payload as Record<string, unknown>), actionState: (button.payload as Record<string, unknown>)?.actionState ?? input.admin.actionState(button.action, button.payload as Record<string, unknown>) }, now, button.itemVersion, 0, outboxId)}`,
     }))) };
   };
 

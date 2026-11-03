@@ -89,7 +89,10 @@ export const createPendingUpdateRepository = (database: AppDatabase) => {
         else if (updateId !== undefined && oldUpdateId !== undefined && updateId !== oldUpdateId) useIncomingSnapshot = updateId > oldUpdateId;
         else useIncomingSnapshot = receivedAt >= previous.receivedAt;
       }
-      const savedSnapshot = useIncomingSnapshot ? snapshot : previous!.snapshot;
+      let savedSnapshot = useIncomingSnapshot ? snapshot : previous!.snapshot;
+      // An edit can expose the editor rather than the original submitter.
+      if (previous?.updateKind === "post" && previous.snapshot.queueAuthor) savedSnapshot = { ...savedSnapshot, queueAuthor: previous.snapshot.queueAuthor };
+      else if (updateKind === "post" && snapshot.queueAuthor) savedSnapshot = { ...savedSnapshot, queueAuthor: snapshot.queueAuthor };
       const keepMarker = previous?.unmatchedEditAt !== undefined && (markerAt === undefined || previous.unmatchedEditAt <= markerAt);
       const savedMarkerAt = keepMarker ? previous!.unmatchedEditAt : markerAt;
       const savedMarkerUpdateId = keepMarker ? previous!.unmatchedEditUpdateId : markerUpdateId;

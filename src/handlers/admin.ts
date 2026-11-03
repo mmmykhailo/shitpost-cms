@@ -347,7 +347,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const authors = deps.policy.listAuthors();
     offset = Math.min(offset, Math.max(0, Math.floor((authors.length - 1) / 20) * 20));
     const page = authors.slice(offset, offset + 20);
-    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[button(deps, "Set alias", "alias_add"), button(deps, "Hidden sender names", "hidden_authors", { offset: 0 })]];
+    const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[button(deps, "Set alias", "alias_add"), button(deps, "Hidden sender names", "hidden_authors", { offset: 0 })], [button(deps, "Queue signatures", "signature_authors", { offset: 0 })]];
     for (const author of page.filter((entry) => entry.alias)) rows.push([button(deps, `Remove alias ${author.userId}`, "alias_remove", { userId: author.userId })]);
     if (offset > 0 || offset + 20 < authors.length) rows.push([
       ...(offset > 0 ? [button(deps, "Previous", "authors_page", { offset: Math.max(0, offset - 20) })] : []),
@@ -357,6 +357,28 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     const lines = [`Observed user authors (${authors.length === 0 ? 0 : offset + 1}–${Math.min(offset + 20, authors.length)} of ${authors.length})`, ...page.map((author) => `${author.userId} · ${cleanDisplay(author.displayName)}${author.username ? ` @${cleanDisplay(author.username)}` : ""}${author.alias ? ` → ${cleanDisplay(author.alias)}` : ""}`)];
     if (notice !== undefined) lines.unshift(notice);
     enqueueReply(ctx, lines.join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:authors`);
+  };
+
+  const sendSignatureAuthors = (ctx: Context, offset = 0, notice?: string): void => {
+    const count = deps.policy.countSignatureAuthors(deps.config.queueChannelId);
+    offset = Math.min(offset, Math.max(0, Math.floor((count - 1) / 20) * 20));
+    const authors = deps.policy.listSignatureAuthors(deps.config.queueChannelId, 20, offset);
+    const rows: AdminActionButton[][] = authors.map(author => [button(deps, `${safeDisplayName(author.exactName)}${author.nickname ? ` → ${cleanDisplay(author.nickname)}` : ""}`, "signature_author_select", { signatureAuthorId: author.id })]);
+    if (offset > 0 || offset + authors.length < count) rows.push([
+      ...(offset > 0 ? [button(deps, "Previous", "signature_authors", { offset: Math.max(0, offset - 20) })] : []),
+      ...(offset + authors.length < count ? [button(deps, "Next", "signature_authors", { offset: offset + 20 })] : []),
+    ]);
+    rows.push([button(deps, "Back to users", "authors")]);
+    enqueueReply(ctx, [notice, `Queue signatures (${count === 0 ? 0 : offset + 1}–${Math.min(offset + authors.length, count)} of ${count})`, "Signature nicknames apply to every queue author with that exact signature in this queue.", ...authors.map(a => safeDisplayName(a.exactName))].filter(Boolean).join("\n"), { reply_markup: keyboard(rows) }, "view", `admin:${deps.config.adminUserId}:view:signature-authors`);
+  };
+
+  const sendSignatureAuthor = (ctx: Context, signatureAuthorId: number, notice?: string): void => {
+    const author = deps.policy.getSignatureAuthor(signatureAuthorId);
+    if (!author || author.queueChatId !== deps.config.queueChannelId) return sendSignatureAuthors(ctx, 0, "This queue signature is no longer available.");
+    const rows = [[button(deps, "Set or replace nickname", "signature_alias_set", { signatureAuthorId })]];
+    if (author.nickname) rows.push([button(deps, "Remove nickname", "signature_alias_remove", { signatureAuthorId })]);
+    rows.push([button(deps, "Back", "signature_authors")]);
+    enqueueReply(ctx, [notice, safeDisplayName(author.exactName), "A nickname applies to this exact queue signature, separately from account and hidden sender nicknames.", `Current nickname: ${author.nickname ? cleanDisplay(author.nickname) : "none"}`].filter(Boolean).join("\n"), { reply_markup: keyboard(rows) });
   };
 
   const sendHiddenAuthors = (ctx: Context, offset = 0, notice?: string): void => {
@@ -492,9 +514,24 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       }
       return true;
     }
+    if (prompt.kind === "signature_alias") {
+      const state = prompt.state as { signatureAuthorId?: number; revision?: number };
+      const author = state.signatureAuthorId === undefined ? undefined : deps.policy.getSignatureAuthor(state.signatureAuthorId);
+      if (!author || author.queueChatId !== deps.config.queueChannelId || author.aliasRevision !== state.revision) {
+        clearPrompt(); sendSignatureAuthors(ctx, 0, "This signature nickname changed; select it again."); return true;
+      }
+      try {
+        deps.policy.setSignatureAlias(author.id, validateAlias(text), deps.config.adminUserId, deps.now());
+        clearPrompt(); sendSignatureAuthor(ctx, author.id, "Queue signature nickname saved.");
+      } catch (error) { enqueueReply(ctx, error instanceof Error ? error.message : "Could not save nickname."); }
+      return true;
+    }
     if (prompt.kind === "hidden_alias") {
       const state = prompt.state && typeof prompt.state === "object" ? prompt.state as Record<string, unknown> : {};
       const hiddenAuthorId = typeof state.hiddenAuthorId === "number" ? state.hiddenAuthorId : undefined;
+      if (hiddenAuthorId !== undefined && typeof state.revision === "number" && deps.policy.getHiddenAuthor(hiddenAuthorId)?.aliasRevision !== state.revision) {
+        clearPrompt(); sendHiddenAuthors(ctx, 0, "This nickname changed; select the hidden sender again."); return true;
+      }
       if (hiddenAuthorId === undefined) { clearPrompt(); enqueueReply(ctx, "The selected hidden sender has expired."); return true; }
       try {
         deps.policy.setHiddenAlias(hiddenAuthorId, validateAlias(text), deps.config.adminUserId, deps.now());
@@ -574,11 +611,24 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
       case "whitelist": return sendWhitelist(ctx);
       case "authors": return sendAuthors(ctx);
       case "authors_page": return sendAuthors(ctx, undefined, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
+      case "signature_authors": return sendSignatureAuthors(ctx, typeof payload.offset === "number" ? payload.offset : 0);
+      case "signature_author_select": return typeof payload.signatureAuthorId === "number" ? sendSignatureAuthor(ctx, payload.signatureAuthorId) : enqueueReply(ctx, "Invalid queue signature.");
+      case "signature_alias_set": {
+        const author = typeof payload.signatureAuthorId === "number" ? deps.policy.getSignatureAuthor(payload.signatureAuthorId) : undefined;
+        if (!author || author.queueChatId !== deps.config.queueChannelId) return enqueueReply(ctx, "This queue signature is no longer available.");
+        return beginPrompt(ctx, { kind: "signature_alias", state: { signatureAuthorId: author.id, revision: author.aliasRevision }, text: "Reply with the nickname for this exact queue author signature.", placeholder: "Nickname" });
+      }
+      case "signature_alias_remove": {
+        const author = typeof payload.signatureAuthorId === "number" ? deps.policy.getSignatureAuthor(payload.signatureAuthorId) : undefined;
+        if (!author || author.queueChatId !== deps.config.queueChannelId) return enqueueReply(ctx, "This queue signature is no longer available.");
+        deps.policy.setSignatureAlias(author.id, null, deps.config.adminUserId, deps.now());
+        return sendSignatureAuthor(ctx, author.id, "Queue signature nickname removed.");
+      }
       case "hidden_authors": return sendHiddenAuthors(ctx, typeof payload.offset === "number" ? Math.max(0, payload.offset) : 0);
       case "hidden_author_select": return typeof payload.hiddenAuthorId === "number" ? sendHiddenAuthor(ctx, payload.hiddenAuthorId) : enqueueReply(ctx, "Invalid hidden sender selection.");
       case "hidden_alias_set": {
         if (typeof payload.hiddenAuthorId !== "number" || !deps.policy.getHiddenAuthor(payload.hiddenAuthorId)) return enqueueReply(ctx, "This hidden sender is no longer available.");
-        return beginPrompt(ctx, { kind: "hidden_alias", state: { hiddenAuthorId: payload.hiddenAuthorId }, text: "Reply with the nickname for this exact hidden sender name.", placeholder: "Nickname" });
+        return beginPrompt(ctx, { kind: "hidden_alias", state: { hiddenAuthorId: payload.hiddenAuthorId, revision: deps.policy.getHiddenAuthor(payload.hiddenAuthorId)!.aliasRevision }, text: "Reply with the nickname for this exact hidden sender name.", placeholder: "Nickname" });
       }
       case "hidden_alias_remove": {
         if (typeof payload.hiddenAuthorId !== "number") return enqueueReply(ctx, "Invalid hidden sender.");
@@ -886,6 +936,6 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (!isAuthorized(ctx, deps.config.adminUserId)) return reject(ctx);
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
-    await handlePrompt(ctx, text);
+    deps.updates.transaction(() => { handlePrompt(ctx, text); deps.updates.finish(ctx.update.update_id, "applied", { handled: true }, deps.now()); });
   });
 };

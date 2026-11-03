@@ -79,8 +79,9 @@ export const createAdminRepository = (database: AppDatabase) => {
   /** Captures only state that this action depends on, not wall-clock age. */
   const actionState = (action: string, payload: Record<string, unknown>): string => {
     if (typeof payload.itemId === "number") {
-      const item = database.raw.query("SELECT status, content_version, source_generation, logical_sequence, maintenance_status, maintenance_operation_id, preparation_state, preparation_operation_id, last_error_code, claimed_operation_id FROM queue_items WHERE id = ?").get(payload.itemId) as Record<string, unknown> | null;
+      const item = database.raw.query("SELECT status, content_version, source_generation, logical_sequence, maintenance_status, maintenance_operation_id, preparation_state, preparation_operation_id, last_error_code, last_error, retry_not_before, attempts, claimed_operation_id FROM queue_items WHERE id = ?").get(payload.itemId) as Record<string, unknown> | null;
       if (action === "queue_move_execute" || action === "queue_move_first_execute") return JSON.stringify(item && { position: item.logical_sequence, status: item.status, maintenance: item.maintenance_status, operation: item.claimed_operation_id, preparationOperation: item.preparation_operation_id });
+      if (item) delete item.logical_sequence;
       const evidence = database.raw.query("SELECT id, phase, state FROM operations WHERE item_id = ? AND state NOT IN ('done','failed') ORDER BY id").all(payload.itemId);
       const outputs = database.raw.query("SELECT oo.* FROM operation_outputs oo JOIN operations o ON oo.operation_id = o.id WHERE o.item_id = ? ORDER BY oo.operation_id, oo.ordinal, oo.chat_id, oo.telegram_message_id").all(payload.itemId);
       const preparation = database.raw.query("SELECT id, phase, state, progress_json FROM queue_preparation_operations WHERE item_id = ? AND state NOT IN ('done','failed') ORDER BY id").all(payload.itemId);

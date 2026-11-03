@@ -54,6 +54,9 @@ export type SemanticOrigin =
   | { kind: "absent" }
   | { kind: "unknown"; type: string };
 
+export type QueueAuthor = Extract<SemanticOrigin, { kind: "user" }> | { kind: "signature"; exactName: string };
+export type CreditIdentity = Extract<SemanticOrigin, { kind: "user" | "hidden_user" }> | { kind: "signature"; queueChatId: ChatId; exactName: string };
+
 export type MessageEntity = {
   type: string;
   offset: number;
@@ -79,6 +82,7 @@ export type StoredMessageSnapshot = {
   captionEntities?: readonly MessageEntity[];
   showCaptionAboveMedia?: boolean;
   origin: SemanticOrigin;
+  queueAuthor?: QueueAuthor;
   telegramDate: number;
   editDate?: number;
   hasReplyMarkup: boolean;

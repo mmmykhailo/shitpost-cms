@@ -501,3 +501,81 @@ describe("preparation service", () => {
     expect(h.preparation.listCleanupPending()).toEqual([]);
   });
 });
+
+describe("queue-author preparation", () => {
+  const SUBMITTER = { kind: "user", userId: asUserId(77), displayName: "Submitter" } as const;
+  test.each(["text", "photo", "sticker"] as const)("prepares and refreshes fallback credits for direct %s submissions", async (contentType) => {
+    const h = open();
+    h.policy.observeAuthor(SUBMITTER, NOW);
+    h.policy.setAlias(77, "First nickname", 42, NOW);
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(101), origin: { kind: "absent" }, queueAuthor: SUBMITTER, contentType, ...(contentType === "text" ? { text: "post" } : {}) }), NOW, "copy", NOW);
+    const fake = makeGateway();
+    const service = serviceFor(h, fake.gateway);
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    const prepared = h.queue.findItemById(1)!;
+    const text = () => h.queue.getCurrentSnapshotSet(1).map(s => [s.text, s.caption].filter(Boolean).join("\n")).join("\n");
+    expect(text()).toContain("by First nickname");
+    expect(prepared).toMatchObject({ origin: { kind: "absent" }, queueAuthor: SUBMITTER, creditIdentity: SUBMITTER, preparationState: "ready" });
+    h.policy.setAlias(77, "Updated nickname", 42, NOW + 1);
+    expect(h.queue.findItemById(1)?.preparationState).toBe("refresh_pending");
+    expect(h.queue.peekNextReady(NOW)).toBeUndefined();
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(text()).toContain("by Updated nickname");
+    expect(text()).not.toContain("First nickname");
+    h.policy.removeAlias(77, 42, NOW + 2);
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(text()).toContain("by Submitter");
+    expect(h.queue.findItemById(1)).toMatchObject({ logicalSequence: prepared.logicalSequence, enqueuedAt: prepared.enqueuedAt, sourceGeneration: prepared.sourceGeneration });
+    expect(h.queue.peekNextReady(NOW)?.id).toBe(1);
+  });
+
+  test("signature nicknames refresh only the selected identity and preserve frozen posts", async () => {
+    const h = open();
+    const identity = { kind: "signature", queueChatId: asChatId(-100), exactName: "Signature" } as const;
+    h.policy.observeAuthor(identity, NOW);
+    h.policy.observeAuthor({ kind: "hidden_user", senderUserName: "Signature" }, NOW);
+    const author = h.policy.listSignatureAuthors(-100)[0]!;
+    h.policy.setSignatureAlias(author.id, "Queue alias", 42, NOW);
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(110), origin: { kind: "absent" }, queueAuthor: { kind: "signature", exactName: "Signature" }, text: "post" }), NOW, "copy", NOW);
+    const fake = makeGateway(), service = serviceFor(h, fake.gateway);
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(h.queue.getCurrentSnapshotSet(1)[0]?.text).toBe("post\n\nby Queue alias");
+    h.policy.setSignatureAlias(author.id, null, 42, NOW + 1);
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(h.queue.getCurrentSnapshotSet(1)[0]?.text).toBe("post\n\nby Signature");
+    const snapshot = h.queue.getCurrentSnapshotSet(1)[0]!;
+    h.queue.acceptAdminQueueEdit({ chatId: -100, messageId: snapshot.messageId, snapshot: { ...snapshot, text: "Admin final text", editDate: NOW + 2 }, receivedAt: NOW + 2 });
+    h.policy.setSignatureAlias(author.id, "Changed after freeze", 42, NOW + 3);
+    expect(h.queue.findItemById(1)?.preparationState).toBe("ready");
+    expect((await service.prepareNext()).kind).toBe("empty");
+    expect(h.queue.getCurrentSnapshotSet(1)[0]?.text).toBe("Admin final text");
+  });
+
+  test.each(["copy", "forward"] as const)("keeps channel delivery %s and selects the correct credit", async (mode) => {
+    const h = open();
+    h.policy.observeAuthor(SUBMITTER, NOW);
+    h.policy.setAlias(77, "Queue alias", 42, NOW);
+    const origin = { kind: "channel", chatId: asChatId(-200), title: "Origin" } as const;
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(120), origin, queueAuthor: SUBMITTER, text: "post" }), NOW, mode, NOW);
+    const service = serviceFor(h, makeGateway().gateway);
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    const current = h.queue.getCurrentSnapshotSet(1)[0]!;
+    expect(current.origin).toEqual(origin);
+    expect(current.text).toBe(mode === "copy" ? "post\n\nby Queue alias" : "post");
+    h.policy.setAlias(77, "Changed", 42, NOW + 1);
+    expect(h.queue.findItemById(1)?.preparationState).toBe(mode === "copy" ? "refresh_pending" : "ready");
+  });
+
+  test("prepares a direct album with a single fallback credit", async () => {
+    const h = open();
+    h.policy.observeAuthor(SUBMITTER, NOW);
+    h.queue.observeQueueSnapshot(snapshotFixture({ messageId: asMessageId(130), origin: { kind: "absent" }, queueAuthor: SUBMITTER, contentType: "photo", mediaGroupId: "queue-author-album", caption: "album caption" }), NOW, "copy", NOW);
+    h.queue.addAlbumMember(1, snapshotFixture({ messageId: asMessageId(131), origin: { kind: "absent" }, queueAuthor: SUBMITTER, contentType: "photo", mediaGroupId: "queue-author-album" }), NOW);
+    h.queue.finalizeAlbums(NOW + 3000);
+    expect((await serviceFor(h, makeGateway().gateway).prepareNext()).kind).toBe("prepared");
+    const snapshots = h.queue.getCurrentSnapshotSet(1);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots.map(s => s.caption ?? "").join("\n").match(/by Submitter/gu)).toHaveLength(1);
+    expect(new Set(snapshots.map(s => s.mediaGroupId)).size).toBe(1);
+  });
+});

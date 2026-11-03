@@ -1,5 +1,5 @@
 import { safeDisplayName } from "./byline";
-import type { ContentType, PublicationPlan, SemanticOrigin } from "../types";
+import type { ContentType, CreditIdentity, PublicationPlan, SemanticOrigin } from "../types";
 
 const inlineCaptionTypes = new Set<ContentType>([
   "photo",
@@ -44,9 +44,17 @@ export const classifyPublicationPlan = (input: {
   contentType: ContentType;
   channelIsWhitelisted: boolean;
   alias?: string;
+  creditIdentity?: CreditIdentity;
 }): PublicationPlan => {
   const { origin, contentType } = input;
   if (contentType === "paid_media" || contentType === "giveaway" || contentType === "service" || contentType === "unknown") {
+    return { kind: "blocked", reason: "unsupported_content" };
+  }
+  if (origin.kind !== "unknown" && !(origin.kind === "channel" && input.channelIsWhitelisted) && input.creditIdentity) {
+    const identity = input.creditIdentity;
+    const name = identity.kind === "signature" ? safeDisplayName(input.alias ?? identity.exactName) : displayNameForOrigin(identity, input.alias) ?? "Unknown";
+    if (contentType === "text" || isInlineCaptionContent(contentType)) return { kind: "copy_with_inline_byline", name };
+    if (isSeparateBylineContent(contentType)) return { kind: "copy_with_separate_byline", name };
     return { kind: "blocked", reason: "unsupported_content" };
   }
   switch (origin.kind) {

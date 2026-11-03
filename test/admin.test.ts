@@ -1239,6 +1239,7 @@ describe("durable private menus", () => {
       const replacementMenu = h.lastSent();
       const stale = h.callbackData(replacementMenu, "Remove 10:00 UTC");
       h.schedule.removeSlot(600, ADMIN_ID, h.clock.now());
+      h.clock.advance(1);
       h.schedule.addSlot(600, ADMIN_ID, h.clock.now());
       await h.run(callbackUpdate(20105, "stale-remove", stale, replacementMenu.message));
       expect(h.lastSent().message.text).toContain("changed");
@@ -1263,5 +1264,40 @@ test("promotes an item from an old queue view with a fresh guarded confirmation"
     await h.run(callbackUpdate(21004, "confirm-first-again", token, confirmation.message));
     expect(h.lastSent().message.text).toContain("already processed");
     expect(h.queue.listActive().map(i => i.id)).toEqual([2, 1]);
+  } finally { h.close(); }
+});
+
+test("manages signature nicknames across pages, delayed replies, and stale removals", async () => {
+  const h = createHarness();
+  try {
+    for (let id = 0; id < 22; id++) h.policy.observeAuthor({ kind: "signature", queueChatId: QUEUE_CHAT_ID, exactName: `Signature ${id}` }, NOW);
+    await h.run(commandUpdate(22001, 22001, "authors"));
+    let menu = h.lastSent();
+    await h.run(callbackUpdate(22002, "signatures", h.callbackData(menu, "Queue signatures"), menu.message));
+    menu = h.lastSent();
+    expect(menu.message.text).toContain("1–20 of 22");
+    await h.run(callbackUpdate(22003, "next", h.callbackData(menu, "Next"), menu.message));
+    menu = h.lastSent();
+    expect(menu.message.text).toContain("21–22 of 22");
+    await h.run(callbackUpdate(22004, "select", h.callbackData(menu, "Signature 20"), menu.message));
+    menu = h.lastSent();
+    await h.run(callbackUpdate(22005, "set", h.callbackData(menu, "Set or replace nickname"), menu.message));
+    const question = h.lastSent();
+    await h.run(replyUpdate(22006, 22006, "\u202E", question.message));
+    expect(h.admin.getPrompt(ADMIN_ID, h.clock.now())?.kind).toBe("signature_alias");
+    h.clock.advance(2 * 86_400_000);
+    await h.run(replyUpdate(22007, 22007, "Custom Signature", question.message));
+    menu = h.lastSent();
+    expect(menu.message.text).toContain("Custom Signature");
+    const removal = h.callbackData(menu, "Remove nickname");
+    const author = h.policy.listSignatureAuthors(QUEUE_CHAT_ID, 100).find(a => a.exactName === "Signature 20")!;
+    h.policy.setSignatureAlias(author.id, "Replacement", ADMIN_ID, h.clock.now());
+    await h.run(callbackUpdate(22008, "stale-remove", removal, menu.message));
+    expect(h.lastSent().message.text).toContain("changed");
+    expect(h.policy.getSignatureAuthor(author.id)?.nickname).toBe("Replacement");
+    await h.run(callbackUpdate(22009, "select-again", `v2:signature_author_select:${author.id}`, menu.message));
+    menu = h.lastSent();
+    await h.run(callbackUpdate(22010, "remove", h.callbackData(menu, "Remove nickname"), menu.message));
+    expect(h.policy.getSignatureAuthor(author.id)?.nickname).toBeNull();
   } finally { h.close(); }
 });

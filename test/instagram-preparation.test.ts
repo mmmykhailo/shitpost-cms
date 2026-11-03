@@ -449,3 +449,23 @@ describe("Instagram Reel preparation", () => {
     expect(fake.copied).toEqual([100]);
   });
 });
+
+test.each(["copy", "forward"] as const)("Instagram channel import respects fallback-author exemption for %s delivery", async (mode) => {
+  const h = open();
+  const submitter = { kind: "user", userId: asUserId(77), displayName: "Submitter" } as const;
+  h.policy.observeAuthor(submitter, NOW);
+  h.policy.setAlias(77, "Queue alias", 42, NOW);
+  enqueue(h, reelSnapshot({ origin: { kind: "channel", chatId: asChatId(-200), title: "Origin" }, queueAuthor: submitter }), mode);
+  const fake = makeGateway();
+  const service = serviceFor(h, fake.gateway, makeDownloader().download);
+  expect((await service.prepareNext()).kind).toBe("prepared");
+  expect(fake.uploads[0]?.caption).toBe(mode === "copy" ? "My Telegram description\n\nby Queue alias" : "My Telegram description");
+  expect(h.queue.findItemById(1)?.queueAuthor).toEqual(submitter);
+  expect(h.queue.getCurrentSnapshotSet(1)[0]?.queueAuthor).toEqual(submitter);
+  h.policy.setAlias(77, "New alias", 42, NOW + 1);
+  expect(h.queue.findItemById(1)?.preparationState).toBe(mode === "copy" ? "refresh_pending" : "ready");
+  if (mode === "copy") {
+    expect((await service.prepareNext()).kind).toBe("prepared");
+    expect(fake.captions.at(-1)).toBe("My Telegram description\n\nby New alias");
+  }
+});

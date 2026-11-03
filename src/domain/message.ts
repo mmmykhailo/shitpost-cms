@@ -134,6 +134,12 @@ export const snapshotFromMessage = (message: Message, ordinal = 0, telegramUpdat
     telegramDate: message.date * 1000,
     hasReplyMarkup: message.reply_markup !== undefined,
   };
+  // Channel sender_chat is not a human author. Telegram's anonymous/service senders are bots.
+  if (message.from && !message.from.is_bot && message.from.id > 0) {
+    result.queueAuthor = { kind: "user", userId: asUserId(message.from.id), displayName: displayName(message.from), ...(message.from.username === undefined ? {} : { username: message.from.username }) };
+  } else if (message.author_signature?.trim()) {
+    result.queueAuthor = { kind: "signature", exactName: message.author_signature };
+  }
   if (telegramUpdateId !== undefined) result.telegramUpdateId = telegramUpdateId;
   if (message.media_group_id !== undefined) result.mediaGroupId = message.media_group_id;
   if ("text" in message) {

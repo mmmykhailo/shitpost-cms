@@ -4,7 +4,7 @@ import type { PendingUpdateRepository } from "../db/pending-update-repository";
 import type { createGeneratedEventRepository } from "../db/generated-event-repository";
 import { snapshotFromMessage } from "../domain/message";
 import type { GeneratedMessageRepository, PolicyRepository, QueueRepository } from "../db/repositories";
-import type { ChatId, DeliveryMode, StoredMessageSnapshot } from "../types";
+import type { ChatId, CreditIdentity, DeliveryMode, StoredMessageSnapshot } from "../types";
 
 export type IngestionResult = {
   accepted: boolean;
@@ -28,9 +28,11 @@ export const createIngestionService = (input: {
     snapshot.origin.kind === "channel" && input.policy.isChannelWhitelisted(snapshot.origin.chatId) ? "forward" : "copy";
 
   const ingestLogicalSnapshot = (snapshot: StoredMessageSnapshot, now: number, deliveryMode = captureDeliveryMode(snapshot), policyCapturedAt = now, unmatchedEdit?: { receivedAt: number; updateId?: number }): IngestionResult => {
-    const resolveInitialPolicy = (origin = snapshot.origin) => {
-      input.policy.observeAuthor(origin, now);
-      const policy = input.policy.resolveCreditPolicy(origin);
+    const resolveInitialPolicy = (identity?: CreditIdentity) => {
+      if (snapshot.queueAuthor?.kind === "user") input.policy.observeAuthor(snapshot.queueAuthor, now);
+      input.policy.observeAuthor(snapshot.origin, now);
+      if (identity) input.policy.observeAuthor(identity, now);
+      const policy = input.policy.resolveCreditPolicy(identity ?? { kind: "absent" });
       return { revisionKey: policy.revisionKey, revision: policy.revision };
     };
     if (snapshot.mediaGroupId !== undefined) {
@@ -38,7 +40,7 @@ export const createIngestionService = (input: {
       if (existing) return { accepted: false, itemId: existing.id, ignoredReason: "duplicate" };
       const album = input.queue.findCollectingAlbum(snapshot.chatId, snapshot.mediaGroupId);
       if (album) {
-        const item = input.queue.addAlbumMember(album.id, snapshot, now, () => resolveInitialPolicy(album.origin));
+        const item = input.queue.addAlbumMember(album.id, snapshot, now, resolveInitialPolicy);
         return { accepted: true, itemId: item.id };
       }
       const finalizedAlbum = input.queue.findAlbum(snapshot.chatId, snapshot.mediaGroupId);

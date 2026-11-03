@@ -1,4 +1,4 @@
-import type { AttributionDescriptor, DeliveryMode, MaintenanceStatus, MessageId, PreparationState, QueueItemStatus, RepresentationKind, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import type { CreditIdentity, QueueAuthor, AttributionDescriptor, DeliveryMode, MaintenanceStatus, MessageId, PreparationState, QueueItemStatus, RepresentationKind, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 export type QueueItemRecord = {
   id: number;
@@ -8,6 +8,8 @@ export type QueueItemRecord = {
   firstMessageId: MessageId;
   contentType: StoredMessageSnapshot["contentType"];
   origin: SemanticOrigin;
+  queueAuthor?: QueueAuthor;
+  creditIdentity?: CreditIdentity;
   status: QueueItemStatus;
   maintenanceStatus: MaintenanceStatus;
   maintenanceOperationId?: string;

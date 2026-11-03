@@ -198,7 +198,7 @@ export const createPreparationService = (input: {
     let mutationMayHaveStarted = false;
     const attribution = item.attribution ?? { ownership: "none" as const };
     let nextAttribution: AttributionDescriptor = attribution;
-    const creditPolicy = input.policy.resolveCreditPolicy(item.origin);
+    const creditPolicy = input.policy.resolveCreditPolicy(item.creditIdentity ?? item.origin);
     input.queue.reconcileNicknamePolicy(item.id, creditPolicy);
     const revision = creditPolicy.revision;
     try {
@@ -225,7 +225,7 @@ export const createPreparationService = (input: {
         if (target.role !== "credit" || target.snapshot.text !== attribution.generatedText) {
           nextAttribution = { ownership: "admin", previousMemberKey: attribution.memberKey };
         } else {
-          const plan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
+          const plan = classifyPublicationPlan({ origin: item.origin, ...(item.creditIdentity ? { creditIdentity: item.creditIdentity } : {}), contentType: item.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
           if (plan.kind !== "copy_with_separate_byline") throw new Error("Current origin no longer has a separate-credit policy");
           const text = separateByline(plan.name);
           nextSnapshot = { ...target.snapshot, text };
@@ -242,7 +242,7 @@ export const createPreparationService = (input: {
         if (ownership.decision !== "preserve_bot_ownership" || generatedFormattingChanged) {
           nextAttribution = generatedFormattingChanged ? { ownership: "admin", previousMemberKey: attribution.memberKey } : ownership.attribution;
         } else {
-          const plan = classifyPublicationPlan({ origin: item.origin, contentType: target.snapshot.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
+          const plan = classifyPublicationPlan({ origin: item.origin, ...(item.creditIdentity ? { creditIdentity: item.creditIdentity } : {}), contentType: target.snapshot.contentType, channelIsWhitelisted: item.deliveryMode === "forward", ...(creditPolicy.alias === undefined ? {} : { alias: creditPolicy.alias }) });
           if (plan.kind !== "copy_with_inline_byline") throw new Error("Current origin no longer has an inline-credit policy");
           const fullText = oldText ?? "";
           const base = fullText.slice(0, fullText.length - attribution.generatedText.length);
@@ -381,9 +381,9 @@ export const createPreparationService = (input: {
           if (item.editorialFrozenAt !== undefined) return fail("needs_review", "instagram_editorial_freeze", "Reel submission was edited. Review it or submit a new message to import the video.");
           if (reel.kind === "invalid") return fail("needs_review", "instagram_invalid_input", reel.reason);
           if (!input.instagramDownloader || !input.gateway.sendVideo) return fail("blocked", "instagram_unavailable", "Instagram import is unavailable in this runtime. Upload the video manually.");
-          const credit = input.policy.resolveCreditPolicy(item.origin);
+          const credit = input.policy.resolveCreditPolicy(item.creditIdentity ?? item.origin);
           input.queue.reconcileNicknamePolicy(item.id, credit);
-          const plan = classifyPublicationPlan({ origin: item.origin, contentType: "video", channelIsWhitelisted: false, ...(credit.alias === undefined ? {} : { alias: credit.alias }) });
+          const plan = classifyPublicationPlan({ origin: item.origin, ...(item.creditIdentity ? { creditIdentity: item.creditIdentity } : {}), contentType: "video", channelIsWhitelisted: false, ...(credit.alias === undefined ? {} : { alias: credit.alias }) });
           if (plan.kind === "blocked") return fail("needs_review", plan.reason, "Telegram author origin requires review.");
           let caption = reel.caption;
           let captionEntities = reel.entities;
@@ -444,6 +444,8 @@ export const createPreparationService = (input: {
             }
             const snapshot = snapshotFromMessage(message);
             snapshot.origin = item.origin;
+            if (item.queueAuthor) snapshot.queueAuthor = item.queueAuthor;
+            else delete snapshot.queueAuthor;
             snapshot.contentFingerprint = fingerprintSnapshotContent(snapshot);
             const member: PreparedMember = { memberKey: source.memberKey, messageId: snapshot.messageId, role: "content", deliveryMode: "copy", snapshot };
             knownOutputIds.push(snapshot.messageId);
@@ -465,7 +467,7 @@ export const createPreparationService = (input: {
         const adopted = input.preparation.completeInPlacePreparation(guard, members, item.attribution ?? { ownership: "none" }, item.nicknameRevisionApplied ?? item.nicknameRevisionWanted ?? 0, input.clock.now(), item.nicknameRevisionAppliedKey ?? item.nicknameRevisionWantedKey ?? "none");
         return { kind: "prepared", itemId: item.id, preparationState: adopted.preparationState, operationId: claim.operationId };
       }
-      const creditPolicy = input.policy.resolveCreditPolicy(item.origin);
+      const creditPolicy = input.policy.resolveCreditPolicy(item.creditIdentity ?? item.origin);
       input.queue.reconcileNicknamePolicy(item.id, creditPolicy);
       item = input.queue.findItemById(item.id) ?? item;
       if (claim.kind === "refresh") return await refreshClaim(claim, item, members);
@@ -475,7 +477,7 @@ export const createPreparationService = (input: {
         return { kind: "blocked", itemId: item.id, status: "needs_review", reason: "missing_captured_policy", operationId: claim.operationId };
       }
       const alias = creditPolicy.alias;
-      const classifiedPlan = classifyPublicationPlan({ origin: item.origin, contentType: item.contentType, channelIsWhitelisted: deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
+      const classifiedPlan = classifyPublicationPlan({ origin: item.origin, ...(item.creditIdentity ? { creditIdentity: item.creditIdentity } : {}), contentType: item.contentType, channelIsWhitelisted: deliveryMode === "forward", ...(alias === undefined ? {} : { alias }) });
       const hasAdminCredit = members.some((member) => member.role === "credit") && item.attribution?.ownership === "admin";
       const plan = hasAdminCredit ? (deliveryMode === "forward" ? { kind: "forward" as const } : { kind: "copy" as const }) : classifiedPlan;
       const revision = creditPolicy.revision;
@@ -485,7 +487,7 @@ export const createPreparationService = (input: {
         return { kind: "blocked", itemId: item.id, status, reason: plan.reason, operationId: claim.operationId };
       }
       const capturedPolicyMode = deliveryMode;
-      const transformsSource = plan.kind === "forward" ? false : item.origin.kind !== "absent";
+      const transformsSource = plan.kind !== "forward" && (item.origin.kind !== "absent" || plan.kind === "copy_with_inline_byline" || plan.kind === "copy_with_separate_byline");
       const transferMode: DeliveryMode = plan.kind === "forward" ? "forward" : "copy";
       const requiresInline = plan.kind === "copy_with_inline_byline";
       const requiresSeparate = plan.kind === "copy_with_separate_byline";

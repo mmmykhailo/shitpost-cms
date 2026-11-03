@@ -1,13 +1,15 @@
+import { selectCreditIdentity, mergeQueueAuthors } from "../domain/credit-policy";
 import type { AppDatabase } from "./database";
 import { randomUUID } from "node:crypto";
 import { INSTAGRAM_UPLOAD_TIMEOUT_MS } from "../domain/instagram-reel";
 import { assertStatusTransition, isSourceBearing, canReorder, type QueueItemRecord } from "../domain/queue-item";
 import { validateSlotCount } from "../domain/schedule";
-import { validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
+import { validateQueueAuthor, validateCreditIdentity, validateAttributionDescriptor, validateOrderedMessageIds, validatePreparedMember, validatePreparedPublicationContractV2, validatePreparedRenewalContractV2, validatePublicationContract, validateRenewalExecutionProgress, validateSemanticOrigin, validateStoredMessageSnapshot } from "../domain/validation";
 import { inspectInlineCreditEdit } from "../domain/attribution";
 import { RENEWAL_ITEM_RETRY_MS } from "../domain/renewal-policy";
 import { InvalidTelegramOutputError, OperationConflictError } from "../errors";
-import type { DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, QueueItemStatus, RenewalExecutionGuard, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot } from "../types";
+import { asChatId } from "../types";
+import type { CreditIdentity, DeliveryMode, MaintenanceStatus, MessageId, OperationGuard, OperationOutputRole, OperationPhase, OperationState, PreparedMember, PreparedPublicationContractV2, PreparedRenewalContractV2, PublicationContract, QueueItemStatus, RenewalExecutionGuard, RenewalExecutionProgress, SemanticOrigin, StoredMessageSnapshot } from "../types";
 
 type QueueRow = {
   id: number;
@@ -17,6 +19,8 @@ type QueueRow = {
   first_message_id: number;
   content_type: StoredMessageSnapshot["contentType"];
   origin_json: string;
+  queue_author_json: string | null;
+  credit_identity_json: string | null;
   status: QueueItemStatus;
   maintenance_status: MaintenanceStatus;
   maintenance_operation_id: string | null;
@@ -118,6 +122,8 @@ const rowToItem = (row: QueueRow): QueueItemRecord => {
     physicalCreatedAt: row.physical_created_at,
     destinationMessageIds: row.destination_message_ids_json ? validateOrderedMessageIds(JSON.parse(row.destination_message_ids_json) as unknown, "destinationMessageIds") : [],
   };
+  if (row.queue_author_json) item.queueAuthor = validateQueueAuthor(JSON.parse(row.queue_author_json));
+  if (row.credit_identity_json) item.creditIdentity = validateCreditIdentity(JSON.parse(row.credit_identity_json));
   if (row.media_group_id !== null) item.mediaGroupId = row.media_group_id;
   for (const [key, value] of [
     ["lastRenewedAt", optionalNumber(row.last_renewed_at)],
@@ -302,7 +308,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     now: number,
     deliveryMode?: DeliveryMode,
     policyCapturedAt?: number,
-    resolveInitialPolicy?: () => ResolvedNicknamePolicy,
+    resolveInitialPolicy?: (identity?: CreditIdentity) => ResolvedNicknamePolicy,
     unmatchedEdit?: UnmatchedEditProvenance,
   ): { item: QueueItemRecord; inserted: boolean } => {
     snapshot = validateStoredMessageSnapshot(snapshot);
@@ -320,14 +326,15 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       const status: QueueItemStatus = isAlbum ? "collecting" : "queued";
       const quietDeadline = isAlbum ? now + 2_000 : null;
       const maxDeadline = isAlbum ? now + 10_000 : null;
-      const policy = resolveInitialPolicy?.();
+      const identity = selectCreditIdentity(snapshot.origin, snapshot.queueAuthor, snapshot.chatId, deliveryMode === "forward");
+      const policy = resolveInitialPolicy?.(identity);
       const defaultKey = snapshot.origin.kind === "user" || snapshot.origin.kind === "hidden_user" ? null : "none";
       const result = database.raw.query(`INSERT INTO queue_items (
         logical_sequence, queue_chat_id, media_group_id, first_message_id, content_type, origin_json, status,
         enqueued_at, physical_created_at, album_quiet_deadline, album_max_deadline, delivery_mode, policy_captured_at,
         nickname_revision_wanted, nickname_revision_wanted_key, editorial_frozen_at, editorial_freeze_reason,
-        editorial_freeze_message_id, editorial_freeze_update_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        editorial_freeze_message_id, editorial_freeze_update_id, queue_author_json, credit_identity_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         lastSequence.value + 1,
         snapshot.chatId,
         snapshot.mediaGroupId ?? null,
@@ -347,6 +354,8 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
         unmatchedEdit === undefined ? null : "admin_edit",
         unmatchedEdit === undefined ? null : snapshot.messageId,
         unmatchedEdit?.updateId ?? null,
+        snapshot.queueAuthor === undefined ? null : JSON.stringify(snapshot.queueAuthor),
+        identity === undefined ? null : JSON.stringify(identity),
       );
       const itemId = Number(result.lastInsertRowid);
       insertSnapshot(itemId, 0, snapshot);
@@ -357,7 +366,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     });
   };
 
-  const addAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot, now: number, resolveInitialPolicy?: () => ResolvedNicknamePolicy): QueueItemRecord => {
+  const addAlbumMember = (itemId: number, snapshot: StoredMessageSnapshot, now: number, resolveInitialPolicy?: (identity?: CreditIdentity) => ResolvedNicknamePolicy): QueueItemRecord => {
     snapshot = validateStoredMessageSnapshot(snapshot);
     return database.transaction(() => {
       const item = findItemById(itemId);
@@ -365,7 +374,10 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       if (item.mediaGroupId !== snapshot.mediaGroupId) throw new Error("Album media group does not match");
       if (!findBySource(snapshot.chatId, snapshot.messageId)) {
         insertSnapshot(itemId, item.sourceGeneration, snapshot);
-        const policy = resolveInitialPolicy?.();
+        const merged = mergeQueueAuthors(item.queueAuthor, snapshot.queueAuthor);
+        const identity = selectCreditIdentity(item.origin, merged.author, snapshot.chatId, item.deliveryMode === "forward");
+        database.raw.query("UPDATE queue_items SET queue_author_json = ?, credit_identity_json = ?, last_error_code = CASE WHEN ? THEN 'mixed_queue_authors' ELSE last_error_code END WHERE id = ?").run(merged.author ? JSON.stringify(merged.author) : null, identity ? JSON.stringify(identity) : null, merged.conflict ? 1 : 0, itemId);
+        const policy = resolveInitialPolicy?.(identity);
         if (policy && item.editorialFrozenAt === undefined) database.raw.query("UPDATE queue_items SET nickname_revision_wanted = CASE WHEN nickname_revision_wanted_key = ? THEN MAX(nickname_revision_wanted, ?) ELSE ? END, nickname_revision_wanted_key = ? WHERE id = ? AND editorial_frozen_at IS NULL").run(policy.revisionKey, policy.revision, policy.revision, policy.revisionKey, itemId);
       }
       database.raw.query("UPDATE queue_items SET album_quiet_deadline = MIN(COALESCE(album_max_deadline, ?), ?) WHERE id = ? AND status = 'collecting'").run(now + 10_000, now + 2_000, itemId);
@@ -431,11 +443,13 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
   });
 
   const reprocessRecoveredItem = (itemId: number, deliveryMode: DeliveryMode, policyCapturedAt: number, now: number): void => database.transaction(() => {
+    const item = findItemById(itemId);
+    const identity = item ? selectCreditIdentity(item.origin, item.queueAuthor, asChatId(item.queueChatId), deliveryMode === "forward") : undefined;
     const result = database.raw.query(`UPDATE queue_items SET representation_kind = 'raw', preparation_state = 'unprepared', delivery_mode = ?, policy_captured_at = ?, prepared_at = NULL,
-      content_version = content_version + 1, last_error_code = NULL, last_error = NULL
+      content_version = content_version + 1, last_error_code = NULL, last_error = NULL, credit_identity_json = ?
       WHERE id = ? AND status = 'queued' AND representation_kind = 'prepared' AND editorial_frozen_at IS NULL AND preparation_operation_id IS NULL AND claimed_operation_id IS NULL AND maintenance_status = 'idle'
         AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state IN ('running','outputs_recorded','cleanup_pending','uncertain'))`)
-      .run(deliveryMode, policyCapturedAt, itemId);
+      .run(deliveryMode, policyCapturedAt, identity ? JSON.stringify(identity) : null, itemId);
     if (Number(result.changes) !== 1) throw conflict("Recovered item changed or is currently owned by another operation");
     database.raw.query("INSERT INTO audit_events (event_type, actor, item_id, metadata_json, created_at) VALUES ('recovered_item_preparation_requested', 'admin', ?, ?, ?)").run(itemId, JSON.stringify({ deliveryMode, policyCapturedAt }), now);
   });
@@ -446,6 +460,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     for (const row of rows) {
       const messages = getMessages(row.id).sort((a, b) => a.telegramMessageId - b.telegramMessageId);
       let status: QueueItemStatus = "queued";
+      if (row.last_error_code === "mixed_queue_authors") status = "needs_review";
       if (messages.length < 2 || messages.length > 10) status = "needs_review";
       if (messages.some((message) => originKey(message.snapshot.origin) !== originKey(messages[0]!.snapshot.origin))) status = "needs_review";
       for (const [ordinal, message] of messages.entries()) {
@@ -486,7 +501,7 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
       }
       if (updateId !== undefined && priorUpdateId !== undefined && updateId <= priorUpdateId) return { kind: "stale", item };
 
-      const persistedSnapshot = validateStoredMessageSnapshot({ ...snapshot, origin: current.snapshot.origin, ...(updateId === undefined ? {} : { telegramUpdateId: updateId }) });
+      const persistedSnapshot = validateStoredMessageSnapshot({ ...snapshot, queueAuthor: current.snapshot.queueAuthor, origin: current.snapshot.origin, ...(updateId === undefined ? {} : { telegramUpdateId: updateId }) });
       let attribution = item.attribution ?? { ownership: "none" as const };
       if (attribution.ownership === "bot" && attribution.memberKey === current.memberKey) {
         if (attribution.placement === "separate") {
@@ -1575,11 +1590,12 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     const rows = database.raw.query("SELECT id FROM queue_items WHERE status IN ('done','deleted','deleted_external') AND completed_at IS NOT NULL AND completed_at < ? AND NOT EXISTS (SELECT 1 FROM orphaned_sources os WHERE os.item_id = queue_items.id AND os.resolved_at IS NULL) AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.item_id = queue_items.id AND o.state NOT IN ('done','failed')) AND NOT EXISTS (SELECT 1 FROM admin_alerts aa WHERE aa.resolved_at IS NULL AND (aa.dedupe_key = 'uncertain_publish:' || queue_items.id OR aa.dedupe_key = 'uncertain_renewal:' || queue_items.id OR aa.dedupe_key = 'renewal_warning:' || queue_items.id OR aa.dedupe_key = 'renewal_critical:' || queue_items.id))").all(before) as Array<{ id: number }>;
     let messages = 0;
     for (const row of rows) {
+      database.raw.query("UPDATE queue_items SET queue_author_json = NULL, credit_identity_json = NULL WHERE id = ?").run(row.id);
       const snapshots = database.raw.query("SELECT source_generation, telegram_message_id, snapshot_json FROM queue_messages WHERE item_id = ?").all(row.id) as Array<{ source_generation: number; telegram_message_id: number; snapshot_json: string }>;
       for (const snapshot of snapshots) {
         try {
           const value = JSON.parse(snapshot.snapshot_json) as Record<string, unknown>;
-          for (const key of ["text", "entities", "caption", "captionEntities"]) delete value[key];
+          for (const key of ["text", "entities", "caption", "captionEntities", "queueAuthor"]) delete value[key];
           database.raw.query("UPDATE queue_messages SET snapshot_json = ? WHERE item_id = ? AND source_generation = ? AND telegram_message_id = ?").run(JSON.stringify(value), row.id, snapshot.source_generation, snapshot.telegram_message_id);
           messages += 1;
         } catch {
@@ -1687,7 +1703,7 @@ export const createPolicyRepository = (database: AppDatabase) => {
 
   const removeChannel = (chatId: number, adminId: number, now: number): void => database.transaction(() => {
     const result = database.raw.query("DELETE FROM channel_whitelist WHERE chat_id = ?").run(chatId);
-    if (Number(result.changes) === 1) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('whitelist_channel_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ chatId }), now);
+    if (Number(result.changes) > 0) database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('whitelist_channel_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ chatId }), now);
   });
 
   const listChannels = (): Array<{ chatId: number; username?: string; title?: string }> => {
@@ -1700,7 +1716,11 @@ export const createPolicyRepository = (database: AppDatabase) => {
     });
   };
 
-  const observeAuthor = (origin: SemanticOrigin, now: number): void => {
+  const observeAuthor = (origin: SemanticOrigin | CreditIdentity, now: number): void => {
+    if (origin.kind === "signature") {
+      database.raw.query("INSERT INTO known_queue_signature_authors(queue_chat_id, exact_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(queue_chat_id, exact_name) DO UPDATE SET last_seen_at = excluded.last_seen_at").run(origin.queueChatId, origin.exactName, now, now);
+      return;
+    }
     if (origin.kind === "hidden_user") {
       database.transaction(() => database.raw.query(`INSERT INTO known_hidden_authors (sender_name, first_seen_at, last_seen_at)
         VALUES (?, ?, ?) ON CONFLICT(sender_name) DO UPDATE SET last_seen_at = MAX(known_hidden_authors.last_seen_at, excluded.last_seen_at)`)
@@ -1727,7 +1747,11 @@ export const createPolicyRepository = (database: AppDatabase) => {
     return row?.user_id;
   };
 
-  const resolveCreditPolicy = (origin: SemanticOrigin): { alias?: string; revisionKey: string; revision: number } => {
+  const resolveCreditPolicy = (origin: SemanticOrigin | CreditIdentity): { alias?: string; revisionKey: string; revision: number } => {
+    if (origin.kind === "signature") {
+      const row = database.raw.query("SELECT id, nickname, alias_revision FROM known_queue_signature_authors WHERE queue_chat_id = ? AND exact_name = ? COLLATE BINARY").get(origin.queueChatId, origin.exactName) as { id: number; nickname: string | null; alias_revision: number } | null;
+      return { ...(row?.nickname ? { alias: row.nickname } : {}), revisionKey: row ? `signature:${row.id}` : `signature:unobserved:${origin.queueChatId}:${origin.exactName}`, revision: row?.alias_revision ?? 0 };
+    }
     if (origin.kind === "hidden_user") {
       const row = database.raw.query("SELECT kha.id, kha.alias_revision, haa.nickname FROM known_hidden_authors kha LEFT JOIN hidden_author_aliases haa ON haa.hidden_author_id = kha.id WHERE kha.sender_name = ? COLLATE BINARY").get(origin.senderUserName) as { id: number; alias_revision: number; nickname: string | null } | null;
       if (!row) return { revisionKey: `hidden:unobserved:${origin.senderUserName}`, revision: 0 };
@@ -1745,22 +1769,22 @@ export const createPolicyRepository = (database: AppDatabase) => {
     return { revisionKey: `user:${origin.userId}`, revision: byId?.alias_revision ?? 0 };
   };
 
-  const aliasForOrigin = (origin: SemanticOrigin): string | undefined => resolveCreditPolicy(origin).alias;
-  const aliasRevisionForOrigin = (origin: SemanticOrigin): number => resolveCreditPolicy(origin).revision;
+  const aliasForOrigin = (origin: SemanticOrigin | CreditIdentity): string | undefined => resolveCreditPolicy(origin).alias;
+  const aliasRevisionForOrigin = (origin: SemanticOrigin | CreditIdentity): number => resolveCreditPolicy(origin).revision;
 
   const reconcileAffectedIdentifiableItems = (userId: number, previousUsername?: string, currentUsername?: string): void => {
     const usernames = [...new Set([previousUsername, currentUsername].filter((name): name is string => name !== undefined))];
-    const clauses = ["json_extract(origin_json, '$.userId') = ?"];
+    const clauses = ["json_extract(credit_identity_json, '$.userId') = ?"];
     const args: Array<string | number> = [userId];
     if (usernames.length > 0) {
-      clauses.push(`lower(json_extract(origin_json, '$.username')) IN (${usernames.map(() => "?").join(",")})`);
+      clauses.push(`lower(json_extract(credit_identity_json, '$.username')) IN (${usernames.map(() => "?").join(",")})`);
       args.push(...usernames);
     }
-    const rows = database.raw.query(`SELECT id, origin_json, nickname_revision_wanted, nickname_revision_wanted_key
+    const rows = database.raw.query(`SELECT id, credit_identity_json, nickname_revision_wanted, nickname_revision_wanted_key
       FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external') AND editorial_frozen_at IS NULL
-        AND json_extract(origin_json, '$.kind') = 'user' AND (${clauses.join(" OR ")})`).all(...args) as Array<{ id: number; origin_json: string; nickname_revision_wanted: number; nickname_revision_wanted_key: string | null }>;
+        AND json_extract(credit_identity_json, '$.kind') = 'user' AND (${clauses.join(" OR ")})`).all(...args) as Array<{ id: number; credit_identity_json: string; nickname_revision_wanted: number; nickname_revision_wanted_key: string | null }>;
     for (const row of rows) {
-      const policy = resolveCreditPolicy(validateSemanticOrigin(JSON.parse(row.origin_json) as unknown));
+      const policy = resolveCreditPolicy(validateCreditIdentity(JSON.parse(row.credit_identity_json) as unknown));
       const wanted = row.nickname_revision_wanted_key === policy.revisionKey ? Math.max(row.nickname_revision_wanted, policy.revision) : policy.revision;
       database.raw.query(`UPDATE queue_items SET nickname_revision_wanted = ?, nickname_revision_wanted_key = ?,
         preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot'
@@ -1776,8 +1800,8 @@ export const createPolicyRepository = (database: AppDatabase) => {
           preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
       WHERE status NOT IN ('done','deleted','deleted_external')
         AND editorial_frozen_at IS NULL
-        AND json_extract(origin_json, '$.kind') = 'user'
-        AND (json_extract(origin_json, '$.userId') = ? OR lower(json_extract(origin_json, '$.username')) = (SELECT normalized_username FROM known_authors WHERE user_id = ?))`)
+        AND json_extract(credit_identity_json, '$.kind') = 'user'
+        AND (json_extract(credit_identity_json, '$.userId') = ? OR lower(json_extract(credit_identity_json, '$.username')) = (SELECT normalized_username FROM known_authors WHERE user_id = ?))`)
       .run(`user:${userId}`, revision, revision, `user:${userId}`, userId, userId);
   };
 
@@ -1843,8 +1867,8 @@ export const createPolicyRepository = (database: AppDatabase) => {
           preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
       WHERE status NOT IN ('done','deleted','deleted_external')
         AND editorial_frozen_at IS NULL
-        AND json_extract(origin_json, '$.kind') = 'hidden_user'
-        AND json_extract(origin_json, '$.senderUserName') = (SELECT sender_name FROM known_hidden_authors WHERE id = ?)`)
+        AND json_extract(credit_identity_json, '$.kind') = 'hidden_user'
+        AND json_extract(credit_identity_json, '$.senderUserName') = (SELECT sender_name FROM known_hidden_authors WHERE id = ?)`)
       .run(hiddenAuthorId, revision, revision, hiddenAuthorId, hiddenAuthorId);
   };
 
@@ -1873,7 +1897,29 @@ export const createPolicyRepository = (database: AppDatabase) => {
     database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('hidden_author_alias_removed', ?, ?, ?)").run(String(adminId), JSON.stringify({ hiddenAuthorId, senderName: row.sender_name, revision }), now);
   });
 
-  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, resolveCreditPolicy, aliasForOrigin, aliasRevisionForOrigin, setAlias, removeAlias, listAuthors, listHiddenAuthors, getHiddenAuthor, countHiddenAuthors, setHiddenAlias, removeHiddenAlias };
+  const listSignatureAuthors = (queueChatId: number, limit = 20, offset = 0) => {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid signature-author page");
+    return database.raw.query("SELECT id, exact_name AS exactName, nickname, alias_revision AS aliasRevision FROM known_queue_signature_authors WHERE queue_chat_id = ? ORDER BY last_seen_at DESC, id LIMIT ? OFFSET ?").all(queueChatId, limit, offset) as Array<{ id: number; exactName: string; nickname: string | null; aliasRevision: number }>;
+  };
+  const countSignatureAuthors = (queueChatId: number): number => (database.raw.query("SELECT COUNT(*) AS count FROM known_queue_signature_authors WHERE queue_chat_id = ?").get(queueChatId) as { count: number }).count;
+  const getSignatureAuthor = (id: number) => database.raw.query("SELECT id, queue_chat_id AS queueChatId, exact_name AS exactName, nickname, alias_revision AS aliasRevision FROM known_queue_signature_authors WHERE id = ?").get(id) as { id: number; queueChatId: number; exactName: string; nickname: string | null; aliasRevision: number } | null;
+  const setSignatureAlias = (id: number, nickname: string | null, adminId: number, now: number): void => database.transaction(() => {
+    const author = getSignatureAuthor(id);
+    if (!author) throw new Error("This queue signature is no longer available");
+    if (author.nickname === nickname) return;
+    const revision = author.aliasRevision + 1;
+    database.raw.query("UPDATE known_queue_signature_authors SET nickname = ?, alias_revision = ? WHERE id = ?").run(nickname, revision, id);
+    const key = `signature:${id}`;
+    database.raw.query(`UPDATE queue_items SET nickname_revision_wanted = ?, nickname_revision_wanted_key = ?,
+      preparation_state = CASE WHEN representation_kind = 'prepared' AND json_extract(attribution_json, '$.ownership') = 'bot' THEN 'refresh_pending' ELSE preparation_state END
+      WHERE status NOT IN ('done','deleted','deleted_external') AND editorial_frozen_at IS NULL
+        AND json_extract(credit_identity_json, '$.kind') = 'signature'
+        AND json_extract(credit_identity_json, '$.queueChatId') = ? AND json_extract(credit_identity_json, '$.exactName') = ? COLLATE BINARY`)
+      .run(revision, key, author.queueChatId, author.exactName);
+    database.raw.query("INSERT INTO audit_events(event_type, actor, metadata_json, created_at) VALUES (?, ?, ?, ?)").run(nickname === null ? "queue_signature_alias_removed" : "queue_signature_alias_set", String(adminId), JSON.stringify({ signatureAuthorId: id, revision }), now);
+  });
+
+  return { isChannelWhitelisted, upsertChannel, removeChannel, listChannels, observeAuthor, resolveAuthorId, resolveCreditPolicy, aliasForOrigin, aliasRevisionForOrigin, setAlias, removeAlias, listAuthors, listHiddenAuthors, getHiddenAuthor, countHiddenAuthors, setHiddenAlias, removeHiddenAlias, listSignatureAuthors, countSignatureAuthors, getSignatureAuthor, setSignatureAlias };
 };
 
 export type GeneratedMessageRepository = ReturnType<typeof createGeneratedMessageRepository>;
@@ -1928,14 +1974,14 @@ export const createScheduleRepository = (database: AppDatabase) => {
     validateSlotCount([...slots(), minuteOfDay], enabled());
     if (!Number.isInteger(minuteOfDay) || minuteOfDay < 0 || minuteOfDay >= 1440) throw new Error("Publication slot is out of range");
     const result = database.raw.query("INSERT OR IGNORE INTO schedule_slots (minute_of_day, created_at, created_by_admin_id, effective_at) VALUES (?, ?, ?, ?)").run(minuteOfDay, now, adminId, now);
-    if (Number(result.changes) === 1) {
+    if (Number(result.changes) > 0) {
       database.raw.query("INSERT INTO schedule_slot_history (minute_of_day, effective_from, effective_until, actor_admin_id) VALUES (?, ?, NULL, ?)").run(minuteOfDay, now, adminId);
       database.raw.query("INSERT INTO audit_events (event_type, actor, metadata_json, created_at) VALUES ('schedule_slot_added', ?, ?, ?)").run(String(adminId), JSON.stringify({ minuteOfDay }), now);
     }
   });
   const removeSlot = (minuteOfDay: number, adminId = 0, now = Date.now()): void => database.transaction(() => {
     const result = database.raw.query("DELETE FROM schedule_slots WHERE minute_of_day = ?").run(minuteOfDay);
-    if (Number(result.changes) === 1) {
+    if (Number(result.changes) > 0) {
       database.raw.query("UPDATE schedule_slot_history SET effective_until = ? WHERE minute_of_day = ? AND effective_until IS NULL").run(now, minuteOfDay);
       database.raw.query(`UPDATE schedule_runs SET status = 'failed', cancelled_at = ?, cancel_reason = 'slot_removed', completed_at = ?, error_code = 'slot_removed', claim_token = NULL, claim_boot_id = NULL
         WHERE cancelled_at IS NULL AND ((status = 'pending'
