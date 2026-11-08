@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{margin:0;color:var(--tg-theme-text-color);font:inherit}
+main{padding:12px}
+h2{font-size:19px;margin:0 0 10px}
+p{margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}
+.hero{font-size:24px;font-weight:bold;padding:10px;border-radius:8px;background-color:var(--tg-theme-secondary-bg-color);color:var(--tg-theme-accent-text-color)}
+.note{color:var(--tg-theme-hint-color);font-size:.9em;margin-top:8px}
+nav{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+button{min-height:44px;flex:1;padding:6px 10px}
+button.row{width:100%;text-align:left;margin-top:4px;background-color:var(--tg-theme-secondary-bg-color);color:var(--tg-theme-text-color)}
+button.primary{font-weight:bold}
+</style></head><body><main id="desk"></main><script>
+(function () {
+  var sdk = TelegramWidget;
+  var root = document.getElementById("desk");
+  var screen, pending = false, note = "";
+  function add(parent, tag, text, cls) {
+    var el = document.createElement(tag);
+    el.textContent = text;
+    if (cls) el.className = cls;
+    parent.appendChild(el);
+    return el;
+  }
+  function accept(raw) {
+    try {
+      var data = JSON.parse(raw);
+      if (data && data.v === 1 && (!screen || data.r >= screen.r)) {
+        screen = data;
+        note = data.n || "";
+      } else if (data && data.n) note = data.n;
+    } catch (_) {}
+  }
+  function ask(key) {
+    if (pending) return;
+    pending = true;
+    note = "Working…";
+    paint();
+    sdk.request(key === "r" ? "w1:r" : "w1:" + screen.r + ":" + key).then(function (answer) {
+      note = "";
+      accept(answer.result);
+      pending = false;
+      paint();
+    }, function () {
+      pending = false;
+      note = "Could not get a reply. Refresh to check the current state.";
+      paint();
+    });
+  }
+  function control(parent, label, key, cls, link) {
+    var button = add(parent, "button", label, cls);
+    button.disabled = pending;
+    button.addEventListener("click", function () {
+      if (link) sdk.openTelegramLink(link);
+      else ask(key);
+    });
+  }
+  function paint() {
+    root.textContent = "";
+    if (!screen || sdk.isForward) {
+      add(root, "h2", "Shitpost Desk");
+      add(root, "p", "Open the bot in private chat and send /manage.");
+      return;
+    }
+    add(root, "h2", screen.t);
+    if (screen.h) add(root, "p", screen.h, "hero");
+    if (screen.b) add(root, "p", screen.b);
+    screen.a.forEach(function (a) {
+      if (a[2] === "row") control(root, a[1], a[0], "row");
+    });
+    var nav = add(root, "nav", "");
+    screen.a.forEach(function (a) {
+      if (a[2] !== "row") control(nav, a[1], a[0], a[2]);
+    });
+    if (screen.l) control(nav, "Open source ↗", "", "", screen.l);
+    control(nav, "Refresh", "r");
+    if (note) add(root, "p", note, "note");
+  }
+  accept(sdk.chatData);
+  sdk.onEvent("chatDataChanged", function () { accept(sdk.chatData); paint(); });
+  paint();
+  sdk.ready();
+})();
+</script></body></html>

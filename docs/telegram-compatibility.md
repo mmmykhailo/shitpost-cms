@@ -31,3 +31,16 @@ The real Telegram checklist remains a deployment prerequisite. It requires a dis
 24. A saved private menu still opens current views after a bot restart and more than ten minutes; repeating navigation works. A valid old confirmation executes once, a changed confirmation explains the changed state, and a delayed reply to the active question still works.
 
 The listed checks are still unverified against live Telegram; the automated suite uses fake transport and local clocks. Record the date, observed Bot API behavior, and any plan changes here before enabling production scheduling. In particular, a failed origin-preservation check blocks the Bot API renewal design. No live Telegram credentials or disposable channels were available during implementation.
+
+## Private Desk widget
+
+Use a disposable bot, private queue and destination channels, and a separate database. The widget project documents the beta methods on Telegram's test environment. For that check set `ADMIN_WIDGETS=beta-test` with the **test environment** bot token and chat IDs. Test the normal Bot API separately with a disposable normal bot using `ADMIN_WIDGETS=widget`. Keep the live bot on `ADMIN_WIDGETS=classic` until the normal endpoint and the admin's clients pass. [Widget beta API and caption behavior](https://github.com/TelegramMessenger/widget-sandbox/blob/main/docs/tgw-format.md#the-bot-api-104)
+
+1. Start the bot and open `/manage` in PM. Verify the widget renders and that tapping a row calls back through the same poller. Record the client platform, version and endpoint, and redact tokens, chat IDs and widget state in any captures.
+2. Verify Desk → Queue → Item → Back uses the same message. After the latest screen is saved, open the chat on a second device and after a bot restart. Tap a stale control and check that it only refreshes the screen.
+3. Check light and dark themes, narrow bubbles, and large text. Open a private queue link from the item screen. Forward the widget to a disposable chat and verify that it shows no private state and accepts no actions.
+4. With seeded posts, review and run a manual publication, reorder a post, and delete a different post. Double-tap a confirmation and check for a single action and a matching PM receipt. Verify the widget result agrees with the PM receipt. Try cancelling a review and tapping a stale confirmation from a second device.
+5. Test an uncertain output with tracked IDs. Check that the evidence is readable across pages and that available resolutions match the evidence. Add a UTC slot through ForceReply, restart while the prompt is active, and verify a reply bound to that message still works.
+6. Delete the widget and try `/manage reopen`. From a client that cannot render it, send `/manage classic` and verify that the original widget no longer accepts actions. Test classic commands and alerts after disabling widget mode.
+
+The automated suite uses a mocked Bot API. This checklist records the remaining live observations before enablement.

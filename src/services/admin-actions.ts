@@ -15,7 +15,7 @@ import { withTelegramMutationScope } from "../telegram-request-context";
 import { abortableSleep } from "./task-supervisor";
 import type { AdminReplyMarkupIntent } from "./admin-response-worker";
 
-type ActionResult = { text?: string; replyMarkup?: AdminReplyMarkupIntent; state?: "applied" | "rejected" | "uncertain"; noResponse?: boolean; reconciliationAttempted?: boolean };
+type ActionResult = { text?: string; widgetItemId?: number; replyMarkup?: AdminReplyMarkupIntent; state?: "applied" | "rejected" | "uncertain"; noResponse?: boolean; reconciliationAttempted?: boolean };
 type ClaimedAction = NonNullable<ReturnType<AdminUpdateRepository["claimNext"]>> & { reconcileOnly?: boolean };
 
 const object = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
@@ -40,6 +40,7 @@ export const createAdminActionWorker = (input: {
   operationTracker?: OperationTracker;
   incidents?: { snapshot(): { id: string } | undefined; setActionRequired(id: string, required: boolean): boolean };
   setCommands?: () => Promise<unknown>;
+  updateWidget?: (updateId: number, text: string, markup: AdminReplyMarkupIntent | undefined, itemId: number | undefined) => void;
 }) => {
   const button = (text: string, action: string, payload: unknown = {}): AdminReplyMarkupIntent => ({ kind: "inline_keyboard", rows: [[{ text, action, payload }]] });
 
@@ -66,6 +67,8 @@ export const createAdminActionWorker = (input: {
     const state = result.state ?? "applied";
     if (!input.updates.finish(claim.updateId, state, { ...(result.text === undefined ? {} : { text: result.text }), operationId: input.updates.find(claim.updateId)?.operationId, ...(result.reconciliationAttempted ? { reconciliationAttempted: true } : {}) }, input.clock.now(), claim.claimToken)) return;
     if (result.noResponse || result.text === undefined) return;
+    try { input.updates.transaction(() => input.updateWidget?.(claim.updateId, result.text!, result.replyMarkup, result.widgetItemId)); }
+    catch { input.logger.warn("admin_widget_result_update_failed", { updateId: claim.updateId }); }
     input.responses.enqueue({ updateId: claim.updateId, adminChatId: input.adminChatId, kind: "confirmation", descriptor: { version: 1, text: result.text, ...(result.replyMarkup === undefined ? {} : { replyMarkup: result.replyMarkup }) }, now: input.clock.now() });
   });
 
@@ -142,12 +145,12 @@ export const createAdminActionWorker = (input: {
         saveOperationId(claim, operationId);
         const recovered = await input.recovery.recover(payload.reference, operationId);
         input.admin.audit(recovered.reused ? "recovery_existing_item_reused" : "recovery_completed", String(input.adminUserId), input.clock.now(), recovered.itemId, operationId, { sourceIds: recovered.sourceIds, creditLast: recovered.creditLast ?? false });
-        if (recovered.reused) return { text: `Those messages already belong to queue item #${recovered.itemId}; I reused that item and did not create a duplicate.`, replyMarkup: button("Queue", "queue") };
+        if (recovered.reused) return { widgetItemId: recovered.itemId, text: `Those messages already belong to queue item #${recovered.itemId}; I reused that item and did not create a duplicate.`, replyMarkup: button("Queue", "queue") };
         const replyMarkup = recovered.canApplyPreparationRules
           ? { kind: "inline_keyboard" as const, rows: [[{ text: "Apply preparation rules", action: "recovery_apply_preparation", payload: { itemId: recovered.itemId } }], [{ text: "Queue", action: "queue", payload: {} }]] }
           : button("Queue", "queue");
         const suffix = recovered.creditLast ? " The final message was recorded as a separate credit." : " It is ready to publish as shown; no author was inferred from its text.";
-        return { text: `Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}.${suffix}`, replyMarkup };
+        return { widgetItemId: recovered.itemId, text: `Recovered queue item #${recovered.itemId} from source IDs ${recovered.sourceIds.join(", ")}.${suffix}`, replyMarkup };
       }
       case "whitelist_lookup": {
         if (typeof payload.reference !== "string") return { state: "rejected", text: "The saved channel lookup is invalid." };

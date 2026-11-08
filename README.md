@@ -39,6 +39,8 @@ The database defaults to `./data/bot.sqlite`. It is WAL-backed and is intentiona
 
 `/start` and `/manage` open the dashboard. The bot also supports `/queue`, `/schedule`, `/whitelist`, `/authors`, `/health`, `/recover`, and `/cancel`. Every command, text prompt, and callback requires the configured numeric admin ID and a private chat.
 
+The optional **Shitpost Desk** uses an interactive Telegram widget in the admin PM. Enable `ADMIN_WIDGETS=widget` only after verifying the Bot API and your clients with a disposable bot. Use `ADMIN_WIDGETS=beta-test` with a Telegram test bot, disposable channels and a separate database to try the beta endpoint. With widgets enabled, `/manage` returns the existing Desk to its home screen and `/manage reopen` opens a new one at the bottom of the chat. `/manage classic` opens the text menu and retires the active widget. See the [widget compatibility checklist](docs/telegram-compatibility.md#private-desk-widget).
+
 Private menu navigation is reusable across elapsed time and restart. Confirmations execute once and are checked against current item/setting evidence; changed confirmations explain why a fresh review is needed. Active reply prompts remain usable until completed, cancelled, replaced, or invalidated by a target change. Older confirmations that lack the new evidence guards require a fresh review; already-purged legacy buttons can only open a replacement menu.
 
 Private replies and prompts are stored for delivery independently from command execution. Retrying a reply never replays the admin action, and ambiguous sends are retained for review rather than resent blindly.

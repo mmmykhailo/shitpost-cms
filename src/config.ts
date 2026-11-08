@@ -5,6 +5,7 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type AppConfig = {
   instagramCookieFile?: string;
+  adminWidgets?: "classic" | "widget" | "beta-test";
   botToken: string;
   adminUserId: UserId;
   queueChannelId: ChatId;
@@ -56,6 +57,10 @@ export const parseConfig = (
   if (!(["debug", "info", "warn", "error"] as const).includes(rawLogLevel as LogLevel)) {
     throw new Error("LOG_LEVEL must be one of debug, info, warn, error");
   }
+  const adminWidgets = environment.ADMIN_WIDGETS?.trim() || "classic";
+  if (adminWidgets !== "classic" && adminWidgets !== "widget" && adminWidgets !== "beta-test") {
+    throw new Error("ADMIN_WIDGETS must be classic, widget, or beta-test");
+  }
   const rawReleaseSha = environment.RELEASE_SHA?.trim() || undefined;
   const instagramCookieFile = environment.INSTAGRAM_COOKIE_FILE?.trim() || undefined;
   if (instagramCookieFile !== undefined && (!isAbsolute(instagramCookieFile) || /[\0\r\n]/u.test(instagramCookieFile))) throw new Error("INSTAGRAM_COOKIE_FILE must be an absolute path without control characters");
@@ -71,6 +76,7 @@ export const parseConfig = (
   return {
     ...(instagramCookieFile === undefined ? {} : { instagramCookieFile }),
     botToken,
+    ...(adminWidgets === "classic" ? {} : { adminWidgets }),
     adminUserId: asUserId(adminUserId),
     queueChannelId: asChatId(queueChannelId),
     targetChannelId: asChatId(targetChannelId),

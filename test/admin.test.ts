@@ -1,3 +1,8 @@
+import { createAdminPanelRepository } from "../src/db/admin-panel-repository";
+import { createAdminWidgetPanel } from "../src/services/admin-widget-panel";
+import { createAdminWidgetDelivery } from "../src/services/admin-widget-delivery";
+import { checkWidgetBudget, snapshotDesk, type DeskScreen } from "../src/admin-ui/widget/model";
+import { telegramMutationScope } from "../src/telegram-request-context";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -62,7 +67,7 @@ const commandUpdate = (updateId: number, messageId: number, command: string): Up
   update_id: updateId,
   message: {
     ...makeMessage(messageId, `/${command}`),
-    entities: [{ type: "bot_command", offset: 0, length: command.length + 1 }],
+    entities: [{ type: "bot_command", offset: 0, length: command.split(" ")[0]!.length + 1 }],
   },
 } as Update);
 
@@ -76,7 +81,7 @@ const callbackUpdate = (updateId: number, callbackId: string, data: string, mess
   callback_query: { id: callbackId, from, chat_instance: "test-chat", message, data },
 } as Update);
 
-const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = async (): Promise<PublicationOutcome> => ({ kind: "empty" })) => {
+const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = async (): Promise<PublicationOutcome> => ({ kind: "empty" }), widgets = false) => {
   const directory = mkdtempSync(join(tmpdir(), "shitpost-cms-admin-"));
   const database = createDatabase(join(directory, "bot.sqlite"));
   const queue = createQueueRepository(database, { bootId: "admin-test" });
@@ -85,6 +90,9 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const clock = createFakeClock(NOW);
   const admin = createAdminRepository(database);
   const responses = createAdminResponseRepository(database);
+  const panels = createAdminPanelRepository(database);
+  const widgetPanel = createAdminWidgetPanel(panels, responses, ADMIN_CHAT_ID, clock.now);
+  let widgetResponse: { ok: false; error_code: number; description: string; parameters?: { retry_after: number } } | undefined;
   const updates = createAdminUpdateRepository(database);
   const pending = createPendingUpdateRepository(database);
   const preparation = createPreparationRepository(database);
@@ -136,7 +144,16 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   const bot = new Bot("test-token", { botInfo: BOT_INFO });
   bot.api.config.use(async (_previous, method, payload) => {
     const body = payload as Record<string, unknown>;
-    calls.push({ method: String(method), payload: body });
+    const name = String(method);
+    if (name === "sendWidget" || name === "editMessageWidgetData") telegramMutationScope()?.beforeDispatch?.(name, body);
+    calls.push({ method: name, payload: body });
+    if ((name === "sendWidget" || name === "editMessageWidgetData") && widgetResponse) {
+      const failure = widgetResponse;
+      widgetResponse = undefined;
+      return failure as never;
+    }
+    if (name === "sendWidget") return { ok: true, result: { message_id: nextMessageId++ } } as never;
+
     if (method === "sendMessage") {
       const message = {
         message_id: nextMessageId,
@@ -173,6 +190,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
   } as AdminDeps["config"];
   const deps = {
     config,
+    ...(widgets ? { widgetPanel } : {}),
     queue,
     policy,
     schedule,
@@ -228,6 +246,7 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     bootId: "admin-test",
     clock,
     logger,
+    deliverWidget: createAdminWidgetDelivery({ api: bot.api, panels, responses, clock, enabled: widgets, adminChatId: ADMIN_ID }),
   });
   const actionWorker = createAdminActionWorker({
     updates,
@@ -245,12 +264,17 @@ const createHarness = (manualPublish: AdminDeps["scheduler"]["manualPublish"] = 
     bootId: "admin-test",
     clock,
     logger,
+    ...(widgets ? { updateWidget: (updateId, text) => widgetPanel.finish(updateId, text, []) } : {}),
     setCommands: async () => bot.api.setMyCommands([{ command: "start", description: "Open queue manager" }], { scope: { type: "chat", chat_id: ADMIN_ID } }),
   });
 
   return {
     bot,
     clock,
+    panels,
+    widgetPanel,
+    responseWorker,
+    setWidgetResponse: (response: typeof widgetResponse) => { widgetResponse = response; },
     database,
     queue,
     policy,
@@ -1319,4 +1343,166 @@ test("delayed resolution replies refuse changed evidence without adopting output
     expect(h.queue.findItemById(prepared.item.id)?.status).toBe("uncertain_publish");
     expect(h.admin.getPrompt(ADMIN_ID, h.clock.now())).toBeUndefined();
   } finally { h.close(); }
+});
+
+describe("private Desk widget", () => {
+  type Wire = { v: number; r: number; t: string; b?: string; n?: string; l?: string; a: Array<[string, string]> };
+  const wire = (data: unknown): Wire => JSON.parse(String(data)) as Wire;
+  const key = (screen: Wire, label: string): string => {
+    const control = screen.a.find(([, text]) => text.includes(label));
+    if (!control) throw new Error(`No Desk control ${label} on ${screen.t}`);
+    return `w1:${screen.r}:${control[0]}`;
+  };
+  const reply = (h: ReturnType<typeof createHarness>) => h.calls.filter((call) => call.method === "answerWidgetQuery").at(-1)?.payload.data;
+  const tap = (updateId: number, messageId: number, data: string, from = ADMIN_CHAT_ID, chatType = "private"): Update => ({
+    update_id: updateId,
+    widget_query: { id: String(updateId), from: { id: from }, chat: { id: ADMIN_CHAT_ID, type: chatType }, message_id: messageId, data },
+  } as unknown as Update);
+
+  test("widget keeps one PM message and guards delete by actor, revision and durable receipt", async () => {
+    const h = createHarness(undefined, true);
+    try {
+      const item = h.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(700) }), NOW).item;
+      await h.run(commandUpdate(1, 10, "manage"));
+      const send = h.calls.find((call) => call.method === "sendWidget")!;
+      expect(send.payload).toMatchObject({ chat_id: ADMIN_CHAT_ID, allow_queries: true });
+      expect(send.payload).not.toHaveProperty("public_data");
+      expect(send.payload).not.toHaveProperty("is_shared");
+      const desk = wire(send.payload.chat_data);
+      const messageId = h.panels.find(ADMIN_CHAT_ID)!.messageId!;
+      await h.run(tap(2, messageId, key(desk, "in queue")));
+      const queue = wire(reply(h));
+      expect(queue.t).toBe("Queue");
+      expect(queue.a.every(([, label]) => !label.includes("Delete"))).toBe(true);
+      await h.run(tap(3, messageId, key(queue, `#${item.id}`)));
+      const detail = wire(reply(h));
+      expect(detail.l).toContain("/700");
+      await h.run(tap(4, messageId, key(detail, "Actions")));
+      await h.run(tap(5, messageId, key(wire(reply(h)), "Review delete")));
+      const review = wire(reply(h));
+      const confirm = key(review, "Confirm delete");
+      await h.run(tap(6, messageId, confirm, ADMIN_CHAT_ID + 1));
+      expect(reply(h)).toBeUndefined();
+      await h.run(tap(7, messageId, confirm, ADMIN_CHAT_ID, "group"));
+      await h.run(tap(8, messageId + 1, confirm));
+      expect(wire(reply(h)).n).toContain("retired");
+      await h.run(tap(9, messageId, `w1:${detail.r}:0`));
+      expect(wire(reply(h))).toMatchObject({ r: review.r, n: expect.stringContaining("changed") });
+      expect(h.deleted).toHaveLength(0);
+
+      await h.run(tap(10, messageId, confirm));
+      expect(wire(reply(h)).t).toBe("Request accepted");
+      expect(h.updates.find(10)?.state).toBe("applied");
+      expect(h.queue.findItemById(item.id)?.status).toBe("deleted");
+      expect(h.deleted).toEqual([{ chatId: Number(QUEUE_CHAT_ID), messageIds: [700] }]);
+      await h.run(tap(10, messageId, confirm));
+      await h.run(tap(11, messageId, confirm));
+      expect(h.deleted).toHaveLength(1);
+      expect(wire(reply(h)).t).toBe("Operation result");
+
+      h.clock.advance(1_000);
+      expect(await h.responseWorker.runOnce()).toBe(true);
+      const edit = h.calls.filter((call) => call.method === "editMessageWidgetData").at(-1)!;
+      expect(edit.payload.message_id).toBe(messageId);
+      expect(wire(edit.payload.chat_data).t).toBe("Operation result");
+      expect(h.calls.filter((call) => call.method === "sendWidget")).toHaveLength(1);
+
+      await h.run(commandUpdate(12, 11, "manage classic"));
+      expect(h.lastSent().message.text).toContain("Telegram queue manager");
+      await h.run(tap(13, messageId, "w1:r"));
+      expect(wire(reply(h)).n).toContain("retired");
+    } finally { h.close(); }
+  });
+
+  test("checkpoint handles 429 and no-op, then retires a deleted widget", async () => {
+    const h = createHarness(undefined, true);
+    try {
+      await h.run(commandUpdate(1, 10, "manage"));
+      const id = h.panels.find(ADMIN_CHAT_ID)!.messageId!;
+      await h.run(tap(2, id, "w1:r"));
+      h.clock.advance(1_000);
+      h.setWidgetResponse({ ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 2 } });
+      expect(await h.responseWorker.runOnce()).toBe(true);
+      expect(h.panels.find(ADMIN_CHAT_ID)?.checkpoint).toBe(1);
+      expect(await h.responseWorker.runOnce()).toBe(false);
+      h.clock.advance(2_000);
+      h.setWidgetResponse({ ok: false, error_code: 400, description: "Bad Request: message is not modified" });
+      expect(await h.responseWorker.runOnce()).toBe(true);
+      expect(h.panels.find(ADMIN_CHAT_ID)?.checkpoint).toBe(2);
+      await h.run(tap(3, id, "w1:r"));
+      h.clock.advance(1_000);
+      h.setWidgetResponse({ ok: false, error_code: 400, description: "Bad Request: message to edit not found" });
+      expect(await h.responseWorker.runOnce()).toBe(true);
+      expect(h.panels.find(ADMIN_CHAT_ID)?.messageId).toBeNull();
+      await h.run(commandUpdate(4, 11, "manage"));
+      expect(h.panels.find(ADMIN_CHAT_ID)?.messageId).not.toBe(id);
+    } finally { h.close(); }
+  });
+
+  test("restores pending edits and rejects a fresh tap on a review whose source changed", async () => {
+    const h = createHarness(undefined, true);
+    try {
+      const item = h.queue.observeQueueSnapshot(snapshotFixture({ chatId: QUEUE_CHAT_ID, messageId: asMessageId(701) }), NOW).item;
+      await h.run(commandUpdate(1, 10, "queue"));
+      const panel = h.panels.find(ADMIN_CHAT_ID)!;
+      const id = panel.messageId!;
+      await h.run(tap(2, id, key(wire(snapshotDesk(panel.screen, panel.revision).data), `#${item.id}`)));
+      await h.run(tap(3, id, key(wire(reply(h)), "Actions")));
+      await h.run(tap(4, id, key(wire(reply(h)), "Review delete")));
+      const confirm = key(wire(reply(h)), "Confirm delete");
+
+      h.clock.advance(1_000);
+      const claim = h.responses.claimDue(h.clock.now(), "interrupted")!;
+      expect(h.responses.markRequestStarted(claim.id, claim.claimToken!, h.clock.now())).toBe(true);
+      expect(h.responses.recover(h.clock.now(), "admin-test")).toEqual({ requeued: 1, uncertain: 0 });
+      expect(await h.responseWorker.runOnce()).toBe(true);
+
+      h.database.raw.query("UPDATE queue_items SET source_generation = source_generation + 1 WHERE id = ?").run(item.id);
+      await h.run(tap(5, id, confirm));
+      const review = wire(reply(h));
+      expect([review.t, review.b].join(" ")).toContain("source changed");
+      expect(h.deleted).toHaveLength(0);
+      expect(h.calls.filter(call => call.method === "sendWidget")).toHaveLength(1);
+    } finally { h.close(); }
+  });
+
+  test("accepts a schedule reply through the existing bound prompt and returns to the widget", async () => {
+    const h = createHarness(undefined, true);
+    try {
+      await h.run(commandUpdate(1, 10, "schedule"));
+      const panel = h.panels.find(ADMIN_CHAT_ID)!;
+      const id = panel.messageId!;
+      await h.run(tap(2, id, key(wire(snapshotDesk(panel.screen, panel.revision).data), "Add UTC slot")));
+      expect(wire(reply(h)).t).toBe("Reply in chat");
+      const question = h.lastSent().message;
+      expect(h.lastSent().payload.reply_markup).toMatchObject({ force_reply: true });
+      await h.run(replyUpdate(3, 11, "18:30", question));
+      expect(h.schedule.slots()).toEqual([1110]);
+      expect(h.admin.getPrompt(ADMIN_ID, NOW)).toBeUndefined();
+      expect(h.panels.find(ADMIN_CHAT_ID)?.screen.title).toBe("Schedule");
+    } finally { h.close(); }
+  });
+
+  test("widget HTML and multibyte evidence fit Telegram budgets without dropping the review", () => {
+    checkWidgetBudget();
+    const body = "🧾".repeat(180) + " Known destination IDs: 1234567";
+    const screen: DeskScreen = {
+      title: "🧪".repeat(20), hero: "🧪".repeat(40), body,
+      actions: Array.from({ length: 8 }, () => ({ label: "🧪".repeat(40), route: { name: "desk" } })),
+      back: { name: "desk" },
+    };
+    let rebuilt = "";
+    for (let page = 0; ; page += 1) {
+      const snapshot = snapshotDesk({ ...screen, page }, 1);
+      expect(Buffer.byteLength(snapshot.data)).toBeLessThanOrEqual(1_024);
+      const visible = wire(snapshot.data);
+      rebuilt += visible.b ?? "";
+      if (!visible.a.some(([id]) => id === "n")) {
+        expect(snapshot.actions).toHaveLength(8);
+        break;
+      }
+      expect(snapshot.actions).toHaveLength(0);
+    }
+    expect(rebuilt).toBe(body);
+  });
 });

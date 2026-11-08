@@ -1,3 +1,8 @@
+import { snapshotDesk, widgetTemplate, type DeskRoute, type DeskScreen } from "../admin-ui/widget/model";
+import { adminRoute, createDeskViews, deskAction, deskHome } from "../admin-ui/widget/views";
+import { rawWidgets, readWidgetQuery } from "../admin-ui/widget/transport";
+import type { AdminWidgetPanel } from "../services/admin-widget-panel";
+import type { ResolvedCallback } from "../domain/admin-callback";
 import { canReorder } from "../domain/queue-item";
 import { decodeReusableCallback, isReusableAction } from "../domain/admin-callback";
 import type { Bot, Context } from "grammy";
@@ -29,6 +34,7 @@ import { asChatId, asMessageId, type ChatId, type MessageId, type UserId } from 
 
 type AdminDeps = {
   config: AppConfig;
+  widgetPanel?: AdminWidgetPanel;
   queue: QueueRepository;
   policy: PolicyRepository;
   schedule: ScheduleRepository;
@@ -99,6 +105,74 @@ const dashboardText = (deps: AdminDeps): string => {
 };
 
 export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
+  const capture = new WeakMap<Context, { screens: DeskScreen[]; prompt: boolean }>();
+  const widgetPanel = deps.widgetPanel;
+  const views = createDeskViews({
+    ...deps, adminId: deps.config.adminUserId, queueChannelId: deps.config.queueChannelId,
+    nextAt: deps.scheduler.nextAt,
+    button: (label, action, payload, version) => button(deps, label, action, payload, version),
+  });
+
+  if (widgetPanel) bot.use(async (ctx, next) => {
+    const query = readWidgetQuery(ctx);
+    if (!query) return next();
+    const adminId = deps.config.adminUserId;
+    const answer = async (data?: string) => {
+      try {
+        await rawWidgets(bot.api).answerWidgetQuery({ widget_query_id: query.id, ...(data ? { data } : {}) }, AbortSignal.timeout(3_000));
+      } catch (error) {
+        deps.logger.warn("admin_widget_answer_failed", { errorKind: classifyTelegramError(error).kind });
+      }
+    };
+    if (!query.original || query.from !== adminId || query.chatId !== adminId || query.chatType !== "private") {
+      await answer();
+      return;
+    }
+    const active = widgetPanel.find();
+    if (active?.template !== widgetTemplate || active.messageId === null || active.messageId !== query.messageId) {
+      await answer(JSON.stringify({ n: "This Desk is retired. Send /manage to open it." }));
+      return;
+    }
+    if (typeof query.data !== "string" || Buffer.byteLength(query.data) > 64) {
+      await answer(JSON.stringify({ n: "Invalid Desk action." }));
+      return;
+    }
+    const data = query.data;
+    const match = /^w1:(\d+):([0-7pnb])$/u.exec(data);
+    if (data !== "w1:r" && !match) {
+      await answer(JSON.stringify({ n: "Unknown Desk action." }));
+      return;
+    }
+
+    const response = deps.updates.transaction(() => {
+      const snapshot = snapshotDesk(active.screen, active.revision);
+      if (!deps.updates.begin({ updateId: ctx.update.update_id, adminId, actionKind: "widget_query",
+        actionPayload: {}, bootId: deps.bootId, now: deps.now() })) return snapshot.data;
+      const updateId = ctx.update.update_id;
+      const key = match?.[2];
+      let screen: DeskScreen | undefined;
+      let note: string | undefined;
+      if (match && Number(match[1]) !== active.revision) {
+        note = "The Desk changed. Review the current screen.";
+      } else if (key === "p" || key === "n") {
+        const page = (active.screen.page ?? 0) + (key === "p" ? -1 : 1);
+        const controls = (JSON.parse(snapshot.data) as { a: [string, string][] }).a;
+        if (controls.some(([id]) => id === key)) screen = { ...active.screen, page };
+      } else {
+        const route = data === "w1:r" ? active.screen.refresh : key === "b" ? active.screen.back : snapshot.actions[Number(key)];
+        if (route && route.name !== "admin") screen = views(route);
+        else if (route?.name === "admin") {
+          // A refresh must never execute a stored admin action.
+          if (data !== "w1:r") screen = runWidgetAction(ctx, route.button, active.screen);
+        }
+      }
+      deps.updates.finish(updateId, "applied", { handled: true }, deps.now());
+      if (screen) return widgetPanel.save(screen);
+      return note ? snapshotDesk(active.screen, active.revision, note).data : snapshot.data;
+    });
+    await answer(response);
+  });
+
   bot.use(async (ctx, next) => {
     if (!isAuthorized(ctx, deps.config.adminUserId)) return next();
     const updateId = ctx.update.update_id;
@@ -128,6 +202,20 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   const enqueueReply = (ctx: Context, text: string, options: Record<string, unknown> = {}, responseKind: AdminResponseKind = "confirmation", coalesceKey?: string): void => {
     const updateId = ctx.update.update_id;
     const markup = options.reply_markup as AdminReplyMarkupIntent | undefined;
+    const widget = capture.get(ctx);
+    if (widget) {
+      const lines = text.split("\n");
+      const headline = lines.shift() ?? "Shitpost Desk";
+      const title = Buffer.byteLength(headline) <= 60 ? headline : "Review";
+      const body = title === headline ? lines.join("\n") : text;
+      const actions = markup?.kind === "inline_keyboard" ? markup.rows.flat().map((entry) => {
+        const destination: DeskRoute = entry.action === "queue" ? { name: "queue", offset: 0 }
+          : entry.action === "dashboard" ? deskHome : adminRoute(entry);
+        return deskAction(entry.text, destination, !isReusableAction(entry.action) && !entry.action.startsWith("widget_") ? "primary" : undefined);
+      }) : [];
+      widget.screens.push({ title, body, actions });
+      return;
+    }
     const descriptor: AdminResponseDescriptor = { version: 1, text };
     if (Array.isArray(options.entities)) {
       const entities = options.entities as NonNullable<AdminResponseDescriptor["entities"]>;
@@ -161,6 +249,8 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const beginPrompt = (ctx: Context, spec: PromptSpec): void => {
+    const widget = capture.get(ctx);
+    if (widget) widget.prompt = true;
     const generationId = randomUUID();
     const state = spec.state as Record<string, unknown>;
     const guardedState = typeof state.itemId === "number" ? { ...state, actionState: deps.admin.actionState("resolution_prompt", state) } : state;
@@ -222,6 +312,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendQueue = (ctx: Context, offset = 0): void => {
+    const widget = capture.get(ctx);
+    if (widget) {
+      widget.screens.push(views({ name: "queue", offset }));
+      return;
+    }
     const now = deps.now();
     const pageSize = 10;
     offset = Math.min(Math.max(0, offset), Math.max(0, Math.floor((deps.queue.listActive(10_000).length - 1) / pageSize) * pageSize));
@@ -322,6 +417,12 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendSchedule = (ctx: Context, notice?: string): void => {
+    const widget = capture.get(ctx);
+    if (widget) {
+      const screen = views({ name: "schedule", offset: 0 });
+      widget.screens.push({ ...screen, ...(notice ? { body: notice + "\n" + screen.body } : {}) });
+      return;
+    }
     const slots = deps.schedule.slots();
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[button(deps, "Add UTC slot", "slot_add"), button(deps, deps.schedule.enabled() ? "Pause" : "Resume", deps.schedule.enabled() ? "schedule_pause" : "schedule_resume")]];
     for (const slot of slots) rows.push([button(deps, `Remove ${formatUtcSlot(slot)}`, "slot_remove", { minuteOfDay: slot })]);
@@ -332,6 +433,11 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
   };
 
   const sendWhitelist = (ctx: Context): void => {
+    const widget = capture.get(ctx);
+    if (widget) {
+      widget.screens.push(views({ name: "sources", offset: 0 }));
+      return;
+    }
     const channels = deps.policy.listChannels();
     const rows: Array<Awaited<ReturnType<typeof button>>[]> = [[button(deps, "Add channel", "whitelist_add")]];
     for (const channel of channels) rows.push([button(deps, `Remove ${cleanDisplay(channel.title || channel.username || String(channel.chatId))}`, "whitelist_remove", { chatId: channel.chatId })]);
@@ -594,6 +700,10 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (!resolved) return enqueueReply(ctx, token && deps.admin.callbackWasProcessed(deps.config.adminUserId, token)
       ? "This confirmation was already processed." : "This button is no longer available. Open a fresh menu.", { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });
     if ("legacy" in resolved && resolved.legacy && !isReusableAction(resolved.action)) return enqueueReply(ctx, "This older confirmation needs a fresh review.", { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });
+    return executeAdminAction(ctx, resolved);
+  };
+
+  const executeAdminAction = (ctx: Context, resolved: Omit<ResolvedCallback, "payload"> & { payload: unknown }): void => {
     const payload = (resolved.payload && typeof resolved.payload === "object" ? resolved.payload : {}) as Record<string, unknown>;
     if (typeof payload.actionState === "string" && payload.actionState !== deps.admin.actionState(resolved.action, payload)) {
       return enqueueReply(ctx, (resolved.action === "publish_execute" ? "The ready queue changed; reopen the dashboard." : resolved.action === "queue_delete_confirm" ? "This item or its source changed. Review it again before deleting." : "The state for this confirmation changed. Review the item or setting again."), { reply_markup: keyboard([[button(deps, "Dashboard", "dashboard")]]) });
@@ -697,10 +807,60 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
           return enqueueReply(ctx, error instanceof Error ? error.message : "Tracked output cleanup failed; the item remains uncertain.");
         }
       }
+      case "widget_health": {
+        const health = deps.health.snapshot();
+        return enqueueReply(ctx, ["Health", `Database: ${health.databaseOk ? "available" : "failed"}`,
+          `Worker lease: ${health.leaseOwned ? "owned" : "lost"}`,
+          `Operations: ${health.activeOperations} active · ${health.uncertainOperations} uncertain`,
+          `Telegram cooldown: ${health.sharedCooldown?.remainingMs ? new Date(health.sharedCooldown.notBefore).toISOString() : "inactive"}`,
+          "Send /health for the full report."].join("\n"));
+      }
+      case "widget_logs": {
+        const rows = deps.recentLogs?.recent({ level: "info", limit: 4 }) ?? [];
+        return enqueueReply(ctx, ["Recent logs", ...rows.map(row => `${new Date(row.at).toISOString().slice(11, 19)} ${row.level} · ${cleanDisplay(row.event)}`),
+          "Send /logs for details and severity filters."].join("\n"));
+      }
+      case "widget_recover": return beginRecovery(ctx);
+      case "widget_resume_prompt": {
+        const widget = capture.get(ctx);
+        if (widget) widget.prompt = true;
+        return;
+      }
+      case "widget_cancel_prompt":
+        clearPrompt();
+        return enqueueReply(ctx, "Prompt cancelled.");
+      case "widget_slot_review": {
+        const slot = payload.minuteOfDay;
+        if (typeof slot !== "number" || !deps.schedule.slots().includes(slot)) return sendSchedule(ctx, "That UTC slot is gone.");
+        const label = formatUtcSlot(slot) + " UTC";
+        return enqueueReply(ctx, `Remove ${label}?\nThe other slots keep their current schedule.`, {
+          reply_markup: keyboard([[button(deps, `Remove ${label}`, "slot_remove", { minuteOfDay: slot })]]),
+        });
+      }
+      case "widget_schedule_review": {
+        const enabled = deps.schedule.enabled();
+        const label = enabled ? "Pause scheduling" : "Resume scheduling";
+        return enqueueReply(ctx, `${label}?\nManual publishing remains available.`, {
+          reply_markup: keyboard([[button(deps, label, "widget_schedule_confirm", { enabled })]]),
+        });
+      }
+      case "widget_schedule_confirm":
+        if (payload.enabled !== deps.schedule.enabled()) return sendSchedule(ctx, "Scheduling changed. Review the current state.");
+        return executeAdminAction(ctx, { action: payload.enabled ? "schedule_pause" : "schedule_resume", payload: {} });
       case "publish": {
         const candidate = deps.queue.peekNextReady(deps.now());
         if (!candidate) return enqueueReply(ctx, "No prepared queue item is currently ready to publish.", { reply_markup: keyboard([[button(deps, "Queue", "queue")], [button(deps, "Cancel", "dashboard")]]) });
         const confirm = button(deps, "Confirm publish next", "publish_execute", { itemId: candidate.id, contentVersion: candidate.contentVersion, sourceGeneration: candidate.sourceGeneration }, candidate.contentVersion);
+        if (capture.has(ctx)) {
+          const sourceId = deps.queue.currentSourceIds(candidate.id)[0];
+          const link = sourceId === undefined ? undefined : buildQueueMessageLink(deps.config.queueChannelId, sourceId);
+          capture.get(ctx)!.screens.push({
+            title: "Review next publish", hero: `#${candidate.id} · ${candidate.contentType}`,
+            body: `Target channel ${deps.config.targetChannelId}. If this item fails before producing any output, the run can try a later ready post.`,
+            ...(link ? { link } : {}), actions: [deskAction("Run publish next", adminRoute(confirm), "primary")],
+          });
+          return;
+        }
         return enqueueReply(ctx, `Publish next available item #${candidate.id} now? If an item fails definitively before producing output, this run may skip it and try a later ready item.`, { reply_markup: keyboard([[confirm], [button(deps, "Cancel", "dashboard")]]) });
       }
       case "publish_execute": {
@@ -879,7 +1039,7 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
         const item = deps.queue.findItemById(itemId);
         if (!item || ["done", "deleted", "deleted_external"].includes(item.status)) return enqueueReply(ctx, "This item is no longer waiting in the queue.");
         const confirm = button(deps, `Confirm delete #${itemId}`, "queue_delete_confirm", { itemId }, item.contentVersion);
-        return enqueueReply(ctx, "Delete this queue item from Telegram and SQLite?", { reply_markup: keyboard([[confirm], [button(deps, "Cancel", "queue")]]) });
+        return enqueueReply(ctx, capture.has(ctx) ? `Delete queue item #${itemId}?\nThis removes its current source messages from the queue channel.` : "Delete this queue item from Telegram and SQLite?", { reply_markup: keyboard([[confirm], [button(deps, "Cancel", "queue")]]) });
       }
       case "queue_delete_confirm": {
         if (itemId === undefined) return enqueueReply(ctx, "Invalid queue item.");
@@ -894,6 +1054,36 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     }
   };
 
+  const runWidgetAction = (ctx: Context, action: AdminActionButton, previous: DeskScreen): DeskScreen => {
+    const captured = { screens: [] as DeskScreen[], prompt: false };
+    capture.set(ctx, captured);
+    try {
+      executeAdminAction(ctx, action);
+    } finally {
+      capture.delete(ctx);
+    }
+    if (captured.prompt) return { ...views({ name: "prompt" }), back: previous.refresh ?? previous.back ?? deskHome };
+    if (deps.updates.find(ctx.update.update_id)?.state === "queued") {
+      return views({ name: "result", updateId: ctx.update.update_id });
+    }
+    const screen = captured.screens.at(-1);
+    const back = previous.refresh ?? previous.back ?? deskHome;
+    if (!screen) return { title: "Shitpost Desk", body: "No further action is available.", actions: [], back };
+    const notice = captured.screens.slice(0, -1).map((entry) => [entry.title, entry.body].filter(Boolean).join("\n")).join("\n");
+    return {
+      ...screen,
+      ...(notice ? { body: [notice, screen.body].filter(Boolean).join("\n") } : {}),
+      back: screen.back ?? back,
+    };
+  };
+
+  const beginRecovery = (ctx: Context): void => beginPrompt(ctx, {
+      kind: "recover",
+      state: {},
+      text: "Recover one queue-channel message or enter an ordered bundle of message IDs. Recovery keeps each selected message's shown forwarding mode and is ready to publish as shown. For a content bundle with one standalone text credit, append --credit-last. Telegram cannot enumerate missed history.",
+      placeholder: "message IDs [--credit-last]",
+  });
+
   const command = (name: string, handler: (ctx: Context) => void | Promise<void>): void => {
     bot.command(name, async (ctx) => {
       if (!isAuthorized(ctx, deps.config.adminUserId)) return reject(ctx);
@@ -901,28 +1091,33 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     });
   };
 
-  command("start", async (ctx) => {
-    const replyMarkup = await dashboardKeyboard();
+  const openDesk = (ctx: Context, route: Exclude<DeskRoute, { name: "admin" }>): boolean => {
+    if (!widgetPanel) return false;
+    if (ctx.match === "classic") {
+      deps.updates.transaction(() => widgetPanel.retire());
+      return false;
+    }
+    deps.updates.transaction(() => {
+      if (ctx.match === "reopen") widgetPanel.retire();
+      widgetPanel.open(views(route));
+    });
+    return true;
+  };
+
+  command("start", (ctx) => {
     deps.updates.transaction(() => {
       deferAction(ctx, "set_commands", {});
-      enqueueReply(ctx, dashboardText(deps), { reply_markup: replyMarkup }, "view", `admin:${deps.config.adminUserId}:view:dashboard`);
+      if (!openDesk(ctx, deskHome)) sendDashboard(ctx);
     });
   });
-  command("manage", sendDashboard);
-  command("queue", sendQueue);
-  command("schedule", sendSchedule);
-  command("whitelist", sendWhitelist);
-  command("authors", sendAuthors);
+  command("manage", (ctx) => { if (!openDesk(ctx, deskHome)) sendDashboard(ctx); });
+  command("queue", (ctx) => { if (!openDesk(ctx, { name: "queue", offset: 0 })) sendQueue(ctx); });
+  command("schedule", (ctx) => { if (!openDesk(ctx, { name: "schedule", offset: 0 })) sendSchedule(ctx); });
+  command("whitelist", (ctx) => { if (!openDesk(ctx, { name: "sources", offset: 0 })) sendWhitelist(ctx); });
+  command("authors", (ctx) => { if (!openDesk(ctx, { name: "authors" })) sendAuthors(ctx); });
   command("health", sendHealth);
   command("logs", async (ctx) => sendLogs(ctx, ctx.message?.text?.replace(/^\/logs(?:@\w+)?(?:\s|$)/u, "") ?? ""));
-  command("recover", async (ctx) => {
-    await beginPrompt(ctx, {
-      kind: "recover",
-      state: {},
-      text: "Recover one queue-channel message or enter an ordered bundle of message IDs. Recovery keeps each selected message's shown forwarding mode and is ready to publish as shown. For a content bundle with one standalone text credit, append --credit-last. Telegram cannot enumerate missed history.",
-      placeholder: "message IDs [--credit-last]",
-    });
-  });
+  command("recover", beginRecovery);
   command("cancel", async (ctx) => { clearPrompt(); await enqueueReply(ctx, "Pending admin prompt cancelled."); });
 
   bot.callbackQuery(/.*/, async (ctx) => {
@@ -938,6 +1133,17 @@ export const registerAdminHandlers = (bot: Bot, deps: AdminDeps): void => {
     if (!isAuthorized(ctx, deps.config.adminUserId)) return reject(ctx);
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return;
-    deps.updates.transaction(() => { handlePrompt(ctx, text); deps.updates.finish(ctx.update.update_id, "applied", { handled: true }, deps.now()); });
+    deps.updates.transaction(() => {
+      const active = widgetPanel?.find();
+      const onPrompt = active?.template === widgetTemplate && active.messageId !== null && active.screen.refresh?.name === "prompt";
+      handlePrompt(ctx, text);
+      if (onPrompt && !deps.admin.getPrompt(deps.config.adminUserId, deps.now())) {
+        const receipt = deps.updates.find(ctx.update.update_id);
+        const back = active.screen.back;
+        if (receipt?.state === "queued") widgetPanel!.save(views({ name: "result", updateId: ctx.update.update_id }));
+        else if (back && back.name !== "admin") widgetPanel!.save(views(back));
+      }
+      deps.updates.finish(ctx.update.update_id, "applied", { handled: true }, deps.now());
+    });
   });
 };

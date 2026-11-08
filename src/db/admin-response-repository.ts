@@ -7,6 +7,13 @@ const validateDescriptor = (value: unknown): Record<string, unknown> => {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) throw new Error("Admin response descriptor must be an object");
   const descriptor = payload as Record<string, unknown>;
   if (descriptor.version !== 1 || typeof descriptor.text !== "string") throw new Error("Admin response descriptor version or text is invalid");
+  if (descriptor.widget !== undefined) {
+    const widget = descriptor.widget as Record<string, unknown> | null;
+    if (!widget || typeof widget !== "object" || !Number.isSafeInteger(widget.revision) || Number(widget.revision) <= 0 ||
+      (widget.messageId !== undefined && (!Number.isSafeInteger(widget.messageId) || Number(widget.messageId) <= 0))) {
+      throw new Error("Admin widget delivery descriptor is invalid");
+    }
+  }
   if (descriptor.entities !== undefined && (!Array.isArray(descriptor.entities) || descriptor.entities.some((entry) => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true;
     const entity = entry as Record<string, unknown>;
@@ -112,7 +119,7 @@ export const createAdminResponseRepository = (database: AppDatabase) => {
 
   const enqueue = (input: {
     dedupeKey?: string; updateId?: number; responseOrdinal?: number; adminChatId: number; kind: AdminResponseKind;
-    descriptor: unknown; coalesceKey?: string; now: number;
+    descriptor: unknown; coalesceKey?: string; now: number; notBefore?: number;
   }): { record: AdminResponseRecord; inserted: boolean } => database.transaction(() => {
     if (!Number.isSafeInteger(input.adminChatId) || !Number.isSafeInteger(input.now) || input.now < 0) throw new RangeError("Invalid admin response destination or timestamp");
     if (input.updateId !== undefined && (!Number.isSafeInteger(input.updateId) || input.updateId < 0)) throw new RangeError("Admin response update ID must be a nonnegative safe integer");
@@ -127,13 +134,13 @@ export const createAdminResponseRepository = (database: AppDatabase) => {
       const pending = database.raw.query("SELECT id FROM admin_response_outbox WHERE coalesce_key = ? AND kind = 'view' AND state = 'pending' ORDER BY created_at DESC LIMIT 1").get(input.coalesceKey) as { id: string } | null;
       if (pending !== null) {
         const changed = database.raw.query(`UPDATE admin_response_outbox SET dedupe_key = ?, update_id = ?, response_ordinal = ?, admin_chat_id = ?, descriptor_json = ?, created_at = ?, next_attempt_at = ?, attempt_count = 0, last_error_kind = NULL, last_error_description = NULL
-          WHERE id = ? AND state = 'pending'`).run(dedupeKey, input.updateId ?? null, ordinal ?? null, input.adminChatId, descriptorJson, input.now, input.now, pending.id);
+          WHERE id = ? AND state = 'pending'`).run(dedupeKey, input.updateId ?? null, ordinal ?? null, input.adminChatId, descriptorJson, input.now, input.notBefore ?? input.now, pending.id);
         if (Number(changed.changes) === 1) return { record: find(pending.id)!, inserted: false };
       }
     }
     const id = randomUUID();
     database.raw.query(`INSERT INTO admin_response_outbox (id, dedupe_key, update_id, response_ordinal, admin_chat_id, kind, descriptor_version, descriptor_json, coalesce_key, state, created_at, next_attempt_at, attempt_count)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', ?, ?, 0)`).run(id, dedupeKey, input.updateId ?? null, ordinal ?? null, input.adminChatId, input.kind, descriptorJson, input.coalesceKey ?? null, input.now, input.now);
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending', ?, ?, 0)`).run(id, dedupeKey, input.updateId ?? null, ordinal ?? null, input.adminChatId, input.kind, descriptorJson, input.coalesceKey ?? null, input.now, input.notBefore ?? input.now);
     return { record: find(id)!, inserted: true };
   });
 
@@ -166,7 +173,7 @@ export const createAdminResponseRepository = (database: AppDatabase) => {
     const record = findByDedupeKey(dedupeKey);
     return record === undefined ? false : cancel(record.id, now);
   };
-  const cancelPending = (coalesceKey: string, now: number): number => Number(database.raw.query("UPDATE admin_response_outbox SET state = 'cancelled', last_error_kind = 'cancelled', last_error_description = 'Superseded before delivery' WHERE coalesce_key = ? AND state = 'pending'").run(coalesceKey, now).changes);
+  const cancelPending = (coalesceKey: string, _now: number): number => Number(database.raw.query("UPDATE admin_response_outbox SET state = 'cancelled', last_error_kind = 'cancelled', last_error_description = 'Superseded before delivery' WHERE coalesce_key = ? AND state = 'pending'").run(coalesceKey).changes);
   const rearmCancelled = (dedupeKey: string, descriptor: unknown, now: number): AdminResponseRecord | undefined => database.transaction(() => {
     const json = JSON.stringify(validateDescriptor(descriptor));
     if (json === undefined) throw new Error("Admin response descriptor must be JSON serializable");
@@ -184,9 +191,9 @@ export const createAdminResponseRepository = (database: AppDatabase) => {
   const recover = (now: number, bootId?: string): { requeued: number; uncertain: number } => database.transaction(() => {
     const lostClaim = "(lease_expires_at IS NULL OR lease_expires_at <= ? OR (? IS NOT NULL AND claim_boot_id IS NOT ?))";
     const uncertain = Number(database.raw.query(`UPDATE admin_response_outbox SET state = 'uncertain', claim_token = NULL, claim_boot_id = NULL, lease_expires_at = NULL, last_error_kind = 'restart_after_request_start', last_error_description = 'Telegram may have delivered this response before restart'
-      WHERE state = 'sending' AND request_started_at IS NOT NULL AND ${lostClaim}`).run(now, bootId ?? null, bootId ?? null).changes);
-    const requeued = Number(database.raw.query(`UPDATE admin_response_outbox SET state = 'pending', claim_token = NULL, claim_boot_id = NULL, lease_expires_at = NULL, next_attempt_at = ?, last_error_kind = 'restart_before_request', last_error_description = 'Response was not sent before restart'
-      WHERE state = 'sending' AND request_started_at IS NULL AND ${lostClaim}`).run(now, now, bootId ?? null, bootId ?? null).changes);
+      WHERE state = 'sending' AND request_started_at IS NOT NULL AND json_extract(descriptor_json, '$.widget.messageId') IS NULL AND ${lostClaim}`).run(now, bootId ?? null, bootId ?? null).changes);
+    const requeued = Number(database.raw.query(`UPDATE admin_response_outbox SET state = 'pending', claim_token = NULL, claim_boot_id = NULL, lease_expires_at = NULL, next_attempt_at = ?, request_started_at = NULL, last_error_kind = CASE WHEN request_started_at IS NULL THEN 'restart_before_request' ELSE 'widget_edit_reconcile' END, last_error_description = CASE WHEN request_started_at IS NULL THEN 'Response was not sent before restart' ELSE 'Reconciling an edit to a known widget' END
+      WHERE state = 'sending' AND (request_started_at IS NULL OR json_extract(descriptor_json, '$.widget.messageId') IS NOT NULL) AND ${lostClaim}`).run(now, now, bootId ?? null, bootId ?? null).changes);
     return { requeued, uncertain };
   });
   const counts = (): { pending: number; sending: number; uncertain: number; failed: number; oldestPendingAt?: number } => {

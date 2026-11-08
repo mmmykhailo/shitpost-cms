@@ -718,6 +718,19 @@ const migrations: readonly Migration[] = [
       )`,
     ],
   },
+  {
+    version: 16,
+    statements: [
+      `CREATE TABLE admin_panels (
+        chat_id INTEGER PRIMARY KEY,
+        revision INTEGER NOT NULL,
+        template TEXT NOT NULL,
+        message_id INTEGER,
+        checkpoint INTEGER NOT NULL DEFAULT 0,
+        screen_json TEXT NOT NULL
+      )`,
+    ],
+  },
 ];
 
 export const applyMigrations = (db: Database, throughVersion = Number.POSITIVE_INFINITY): void => {

@@ -7,7 +7,7 @@ import type { Clock } from "../types";
 import { asNumericChatId, telegramMutationScope, type TelegramMutationScope, type TelegramRequestResult } from "../telegram-request-context";
 
 const MUTATION_METHODS = new Set([
-  "sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAudio", "sendAnimation", "sendVoice", "sendVideoNote", "sendMediaGroup",
+  "sendWidget", "editMessageWidgetData", "sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAudio", "sendAnimation", "sendVoice", "sendVideoNote", "sendMediaGroup",
   "forwardMessage", "forwardMessages", "copyMessage", "copyMessages", "editMessageText", "editMessageCaption", "editMessageMedia",
   "editMessageReplyMarkup", "deleteMessage", "deleteMessages", "setMyCommands",
 ]);

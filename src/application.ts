@@ -1,3 +1,9 @@
+import { adminRoute, deskAction } from "./admin-ui/widget/views";
+import { checkWidgetBudget } from "./admin-ui/widget/model";
+import { widgetAllowedUpdates } from "./admin-ui/widget/transport";
+import { createAdminPanelRepository } from "./db/admin-panel-repository";
+import { createAdminWidgetPanel } from "./services/admin-widget-panel";
+import { createAdminWidgetDelivery } from "./services/admin-widget-delivery";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import { readFile, rm } from "node:fs/promises";
@@ -174,7 +180,14 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   const interruptedAdminUpdates = adminUpdates.markInterruptedUncertain(clock.now());
   if (interruptedAdminUpdates > 0) logger.warn("admin_updates_recovered_uncertain", { count: interruptedAdminUpdates });
 
-  const bot = options.bot ?? new Bot(config.botToken);
+  const widgetsEnabled = config.adminWidgets === "widget" || config.adminWidgets === "beta-test";
+  if (widgetsEnabled) checkWidgetBudget();
+  const bot = options.bot ?? new Bot(config.botToken, config.adminWidgets === "beta-test" ? {
+    client: { apiRoot: "https://api.telegram.org/beta", environment: "test" },
+  } : undefined);
+  const adminPanels = createAdminPanelRepository(database);
+  const widgetPanel = createAdminWidgetPanel(adminPanels, adminResponses, config.adminUserId, clock.now);
+  if (!widgetsEnabled && widgetPanel.find()?.messageId != null) database.transaction(() => widgetPanel.retire());
   const telegramCooldown = createTelegramCooldown({ repository: createTelegramCooldownRepository(database), clock });
   const adminChatId = adminChatIdFromUserId(config.adminUserId);
   const telegramIncidents = createTelegramIncidentService({ incidents: incidentRepository, responses: adminResponses, adminChatId: Number(adminChatId), adminUserId: config.adminUserId, cooldown: telegramCooldown, now: clock.now, logger });
@@ -200,7 +213,10 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     responses: adminResponses,
     createCallbackToken: (action, payload, now, itemVersion) => admin.createCallbackToken(config.adminUserId, action, payload, now, itemVersion),
   });
-  const adminResponseWorker = createAdminResponseWorker({ responses: adminResponses, admin, gateway, adminChatId: Number(adminChatId), adminUserId: config.adminUserId, bootId, clock, logger, cooldown: telegramCooldown, incidents: telegramIncidents, alerts });
+  const adminResponseWorker = createAdminResponseWorker({ responses: adminResponses, admin, gateway, adminChatId: Number(adminChatId), adminUserId: config.adminUserId, bootId, clock, logger, cooldown: telegramCooldown, incidents: telegramIncidents, alerts,
+    deliverWidget: createAdminWidgetDelivery({ api: bot.api, panels: adminPanels, responses: adminResponses, clock,
+      enabled: widgetsEnabled, adminChatId: config.adminUserId }),
+  });
   let validatedBotId: UserId | undefined;
   let lastRightsCheckAt = 0;
   let lastSuccessfulRightsCheckAt: number | undefined;
@@ -354,6 +370,16 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
     logger,
     operationTracker,
     incidents: telegramIncidents,
+    ...(widgetsEnabled ? { updateWidget: (updateId, text, markup, itemId) => {
+      const actions = markup?.kind === "inline_keyboard"
+        ? markup.rows.flat().filter((entry) => entry.action !== "queue").map((entry) => deskAction(entry.text, adminRoute({
+          ...entry, payload: { ...(entry.payload as Record<string, unknown>),
+            actionState: admin.actionState(entry.action, entry.payload as Record<string, unknown>) },
+        })))
+        : [];
+      if (itemId !== undefined) actions.unshift(deskAction(`Open #${itemId}`, { name: "item", itemId, offset: 0 }));
+      widgetPanel.finish(updateId, text, actions);
+    } } : {}),
     setCommands: () => bot.api.setMyCommands([
       { command: "start", description: "Open queue manager" },
       { command: "manage", description: "Open queue manager" },
@@ -383,6 +409,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
   registerQueueChannelHandlers(bot, ingestion, () => database.raw.query("UPDATE app_state SET last_successful_update_at = ? WHERE id = 1").run(clock.now()));
   registerAdminHandlers(bot, {
     recentLogs,
+    ...(widgetsEnabled ? { widgetPanel } : {}),
     config,
     queue,
     policy,
@@ -629,7 +656,7 @@ export const main = async (options: ApplicationOptions = {}): Promise<void> => {
 
   try {
     pollingPromise = bot.start({
-      allowed_updates: ["message", "callback_query", "channel_post", "edited_channel_post"],
+      allowed_updates: widgetAllowedUpdates(widgetsEnabled),
       onStart: async (botInfo) => {
         startBackgroundWork();
         runtimeStatus.writeReady(botInfo.id);

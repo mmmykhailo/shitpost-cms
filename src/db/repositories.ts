@@ -649,6 +649,20 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     return rows.map(rowToItem);
   };
 
+  const deskItems = (attention: boolean, limit: number, requestedOffset: number) => {
+    const where = `status NOT IN ('done','deleted','deleted_external')${attention
+      ? " AND (status IN ('blocked','needs_edit','needs_review','uncertain_publish','delete_blocked') OR maintenance_status = 'uncertain_renewal' OR preparation_state = 'uncertain')"
+      : ""}`;
+    const count = (database.raw.query(`SELECT COUNT(*) AS count FROM queue_items WHERE ${where}`).get() as { count: number }).count;
+    const offset = Math.min(requestedOffset, Math.max(0, Math.floor((count - 1) / limit) * limit));
+    const rows = database.raw.query(`SELECT * FROM queue_items WHERE ${where} ORDER BY logical_sequence LIMIT ? OFFSET ?`).all(limit, offset) as QueueRow[];
+    return { count, offset, items: rows.map(rowToItem) };
+  };
+
+  const deskPosition = (sequence: number): number => (database.raw.query(
+    "SELECT COUNT(*) + 1 AS position FROM queue_items WHERE logical_sequence < ? AND status NOT IN ('done','deleted','deleted_external')",
+  ).get(sequence) as { position: number }).position;
+
   const getHead = (): QueueItemRecord | undefined => {
     const row = database.raw.query("SELECT * FROM queue_items WHERE status NOT IN ('done','deleted','deleted_external') ORDER BY logical_sequence LIMIT 1").get() as QueueRow | null;
     return row ? rowToItem(row) : undefined;
@@ -1628,6 +1642,8 @@ export const createQueueRepository = (database: AppDatabase, options: { bootId?:
     acceptProvisionalPreparationEdit,
     updateSnapshot,
     listActive,
+    deskItems,
+    deskPosition,
     getHead,
     peekNextReady,
     claimReadyPublication,

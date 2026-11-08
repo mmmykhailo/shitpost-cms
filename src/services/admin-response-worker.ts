@@ -1,3 +1,4 @@
+import type { WidgetDelivery } from "./admin-widget-delivery";
 import { encodeReusableCallback } from "../domain/admin-callback";
 import { randomUUID } from "node:crypto";
 import type { AdminResponseKind, AdminResponseRecord, AdminResponseRepository } from "../db/admin-response-repository";
@@ -17,6 +18,7 @@ export type AdminReplyMarkupIntent =
 export type AdminResponseDescriptor = {
   version: 1;
   text: string;
+  widget?: WidgetDelivery;
   entities?: readonly { type: string; offset: number; length: number; url?: string }[];
   disableLinkPreview?: boolean;
   replyMarkup?: AdminReplyMarkupIntent;
@@ -43,6 +45,7 @@ export const createAdminResponseWorker = (input: {
   clock: Clock;
   logger: Logger;
   cooldown?: TelegramCooldown;
+  deliverWidget?: (row: AdminResponseRecord, delivery: WidgetDelivery) => Promise<void>;
   incidents?: {
     canDeliver(incidentId: string, kind: "warning" | "recovery", now: number): boolean;
     acknowledgeDelivered(incidentId: string, kind: "warning" | "recovery", outboxId: string, now: number): boolean;
@@ -99,6 +102,11 @@ export const createAdminResponseWorker = (input: {
     try { record = parseDescriptor(claim); }
     catch (error) {
       input.responses.finishFailed(claim.id, claim.claimToken!, "failed", "invalid_descriptor", error instanceof Error ? error.message : "Invalid response descriptor");
+      return true;
+    }
+    if (record.descriptor.widget) {
+      if (input.deliverWidget) await input.deliverWidget(record, record.descriptor.widget);
+      else input.responses.cancel(record.id, input.clock.now());
       return true;
     }
     const claimToken = claim.claimToken!;
