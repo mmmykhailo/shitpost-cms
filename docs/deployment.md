@@ -65,9 +65,12 @@ Add these Environment variables:
 VPS_HOST             exact DNS name or IPv4 address used by the host key
 VPS_USER             deploy
 BOT_LOG_LEVEL        info
+ADMIN_WIDGETS        classic (default) or widget
 ```
 
 The workflow validates every value before creating SSH files or touching the VPS. The bot token and channel IDs are never written to a release or passed as command-line arguments. `VPS_SSH_KEY` must be passphrase-free because the job is non-interactive.
+
+The workflow copies `ADMIN_WIDGETS` into the service environment on each deployment. After changing the variable, run **Deploy bot** again and then send `/manage` in the bot's PM. Use `widget` once the normal Bot API endpoint and your clients have passed the widget compatibility check. Use `beta-test` only with a separate test bot, Telegram test chats and database. [Private Desk widget compatibility checklist](telegram-compatibility.md#private-desk-widget)
 
 ## 3. Deploy and inspect
 

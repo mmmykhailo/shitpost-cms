@@ -114,6 +114,7 @@ jobs:
           VPS_HOST: ${{ vars.VPS_HOST }}
           VPS_USER: ${{ vars.VPS_USER }}
           BOT_LOG_LEVEL: ${{ vars.BOT_LOG_LEVEL }}
+          ADMIN_WIDGETS: ${{ vars.ADMIN_WIDGETS }}
         run: |
           set -euo pipefail
           bun -e '
@@ -149,6 +150,9 @@ jobs:
             if (env.BOT_LOG_LEVEL !== undefined && (env.BOT_LOG_LEVEL.includes("\n") || env.BOT_LOG_LEVEL.includes("\r"))) throw new Error("BOT_LOG_LEVEL must not contain a newline");
             const logLevel = env.BOT_LOG_LEVEL?.trim() || "info";
             if (!["debug", "info", "warn", "error"].includes(logLevel)) throw new Error("BOT_LOG_LEVEL must be debug, info, warn, or error");
+            const widgetMode = env.ADMIN_WIDGETS || "classic";
+            if (widgetMode === "beta-test") throw new Error("ADMIN_WIDGETS=beta-test requires a separate Telegram test bot, chats, and database. Use classic or widget for production.");
+            if (!["classic", "widget"].includes(widgetMode)) throw new Error("Production ADMIN_WIDGETS must be classic or widget");
             void adminId;
           '
 
@@ -200,6 +204,7 @@ jobs:
           QUEUE_CHANNEL_ID: ${{ secrets.QUEUE_CHANNEL_ID }}
           TARGET_CHANNEL_ID: ${{ secrets.TARGET_CHANNEL_ID }}
           BOT_LOG_LEVEL: ${{ vars.BOT_LOG_LEVEL }}
+          ADMIN_WIDGETS: ${{ vars.ADMIN_WIDGETS }}
         run: |
           set -euo pipefail
           umask 077
@@ -213,6 +218,7 @@ jobs:
             printf 'TARGET_CHANNEL_ID=%s\n' "$TARGET_CHANNEL_ID"
             printf '%s\n' 'DATABASE_PATH=/srv/shitpost-cms/data/bot.sqlite'
             printf 'LOG_LEVEL=%s\n' "${BOT_LOG_LEVEL:-info}"
+            printf 'ADMIN_WIDGETS=%s\n' "${ADMIN_WIDGETS:-classic}"
             printf 'RELEASE_SHA=%s\n' "$GITHUB_SHA"
             printf '%s\n' 'RUNTIME_STATUS_PATH=/run/shitpost-cms/ready.json'
           } > "$env_file"
